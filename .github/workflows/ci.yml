@@ -55,7 +55,7 @@ jobs:
         run: uv run pytest tests/ -v --tb=short
 
   release:
-    name: Build & Publish
+    name: Release
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [lint, test]
     runs-on: ubuntu-latest
