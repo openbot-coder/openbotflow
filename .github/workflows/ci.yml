@@ -77,7 +77,7 @@ jobs:
         run: uv run hatch build --target wheel
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/lovelace
+        uses: pypa/gh-action-pypi-publish@v1.12.4
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
 
