@@ -1,0 +1,47 @@
+# BotFlow Gateway V2 — 配置示例
+# 复制为 config.yaml 并填写实际值
+
+app:
+  host: "0.0.0.0"
+  port: 8000
+  reload: false
+  workers: 1
+
+database:
+  path: "botflow.db"          # SQLite 数据库路径（相对于项目根目录）
+
+channels:
+  im:
+    enabled: true
+    wecom:
+      bot_id: ""               # 企业微信 bot_id
+      bot_secret: ""           # 企业微信 bot_secret
+      token: ""                # 企业微信 Token
+      encoding_aes_key: ""     # 企业微信 EncodingAESKey
+  a2a:
+    enabled: true
+    agent_card_url: "http://localhost:8000/.well-known/agent.json"
+  acp:
+    enabled: false
+    registry_url: "http://localhost:8000/registry"
+
+llm:
+  provider: "litellm"
+  api_base: "http://localhost:4000"   # LiteLLM Proxy 地址
+  model: "fast/free"
+  api_key: ""                          # 如需认证
+
+router:
+  broadcast_batch_size: 100
+  retry_max_attempts: 3
+  retry_cooldown_secs: 60
+
+session:
+  message_ttl_days: 7
+  lane_max_processing_secs: 300
+  lane_drop_policy: "requeue"          # requeue | drop | requeue_dlq
+  graceful_shutdown_timeout_secs: 30
+
+logging:
+  level: "INFO"
+  format: "json"
