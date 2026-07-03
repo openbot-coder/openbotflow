@@ -26,6 +26,9 @@ class BotflowSettings(BaseSettings):
     # Logging
     log_level: str = "INFO"
 
+    # CORS
+    cors_origins: str = "*"
+
     model_config = {"env_prefix": "BOTFLOW_", "env_file": ".env", "extra": "ignore"}
 
 

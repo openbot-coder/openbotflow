@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -43,8 +43,8 @@ CREATE TABLE IF NOT EXISTS providers (
     base_url TEXT NOT NULL DEFAULT '',
     extra_config TEXT NOT NULL DEFAULT '{}',
     is_enabled INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
 -- Models
@@ -58,8 +58,8 @@ CREATE TABLE IF NOT EXISTS models (
     cooldown_failure_threshold INTEGER NOT NULL DEFAULT 3,
     extra_config TEXT NOT NULL DEFAULT '{}',
     is_enabled INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     UNIQUE(name, provider_id)
 );
 
@@ -69,8 +69,8 @@ CREATE TABLE IF NOT EXISTS model_groups (
     name TEXT NOT NULL UNIQUE,
     description TEXT NOT NULL DEFAULT '',
     is_enabled INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
 -- Group-Model Association
@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS group_models (
     model_id INTEGER NOT NULL REFERENCES models(id),
     weight REAL NOT NULL DEFAULT 1.0,
     is_enabled INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     UNIQUE(group_id, model_id)
 );
 
@@ -101,14 +101,14 @@ CREATE TABLE IF NOT EXISTS call_logs (
     tool_calls TEXT,
     cost REAL DEFAULT 0.0,
     error_message TEXT,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
 -- Config Key-Value Store
 CREATE TABLE IF NOT EXISTS config (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 """
 
@@ -172,8 +172,8 @@ class Database:
     async def set_config(self, key: str, value: str) -> None:
         conn = await self._ensure_connection()
         await conn.execute(
-            "INSERT INTO config (key, value, updated_at) VALUES (?, ?, datetime('now')) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')",
+            "INSERT INTO config (key, value, updated_at) VALUES (?, ?, datetime('now', 'localtime')) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now', 'localtime')",
             (key, value),
         )
         await conn.commit()
@@ -209,7 +209,7 @@ class Database:
                 value = json.dumps(value)
             sets.append(f"{key} = ?")
             values.append(value)
-        sets.append("updated_at = datetime('now')")
+        sets.append("updated_at = datetime('now', 'localtime')")
         values.append(provider_id)
         await conn.execute(f"UPDATE providers SET {', '.join(sets)} WHERE id = ?", values)
         await conn.commit()
@@ -283,7 +283,7 @@ class Database:
                 value = json.dumps(value)
             sets.append(f"{key} = ?")
             values.append(value)
-        sets.append("updated_at = datetime('now')")
+        sets.append("updated_at = datetime('now', 'localtime')")
         values.append(model_id)
         await conn.execute(f"UPDATE models SET {', '.join(sets)} WHERE id = ?", values)
         await conn.commit()
@@ -345,7 +345,7 @@ class Database:
                 raise ValueError(f"Invalid column for group update: {key}")
         sets = [f"{k} = ?" for k in updates]
         values = list(updates.values()) + [group_id]
-        sets.append("updated_at = datetime('now')")
+        sets.append("updated_at = datetime('now', 'localtime')")
         await conn.execute(f"UPDATE model_groups SET {', '.join(sets)} WHERE id = ?", values)
         await conn.commit()
 
@@ -456,8 +456,8 @@ class Database:
             """INSERT INTO call_logs
                (group_id, model_id, provider_id, request_body, response_body,
                 status, duration_ms, prompt_tokens, completion_tokens,
-                cache_tokens, total_tokens, tool_calls, cost, error_message)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                cache_tokens, total_tokens, tool_calls, cost, error_message, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))""",
             (
                 log.group_id, log.model_id, log.provider_id,
                 log.request_body, log.response_body, log.status,
@@ -510,7 +510,6 @@ class Database:
         return CallLog(
             id=row["id"],
             group_id=row["group_id"],
-            model_id=row["model_id"],
             provider_id=row["provider_id"],
             request_body=row["request_body"],
             response_body=row["response_body"],
@@ -523,6 +522,7 @@ class Database:
             tool_calls=row["tool_calls"],
             cost=row["cost"],
             error_message=row["error_message"],
+            created_at=row["created_at"],
         )
 
     # ------------------------------------------------------------------
@@ -538,13 +538,15 @@ class Database:
                    SUM(CASE WHEN cl.status = 'success' THEN 1 ELSE 0 END) AS success_calls,
                    SUM(CASE WHEN cl.status = 'error' THEN 1 ELSE 0 END) AS error_calls,
                    AVG(cl.duration_ms) AS avg_duration_ms,
+                   MIN(cl.duration_ms) AS min_duration_ms,
+                   MAX(cl.duration_ms) AS max_duration_ms,
                    COALESCE(SUM(cl.prompt_tokens), 0) AS total_prompt_tokens,
                    COALESCE(SUM(cl.completion_tokens), 0) AS total_completion_tokens,
                    COALESCE(SUM(cl.cache_tokens), 0) AS total_cache_tokens,
                    COALESCE(SUM(cl.cost), 0.0) AS total_cost
-               FROM call_logs cl
-               JOIN models m ON m.id = cl.model_id
-               WHERE cl.model_id = ?""",
+                FROM call_logs cl
+                JOIN models m ON m.id = cl.model_id
+                WHERE cl.model_id = ?""",
             (model_id,),
         )
         row = await cursor.fetchone()
@@ -558,9 +560,12 @@ class Database:
             success_calls=row["success_calls"],
             error_calls=row["error_calls"],
             avg_duration_ms=row["avg_duration_ms"],
+            min_duration_ms=row["min_duration_ms"],
+            max_duration_ms=row["max_duration_ms"],
             total_prompt_tokens=row["total_prompt_tokens"],
             total_completion_tokens=row["total_completion_tokens"],
             total_cache_tokens=row["total_cache_tokens"],
+            total_tokens=row["total_prompt_tokens"] + row["total_completion_tokens"] + row["total_cache_tokens"],
             total_cost=row["total_cost"],
         )
 
@@ -596,7 +601,7 @@ class Database:
     async def get_cost_summary(self, days: int = 30) -> list[dict]:
         """Get daily cost summary for the last N days."""
         conn = await self._ensure_connection()
-        since = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+        since = (datetime.now() - timedelta(days=days)).isoformat()
         cursor = await conn.execute(
             """SELECT DATE(created_at) AS day,
                       COUNT(*) AS total_calls,

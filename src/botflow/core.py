@@ -28,6 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from botflow.auth import verify_llm_key, verify_mcp_key
 from botflow.common.logger import get_logger, setup_logging
@@ -162,8 +163,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS - 从环境变量读取允许的来源，开发环境默认允许 localhost
-cors_origins = os.environ.get("BOTFLOW_CORS_ORIGINS", "http://localhost:3000,http://localhost:8080").split(",")
+# CORS - 允许所有来源
+cors_origins = os.environ.get("BOTFLOW_CORS_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
@@ -176,7 +177,20 @@ app.add_middleware(
 # MCP Server (SSE transport)
 # ---------------------------------------------------------------------------
 
-mcp_server = FastMCP("botflow")
+mcp_server = FastMCP(
+    "botflow",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            "api.vxquant.com",
+            "api.vxquant.com:*",
+            "127.0.0.1",
+            "127.0.0.1:*",
+            "localhost",
+            "localhost:*",
+        ],
+    ),
+)
 
 # Mount MCP SSE app under /mcp path
 app.mount("/mcp", mcp_server.sse_app())
@@ -746,6 +760,7 @@ async def start_service(
         port=port,
         log_level="info",
         loop="asyncio",
+        forwarded_allow_ips="*",
     )
     server = uvicorn.Server(config_obj)
     await server.serve()
