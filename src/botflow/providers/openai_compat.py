@@ -166,8 +166,8 @@ class OpenAICompatProvider(BaseProvider):
                 {
                     "index": choice.get("index", 0),
                     "delta": {
-                        "role": delta.get("role", ""),
-                        "content": delta.get("content", ""),
+                        "role": delta.get("role") or "assistant",
+                        "content": delta.get("content") or "",
                     },
                     "finish_reason": choice.get("finish_reason"),
                 }
