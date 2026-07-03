@@ -513,10 +513,11 @@ async def _stream_openai(
 ) -> AsyncGenerator[str, None]:
     """Stream response in OpenAI SSE format."""
     model_name = internal.get("model", "")
-    group_id = await _get_group_id({"model": model_name})
-    router = _get_router(group_id)
-
+    group_id = None
     try:
+        group_id = await _get_group_id({"model": model_name})
+        router = _get_router(group_id)
+
         route_result = await router.route(
             messages=internal["messages"],
             temperature=internal.get("temperature"),
@@ -579,10 +580,11 @@ async def _stream_anthropic(
 ) -> AsyncGenerator[str, None]:
     """Stream response in Anthropic SSE format."""
     model_name = internal.get("model", "")
-    group_id = await _get_group_id({"model": model_name})
-    router = _get_router(group_id)
-
+    group_id = None
     try:
+        group_id = await _get_group_id({"model": model_name})
+        router = _get_router(group_id)
+
         route_result = await router.route(
             messages=internal["messages"],
             temperature=internal.get("temperature"),
