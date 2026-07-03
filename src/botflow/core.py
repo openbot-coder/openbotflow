@@ -296,13 +296,10 @@ async def _log_call(
 def _estimate_cost(usage: dict[str, Any]) -> float:
     """Estimate cost based on token usage.
 
-    NOTE: Uses approximate flat rates. For accurate cost tracking,
-    implement per-model pricing tables in the database.
+    Currently returns 0 (cost tracking not implemented).
+    For accurate cost tracking, implement per-model pricing tables.
     """
-    prompt = usage.get("prompt_tokens", 0) or 0
-    completion = usage.get("completion_tokens", 0) or 0
-    # Approx pricing: $0.01/1K prompt, $0.03/1K completion
-    return (prompt * 0.01 + completion * 0.03) / 1000
+    return 0.0
 
 
 def _extract_model_route_info(response: dict, internal_params: dict) -> tuple[int | None, int | None, int | None]:
