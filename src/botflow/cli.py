@@ -28,6 +28,7 @@ def main() -> None:
     set_parser = subparsers.add_parser("set", help="Set API keys")
     set_parser.add_argument("key_type", choices=["llm-key", "mcp-key"], help="Key type")
     set_parser.add_argument("key_value", help="The key value")
+    set_parser.add_argument("--workspace", default=None, help="Workspace path (default: ~/.botflow/)")
 
     args = parser.parse_args()
 
@@ -64,7 +65,7 @@ async def _cmd_set_async(args: argparse.Namespace) -> None:
     """Set API keys in the database (async)."""
     from botflow.storage.db import Database
 
-    workspace = get_workspace_path(None)
+    workspace = get_workspace_path(args.workspace)
     init_workspace(workspace)
 
     db = Database(workspace / "data" / "botflow.db")
