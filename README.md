@@ -354,6 +354,7 @@ uv run pytest -m integration
 
 - [设计文档](docs/design.md) - 完整的系统设计、数据模型、API 定义
 - [AI 助手规范](AGENTS.md) - 开发规范和最佳实践
+- [使用指南 Skill](.qoder/skills/botflow-guide/SKILL.md) - 快速上手 botflow
 
 ## 技术栈
 

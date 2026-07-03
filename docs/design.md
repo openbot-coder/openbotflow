@@ -621,12 +621,16 @@ CREATE INDEX idx_call_logs_provider ON call_logs(provider_id, created_at);
 
 ---
 
-## 文件结构（Phase 1 完成后）
+### 文件结构（Phase 1 完成后）
 
 ```
 d:\src\botflow\
 ├── pyproject.toml
 ├── .python-version
+├── .qoder/
+│   └── skills/
+│       └── botflow-guide/          # 使用指南 Skill
+│           └── SKILL.md
 ├── docs/
 │   └── design.md                   # 本设计文档
 ├── src\botflow\
