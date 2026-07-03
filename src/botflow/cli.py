@@ -40,19 +40,24 @@ def main() -> None:
         sys.exit(1)
 
 
-def _cmd_run(args: argparse.Namespace) -> None:
-    """Start the botflow service."""
+async def _cmd_run_async(args: argparse.Namespace) -> None:
+    """Start the botflow service (async)."""
     workspace = get_workspace_path(args.workspace)
     init_workspace(workspace)
     config = load_config(workspace)
 
     from botflow.core import start_service
-    start_service(
+    await start_service(
         workspace=workspace,
         host=args.host,
         port=args.port,
         config=config,
     )
+
+
+def _cmd_run(args: argparse.Namespace) -> None:
+    """Start the botflow service."""
+    asyncio.run(_cmd_run_async(args))
 
 
 async def _cmd_set_async(args: argparse.Namespace) -> None:
