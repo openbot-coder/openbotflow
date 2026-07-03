@@ -270,7 +270,7 @@ result = await session.call_tool("query_cost_summary", {
   "mcpServers": {
     "botflow": {
       "type": "sse",
-      "url": "http://localhost:8080/mcp/sse",
+      "url": "http://localhost:12307/mcp/sse",
       "headers": {
         "Authorization": "Bearer your-secret-key"
       }
@@ -360,7 +360,7 @@ uv run pytest -m integration
 
 - **Web 框架**: FastAPI
 - **数据库**: SQLite (aiosqlite 异步驱动)
-- **HTTP 客户端**: httpx
+- **LLM 客户端**: 官方 SDK（openai / anthropic / google-genai）
 - **配置管理**: pydantic-settings
 - **日志**: loguru
 - **MCP 协议**: mcp-python-sdk

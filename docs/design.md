@@ -218,9 +218,9 @@ botflow run --workspace ~/my-botflow --host 0.0.0.0 --port 8080
 | 核心服务 | `src/botflow/core.py` | FastAPI 主服务 + MCP 服务编排（OpenAI/Anthropic 双协议） |
 | 模型分组路由 | `src/botflow/router.py` | 模型分组 + 权重选择 + Fallback + 冷却 |
 | 供应商适配基类 | `src/botflow/providers/base.py` | 统一供应商接口 |
-| OpenAI 适配 | `src/botflow/providers/openai_compat.py` | OpenAI / Azure / vLLM / Ollama |
-| Anthropic 适配 | `src/botflow/providers/anthropic_provider.py` | Anthropic Claude |
-| Google 适配 | `src/botflow/providers/google_provider.py` | Google Gemini |
+| OpenAI 适配 | `src/botflow/providers/openai_compat.py` | OpenAI / Azure / vLLM / Ollama（使用 openai SDK） |
+| Anthropic 适配 | `src/botflow/providers/anthropic_provider.py` | Anthropic Claude（使用 anthropic SDK） |
+| Google 适配 | `src/botflow/providers/google_provider.py` | Google Gemini（使用 google-genai SDK） |
 | 鉴权中间件 | `src/botflow/auth.py` | LLM-Key / MCP-Key 鉴权 |
 | 数据库存储 | `src/botflow/storage/db.py` | SQLite 统一数据库操作 |
 | 存储模型 | `src/botflow/storage/models.py` | Pydantic 数据模型定义 |
@@ -613,11 +613,11 @@ CREATE INDEX idx_call_logs_provider ON call_logs(provider_id, created_at);
 
 - **语言**: Python >=3.13
 - **Web 框架**: FastAPI + Uvicorn
-- **AI 框架**: LangChain
 - **配置**: Pydantic Settings + `{workspace}/.env`（数据库存储模型配置）
 - **存储**: SQLite (aiosqlite)
 - **协议**: MCP (Model Context Protocol)
 - **构建**: uv_build
+- **LLM 客户端**: 官方 SDK（openai / anthropic / google-genai）
 
 ---
 
