@@ -95,7 +95,7 @@ class CooldownManager:
 
 
 # ---------------------------------------------------------------------------
-# Provider factory
+# Provider factory + caching
 # ---------------------------------------------------------------------------
 
 PROVIDER_TYPE_MAP: dict[str, type[BaseProvider]] = {
@@ -107,13 +107,30 @@ PROVIDER_TYPE_MAP: dict[str, type[BaseProvider]] = {
     "google": GoogleProvider,
 }
 
+# Cache: provider_id -> (BaseProvider, create_time)
+_provider_cache: dict[int, tuple[BaseProvider, float]] = {}
+_PROVIDER_CACHE_TTL = 300  # 5 minutes
 
-def create_provider_instance(provider_type: str, api_key: str, base_url: str, extra_config: dict[str, Any] | None = None) -> BaseProvider:
-    """Create a provider instance by type."""
+# Cache: group_id -> (list[ModelEndpoint], create_time)
+_endpoint_cache: dict[int, tuple[list["ModelEndpoint"], float]] = {}
+_ENDPOINT_CACHE_TTL = 60  # 1 minute
+
+
+def _get_cached_provider(provider_id: int, provider_type: str, api_key: str, base_url: str, extra_config: dict[str, Any] | None = None) -> BaseProvider:
+    """Get or create a cached provider instance."""
+    now = time.time()
+    cached = _provider_cache.get(provider_id)
+    if cached:
+        instance, create_time = cached
+        if now - create_time < _PROVIDER_CACHE_TTL:
+            return instance
+    # Create new instance
     cls = PROVIDER_TYPE_MAP.get(provider_type)
     if cls is None:
         raise ValueError(f"Unsupported provider type: {provider_type}")
-    return cls(api_key=api_key, base_url=base_url, extra_config=extra_config)
+    instance = cls(api_key=api_key, base_url=base_url, extra_config=extra_config)
+    _provider_cache[provider_id] = (instance, now)
+    return instance
 
 
 # ---------------------------------------------------------------------------
@@ -222,20 +239,31 @@ class GroupRouter:
         self.cooldown = cooldown_manager
 
     async def _load_endpoints(self) -> list[ModelEndpoint]:
-        """Load and build endpoints for all enabled models in the group."""
+        """Load and build endpoints for all enabled models in the group (with caching)."""
+        now = time.time()
+        cached = _endpoint_cache.get(self.group_id)
+        if cached:
+            endpoints, create_time = cached
+            if now - create_time < _ENDPOINT_CACHE_TTL:
+                return endpoints
+        
+        # Cache miss or expired - reload from DB
         models = await self.db.get_group_models(self.group_id, enabled_only=True)
         endpoints: list[ModelEndpoint] = []
         for m in models:
             provider = await self.db.get_provider(m.provider_id)
             if provider is None or not provider.is_enabled:
                 continue
-            provider_instance = create_provider_instance(
+            provider_instance = _get_cached_provider(
+                provider_id=provider.id,
                 provider_type=provider.provider_type,
                 api_key=provider.api_key,
                 base_url=provider.base_url,
                 extra_config=provider.extra_config,
             )
             endpoints.append(ModelEndpoint(m, provider_instance))
+        
+        _endpoint_cache[self.group_id] = (endpoints, now)
         return endpoints
 
     def _get_available(self, endpoints: list[ModelEndpoint]) -> list[ModelEndpoint]:
