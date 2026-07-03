@@ -1,11 +1,14 @@
-"""Anthropic Claude provider."""
+"""Anthropic Claude provider.
+
+Uses the official anthropic SDK for proper streaming, tool use,
+and extended thinking support.
+"""
 
 from __future__ import annotations
 
-import json
 from typing import Any, AsyncGenerator
 
-import httpx
+from anthropic import AsyncAnthropic
 
 from botflow.common.exceptions import ProviderError
 from botflow.common.logger import get_logger
@@ -17,10 +20,9 @@ logger = get_logger("providers.anthropic")
 class AnthropicProvider(BaseProvider):
     """Provider for Anthropic Claude API.
 
-    Converts Anthropic format to/from the unified internal format.
+    Uses the official anthropic SDK for proper connection pooling,
+    retry logic, and protocol compliance.
     """
-
-    API_VERSION = "2023-06-01"
 
     def __init__(
         self,
@@ -29,18 +31,15 @@ class AnthropicProvider(BaseProvider):
         extra_config: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(api_key, base_url, extra_config)
-        self._client: httpx.AsyncClient | None = None
+        self._client: AsyncAnthropic | None = None
 
     @property
-    def client(self) -> httpx.AsyncClient:
+    def client(self) -> AsyncAnthropic:
+        """Get or create the Anthropic client (lazy initialization)."""
         if self._client is None:
-            self._client = httpx.AsyncClient(
+            self._client = AsyncAnthropic(
+                api_key=self.api_key,
                 base_url=self.base_url,
-                headers={
-                    "x-api-key": self.api_key,
-                    "anthropic-version": self.API_VERSION,
-                    "Content-Type": "application/json",
-                },
                 timeout=self.extra_config.get("timeout", 120.0),
             )
         return self._client
@@ -54,16 +53,22 @@ class AnthropicProvider(BaseProvider):
         stream: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        body = self._build_body(messages, model, temperature, max_tokens, stream=False, **kwargs)
+        system, messages = self._extract_system(messages)
+        params: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens or 4096,
+        }
+        if system:
+            params["system"] = system
+        if temperature is not None:
+            params["temperature"] = temperature
+        params.update(kwargs)
 
         try:
-            resp = await self.client.post("/v1/messages", json=body)
-            self._check_response(resp, "Anthropic")
-            data = resp.json()
-            return self._to_unified(data, model)
-        except httpx.TimeoutException:
-            raise ProviderError(f"Anthropic timed out for model {model}")
-        except httpx.RequestError as e:
+            response = await self.client.messages.create(**params)
+            return self._to_unified(response.model_dump(), model)
+        except Exception as e:
             raise ProviderError(f"Anthropic request failed: {e}")
 
     async def chat_stream(
@@ -74,64 +79,43 @@ class AnthropicProvider(BaseProvider):
         max_tokens: int | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[dict[str, Any], None]:
-        body = self._build_body(messages, model, temperature, max_tokens, stream=True, **kwargs)
+        system, messages = self._extract_system(messages)
+        params: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens or 4096,
+        }
+        if system:
+            params["system"] = system
+        if temperature is not None:
+            params["temperature"] = temperature
+        params.update(kwargs)
 
         try:
-            async with self.client.stream("POST", "/v1/messages", json=body) as resp:
-                self._check_response(resp, "Anthropic")
-                event_type = ""
-                async for line in resp.aiter_lines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if line.startswith("event:"):
-                        event_type = line[6:].strip()
-                        continue
-                    if line.startswith("data:"):
-                        chunk = json.loads(line[5:].strip())
-                        yield self._chunk_to_unified(chunk, model, event_type)
-        except httpx.TimeoutException:
-            raise ProviderError(f"Anthropic stream timed out for model {model}")
-        except httpx.RequestError as e:
+            async with self.client.messages.stream(**params) as stream:
+                async for event in stream:
+                    yield self._event_to_chunk(event, model)
+        except Exception as e:
             raise ProviderError(f"Anthropic stream failed: {e}")
 
     async def list_models(self) -> list[dict[str, Any]]:
         # Anthropic does not have a public /v1/models endpoint
-        # Return configured model names
         return [{"id": self.extra_config.get("default_model", "claude-sonnet-4-20250514"), "object": "model"}]
 
-    def _build_body(
-        self,
-        messages: list[dict[str, Any]],
-        model: str,
-        temperature: float | None,
-        max_tokens: int | None,
-        stream: bool,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        body: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "stream": stream,
-        }
-        if max_tokens is not None:
-            body["max_tokens"] = max_tokens
-        else:
-            body["max_tokens"] = 4096  # Anthropic requires max_tokens
-        if temperature is not None:
-            body["temperature"] = temperature
-        # Extract system prompt if present
-        system_msgs = [m for m in messages if m.get("role") == "system"]
-        if system_msgs:
-            body["system"] = system_msgs[-1]["content"]
-            body["messages"] = [m for m in messages if m.get("role") != "system"]
-        body.update(kwargs)
-        return body
+    def _extract_system(self, messages: list[dict[str, Any]]) -> tuple[str, list[dict]]:
+        """Extract system message from messages (Anthropic uses separate system param)."""
+        system = ""
+        filtered = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                system = msg.get("content", "")
+            else:
+                filtered.append(msg)
+        return system, filtered
 
     def _to_unified(self, data: dict, model: str) -> dict[str, Any]:
         """Convert Anthropic response to unified format."""
         content = ""
-        tool_calls = None
         content_blocks = data.get("content", []) or []
         text_blocks = [b for b in content_blocks if b.get("type") == "text"]
         if text_blocks:
@@ -155,16 +139,16 @@ class AnthropicProvider(BaseProvider):
             "usage": {
                 "prompt_tokens": usage.get("input_tokens", 0),
                 "completion_tokens": usage.get("output_tokens", 0),
-                "total_tokens": (usage.get("input_tokens", 0) + usage.get("output_tokens", 0)),
-                "cache_tokens": 0,  # Anthropic doesn't expose cache_tokens in standard response
+                "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+                "cache_tokens": usage.get("cache_read_input_tokens", 0),
             },
             "provider": "anthropic",
         }
 
-    def _chunk_to_unified(self, data: dict, model: str, event_type: str) -> dict[str, Any]:
-        """Convert Anthropic SSE chunk to unified format."""
+    def _event_to_chunk(self, event: Any, model: str) -> dict[str, Any]:
+        """Convert Anthropic streaming event to unified chunk format."""
         chunk: dict[str, Any] = {
-            "id": data.get("message_id", ""),
+            "id": "",
             "object": "chat.completion.chunk",
             "model": model,
             "choices": [
@@ -178,24 +162,50 @@ class AnthropicProvider(BaseProvider):
             "provider": "anthropic",
         }
 
-        if event_type == "message_start" and "message" in data:
-            msg = data["message"]
-            chunk["id"] = msg.get("id", "")
-            chunk["choices"][0]["delta"] = {"role": msg.get("role", "assistant"), "content": ""}
+        # Handle different event types
+        event_type = getattr(event, "type", "")
 
-        elif event_type == "content_block_delta":
-            delta = data.get("delta", {}) or {}
-            chunk["choices"][0]["delta"] = {"content": delta.get("text", "")}
-
-        elif event_type == "message_delta":
-            delta = data.get("delta", {}) or {}
-            chunk["choices"][0]["finish_reason"] = delta.get("stop_reason")
-            usage = data.get("usage", {}) or {}
-            chunk["usage"] = {
-                "prompt_tokens": usage.get("input_tokens", 0),
-                "completion_tokens": usage.get("output_tokens", 0),
-                "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
-                "cache_tokens": 0,
+        if event_type == "message_start" and hasattr(event, "message"):
+            msg = event.message
+            chunk["id"] = getattr(msg, "id", "")
+            chunk["choices"][0]["delta"] = {
+                "role": getattr(msg, "role", "assistant"),
+                "content": "",
             }
+
+        elif event_type == "content_block_delta" and hasattr(event, "delta"):
+            delta = event.delta
+            if hasattr(delta, "text"):
+                chunk["choices"][0]["delta"] = {"content": delta.text}
+            # Handle thinking content
+            elif hasattr(delta, "thinking"):
+                chunk["choices"][0]["delta"] = {"reasoning_content": delta.thinking}
+
+        elif event_type == "message_delta" and hasattr(event, "delta"):
+            delta = event.delta
+            chunk["choices"][0]["finish_reason"] = getattr(delta, "stop_reason", None)
+            # Usage is typically on the final event
+            if hasattr(event, "usage"):
+                usage = event.usage
+                chunk["usage"] = {
+                    "prompt_tokens": getattr(usage, "input_tokens", 0),
+                    "completion_tokens": getattr(usage, "output_tokens", 0),
+                    "total_tokens": getattr(usage, "input_tokens", 0) + getattr(usage, "output_tokens", 0),
+                    "cache_tokens": getattr(usage, "cache_read_input_tokens", 0),
+                }
+
+        elif event_type == "content_block_start" and hasattr(event, "content_block"):
+            block = event.content_block
+            if getattr(block, "type", "") == "tool_use":
+                chunk["choices"][0]["delta"] = {
+                    "tool_calls": [{
+                        "id": getattr(block, "id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": getattr(block, "name", ""),
+                            "arguments": "",
+                        },
+                    }]
+                }
 
         return chunk

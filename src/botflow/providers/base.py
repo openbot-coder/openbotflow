@@ -45,7 +45,7 @@ class BaseProvider(ABC):
                 "prompt_tokens": 10,
                 "completion_tokens": 20,
                 "total_tokens": 30,
-                "prompt_tokens_details": {"cached_tokens": 5}
+                "cache_tokens": 5
             },
             "provider": "openai"
         }
@@ -84,13 +84,3 @@ class BaseProvider(ABC):
         Returns:
             List of model dicts with at minimum {"id": "...", "object": "model"}.
         """
-
-    def _check_response(self, resp: Any, provider_name: str) -> None:
-        """Validate HTTP response and raise on errors."""
-        from botflow.common.exceptions import ProviderError
-
-        if not 200 <= resp.status_code < 300:
-            body = resp.text[:500]
-            raise ProviderError(
-                f"{provider_name} returned HTTP {resp.status_code}: {body}"
-            )

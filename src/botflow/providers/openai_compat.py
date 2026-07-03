@@ -1,11 +1,17 @@
-"""OpenAI-compatible provider (OpenAI, Azure, vLLM, Ollama)."""
+"""OpenAI-compatible provider (OpenAI, Azure, vLLM, Ollama).
+
+Uses the official openai SDK which supports:
+- Direct OpenAI API
+- Azure OpenAI
+- Any OpenAI-compatible endpoint (vLLM, Ollama, etc.)
+"""
 
 from __future__ import annotations
 
-import json
 from typing import Any, AsyncGenerator
 
-import httpx
+from openai import AsyncOpenAI, AsyncAzureOpenAI
+from openai.types.chat import ChatCompletionChunk
 
 from botflow.common.exceptions import ProviderError
 from botflow.common.logger import get_logger
@@ -17,7 +23,8 @@ logger = get_logger("providers.openai")
 class OpenAICompatProvider(BaseProvider):
     """Provider for OpenAI-compatible APIs.
 
-    Supports: OpenAI API, Azure OpenAI, vLLM, Ollama, and any OpenAI-compatible endpoint.
+    Uses the official openai SDK for proper connection pooling, retry logic,
+    and protocol compliance.
     """
 
     def __init__(
@@ -27,23 +34,26 @@ class OpenAICompatProvider(BaseProvider):
         extra_config: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(api_key, base_url, extra_config)
-        self._client: httpx.AsyncClient | None = None
+        self._client: AsyncOpenAI | None = None
+        self._azure_client: AsyncAzureOpenAI | None = None
 
     @property
-    def client(self) -> httpx.AsyncClient:
+    def client(self) -> AsyncOpenAI | AsyncAzureOpenAI:
+        """Get or create the OpenAI client (lazy initialization)."""
+        if "azure" in self.extra_config.get("mode", ""):
+            if self._azure_client is None:
+                self._azure_client = AsyncAzureOpenAI(
+                    api_key=self.api_key,
+                    azure_endpoint=self.base_url,
+                    api_version=self.extra_config.get("api_version", "2024-02-01"),
+                    timeout=self.extra_config.get("timeout", 120.0),
+                )
+            return self._azure_client
+        
         if self._client is None:
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            }
-            if "azure" in self.extra_config.get("mode", ""):
-                headers = {
-                    "api-key": self.api_key,
-                    "Content-Type": "application/json",
-                }
-            self._client = httpx.AsyncClient(
+            self._client = AsyncOpenAI(
+                api_key=self.api_key or "dummy",
                 base_url=self.base_url,
-                headers=headers,
                 timeout=self.extra_config.get("timeout", 120.0),
             )
         return self._client
@@ -57,25 +67,17 @@ class OpenAICompatProvider(BaseProvider):
         stream: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "stream": False,
-        }
-        if temperature is not None:
-            body["temperature"] = temperature
-        if max_tokens is not None:
-            body["max_tokens"] = max_tokens
-        body.update(kwargs)
-
         try:
-            resp = await self.client.post("/chat/completions", json=body)
-            self._check_response(resp, "OpenAICompat")
-            data = resp.json()
-            return self._to_unified(data, model, "openai")
-        except httpx.TimeoutException:
-            raise ProviderError(f"OpenAICompat provider timed out for model {model}")
-        except httpx.RequestError as e:
+            response = await self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=False,
+                **kwargs,
+            )
+            return self._to_unified(response.model_dump(), model)
+        except Exception as e:
             raise ProviderError(f"OpenAICompat request failed: {e}")
 
     async def chat_stream(
@@ -86,44 +88,30 @@ class OpenAICompatProvider(BaseProvider):
         max_tokens: int | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[dict[str, Any], None]:
-        body: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        if temperature is not None:
-            body["temperature"] = temperature
-        if max_tokens is not None:
-            body["max_tokens"] = max_tokens
-        body.update(kwargs)
-
         try:
-            async with self.client.stream("POST", "/chat/completions", json=body) as resp:
-                self._check_response(resp, "OpenAICompat")
-                async for line in resp.aiter_lines():
-                    line = line.strip()
-                    if not line or line == "data: [DONE]":
-                        continue
-                    if line.startswith("data: "):
-                        chunk = json.loads(line[6:])
-                        yield self._chunk_to_unified(chunk, model, "openai")
-        except httpx.TimeoutException:
-            raise ProviderError(f"OpenAICompat stream timed out for model {model}")
-        except httpx.RequestError as e:
+            stream = await self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+                stream_options={"include_usage": True},
+                **kwargs,
+            )
+            async for chunk in stream:
+                yield self._chunk_to_unified(chunk.model_dump(), model)
+        except Exception as e:
             raise ProviderError(f"OpenAICompat stream failed: {e}")
 
     async def list_models(self) -> list[dict[str, Any]]:
         try:
-            resp = await self.client.get("/models")
-            self._check_response(resp, "OpenAICompat")
-            data = resp.json()
-            return data.get("data", [])
-        except httpx.RequestError as e:
+            response = await self.client.models.list()
+            return [m.model_dump() for m in response.data]
+        except Exception as e:
             logger.warning("Failed to list models from {}: {}", self.base_url, e)
             return []
 
-    def _to_unified(self, data: dict, model: str, provider: str) -> dict[str, Any]:
+    def _to_unified(self, data: dict, model: str) -> dict[str, Any]:
         """Convert OpenAI response to unified format."""
         choice = (data.get("choices") or [{}])[0]
         msg = choice.get("message", {}) or {}
@@ -149,10 +137,10 @@ class OpenAICompatProvider(BaseProvider):
                 "total_tokens": usage.get("total_tokens", 0),
                 "cache_tokens": prompt_details.get("cached_tokens", 0),
             },
-            "provider": provider,
+            "provider": "openai",
         }
 
-    def _chunk_to_unified(self, data: dict, model: str, provider: str) -> dict[str, Any]:
+    def _chunk_to_unified(self, data: dict, model: str) -> dict[str, Any]:
         """Convert OpenAI stream chunk to unified format."""
         raw_choices = data.get("choices") or []
         choice = raw_choices[0] if raw_choices and raw_choices[0] is not None else {}
@@ -173,7 +161,7 @@ class OpenAICompatProvider(BaseProvider):
                 }
             ],
             "usage": None,
-            "provider": provider,
+            "provider": "openai",
         }
 
         # Forward tool_calls if present
