@@ -89,13 +89,16 @@ class OpenAICompatProvider(BaseProvider):
         **kwargs: Any,
     ) -> AsyncGenerator[dict[str, Any], None]:
         try:
+            stream_options = kwargs.pop("stream_options", {"include_usage": True})
+            if isinstance(stream_options, dict):
+                stream_options.setdefault("include_usage", True)
             stream = await self.client.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 stream=True,
-                stream_options={"include_usage": True},
+                stream_options=stream_options,
                 **kwargs,
             )
             async for chunk in stream:
@@ -118,16 +121,22 @@ class OpenAICompatProvider(BaseProvider):
         usage = data.get("usage", {}) or {}
         prompt_details = usage.get("prompt_tokens_details", {}) or {}
 
+        message: dict[str, Any] = {
+            "role": msg.get("role", "assistant"),
+            "content": msg.get("content"),
+        }
+        if msg.get("tool_calls"):
+            message["tool_calls"] = msg["tool_calls"]
+        if msg.get("function_call"):
+            message["function_call"] = msg["function_call"]
+
         return {
             "id": data.get("id", ""),
             "model": data.get("model", model),
             "choices": [
                 {
                     "index": choice.get("index", 0),
-                    "message": {
-                        "role": msg.get("role", "assistant"),
-                        "content": msg.get("content", ""),
-                    },
+                    "message": message,
                     "finish_reason": choice.get("finish_reason", "stop"),
                 }
             ],
@@ -146,31 +155,29 @@ class OpenAICompatProvider(BaseProvider):
         choice = raw_choices[0] if raw_choices and raw_choices[0] is not None else {}
         delta = choice.get("delta") or {}
 
-        chunk = {
+        delta_out: dict[str, Any] = {
+            "role": delta.get("role") or "assistant",
+            "content": delta.get("content"),
+        }
+        if delta.get("tool_calls"):
+            delta_out["tool_calls"] = delta["tool_calls"]
+        if delta.get("function_call"):
+            delta_out["function_call"] = delta["function_call"]
+
+        chunk: dict[str, Any] = {
             "id": data.get("id", ""),
             "object": "chat.completion.chunk",
             "model": data.get("model", model),
             "choices": [
                 {
                     "index": choice.get("index", 0),
-                    "delta": {
-                        "role": delta.get("role") or "assistant",
-                        "content": delta.get("content") or "",
-                    },
+                    "delta": delta_out,
                     "finish_reason": choice.get("finish_reason"),
                 }
             ],
             "usage": None,
             "provider": "openai",
         }
-
-        # Forward tool_calls if present
-        if delta.get("tool_calls"):
-            chunk["choices"][0]["delta"]["tool_calls"] = delta["tool_calls"]
-
-        # Forward reasoning_content (thinking process) if present
-        if delta.get("reasoning_content") is not None:
-            chunk["choices"][0]["delta"]["reasoning_content"] = delta["reasoning_content"]
 
         # Include usage on final chunk if provided
         usage = data.get("usage")

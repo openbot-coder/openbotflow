@@ -52,16 +52,21 @@ def internal_to_openai(internal: dict[str, Any]) -> dict[str, Any]:
     choices = []
     for c in internal.get("choices", []):
         msg = c.get("message", {})
+        message: dict[str, Any] = {
+            "role": msg.get("role", "assistant"),
+            "content": msg.get("content", ""),
+        }
+        if msg.get("tool_calls"):
+            message["tool_calls"] = msg["tool_calls"]
+        if msg.get("function_call"):
+            message["function_call"] = msg["function_call"]
         choices.append({
             "index": c.get("index", 0),
-            "message": {
-                "role": msg.get("role", "assistant"),
-                "content": msg.get("content", ""),
-            },
+            "message": message,
             "finish_reason": c.get("finish_reason", "stop"),
         })
 
-    return {
+    result: dict[str, Any] = {
         "id": internal.get("id", ""),
         "object": "chat.completion",
         "created": _now_timestamp(),
@@ -69,6 +74,9 @@ def internal_to_openai(internal: dict[str, Any]) -> dict[str, Any]:
         "choices": choices,
         "usage": internal.get("usage", {}),
     }
+    if internal.get("system_fingerprint"):
+        result["system_fingerprint"] = internal["system_fingerprint"]
+    return result
 
 
 def internal_to_anthropic(internal: dict[str, Any]) -> dict[str, Any]:
@@ -77,16 +85,33 @@ def internal_to_anthropic(internal: dict[str, Any]) -> dict[str, Any]:
     choice = raw_choices[0] if raw_choices and raw_choices[0] is not None else {}
     msg = choice.get("message") or {}
     content_text = msg.get("content") or ""
+    tool_calls = msg.get("tool_calls") or []
 
     usage = internal.get("usage", {})
+
+    content: list[dict[str, Any]] = []
+    if content_text:
+        content.append({"type": "text", "text": content_text})
+    for tc in tool_calls:
+        tc_func = tc.get("function", {})
+        content.append({
+            "type": "tool_use",
+            "id": tc.get("id", "toolu_" + _now_hex()),
+            "name": tc_func.get("name", ""),
+            "input": _safe_json_loads(tc_func.get("arguments", "{}")),
+        })
+
+    stop_reason = choice.get("finish_reason") or "end_turn"
+    if tool_calls and stop_reason == "stop":
+        stop_reason = "tool_use"
 
     return {
         "id": internal.get("id", ""),
         "type": "message",
         "role": "assistant",
-        "content": [{"type": "text", "text": content_text}],
+        "content": content,
         "model": internal.get("model", ""),
-        "stop_reason": choice.get("finish_reason") or "end_turn",
+        "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {
             "input_tokens": usage.get("prompt_tokens", 0),
@@ -263,10 +288,19 @@ def _now_hex() -> str:
     return secrets.token_hex(8)
 
 
+def _safe_json_loads(s: str) -> Any:
+    import json
+    try:
+        return json.loads(s) if s else {}
+    except Exception:
+        return {}
+
+
 def _anthropic_stop_reason(finish_reason: str) -> str:
     mapping = {
         "stop": "end_turn",
         "length": "max_tokens",
         "content_filter": "content_filter",
+        "tool_calls": "tool_use",
     }
     return mapping.get(finish_reason, "end_turn")

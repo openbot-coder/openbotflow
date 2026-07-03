@@ -15,7 +15,7 @@ def register_stats_tools(mcp: FastMCP, db: Database) -> None:
     """Register all statistics tools with the provided MCP server."""
 
     @mcp.tool()
-    async def query_model_stats(model_id: int) -> str:
+    async def query_model_stats(model_id: int) -> dict:
         """Get aggregated statistics for a specific model.
 
         Args:
@@ -23,26 +23,26 @@ def register_stats_tools(mcp: FastMCP, db: Database) -> None:
         """
         stats = await db.get_model_stats(model_id)
         if stats is None:
-            return f"No stats found for model id={model_id}."
+            return {"error": f"No stats found for model id={model_id}."}
 
-        avg_line = (
-            f"  Avg duration: {stats.avg_duration_ms:.1f}ms\n"
-            if stats.avg_duration_ms else "  Avg duration: N/A\n"
-        )
-        return (
-            f"Model [{stats.model_id}] {stats.model_name}:\n"
-            f"  Total calls: {stats.total_calls}\n"
-            f"  Success: {stats.success_calls}\n"
-            f"  Errors: {stats.error_calls}\n"
-            f"{avg_line}"
-            f"  Prompt tokens: {stats.total_prompt_tokens:,}\n"
-            f"  Completion tokens: {stats.total_completion_tokens:,}\n"
-            f"  Cache tokens: {stats.total_cache_tokens:,}\n"
-            f"  Total cost: ${stats.total_cost:.4f}\n"
-        )
+        return {
+            "model_id": stats.model_id,
+            "model_name": stats.model_name,
+            "total_calls": stats.total_calls,
+            "success": stats.success_calls,
+            "errors": stats.error_calls,
+            "avg_duration_ms": stats.avg_duration_ms,
+            "min_duration_ms": stats.min_duration_ms,
+            "max_duration_ms": stats.max_duration_ms,
+            "prompt_tokens": stats.total_prompt_tokens,
+            "completion_tokens": stats.total_completion_tokens,
+            "cache_tokens": stats.total_cache_tokens,
+            "total_tokens": stats.total_tokens,
+            "total_cost": round(stats.total_cost, 4),
+        }
 
     @mcp.tool()
-    async def query_group_stats(group_id: int) -> str:
+    async def query_group_stats(group_id: int) -> dict:
         """Get aggregated statistics for a specific group.
 
         Args:
@@ -50,20 +50,17 @@ def register_stats_tools(mcp: FastMCP, db: Database) -> None:
         """
         stats = await db.get_group_stats(group_id)
         if stats is None:
-            return f"No stats found for group id={group_id}."
+            return {"error": f"No stats found for group id={group_id}."}
 
-        avg_line = (
-            f"  Avg duration: {stats.avg_duration_ms:.1f}ms\n"
-            if stats.avg_duration_ms else "  Avg duration: N/A\n"
-        )
-        return (
-            f"Group [{stats.group_id}] {stats.group_name}:\n"
-            f"  Total calls: {stats.total_calls}\n"
-            f"  Success: {stats.success_calls}\n"
-            f"  Errors: {stats.error_calls}\n"
-            f"{avg_line}"
-            f"  Total cost: ${stats.total_cost:.4f}\n"
-        )
+        return {
+            "group_id": stats.group_id,
+            "group_name": stats.group_name,
+            "total_calls": stats.total_calls,
+            "success": stats.success_calls,
+            "errors": stats.error_calls,
+            "avg_duration_ms": stats.avg_duration_ms,
+            "total_cost": round(stats.total_cost, 4),
+        }
 
     @mcp.tool()
     async def query_messages(
@@ -72,7 +69,7 @@ def register_stats_tools(mcp: FastMCP, db: Database) -> None:
         status: str | None = None,
         limit: int = 20,
         offset: int = 0,
-    ) -> str:
+    ) -> dict:
         """Query recent call logs with optional filters.
 
         Args:
@@ -91,24 +88,29 @@ def register_stats_tools(mcp: FastMCP, db: Database) -> None:
             offset=offset,
         )
         if not logs:
-            return "No messages found."
+            return {"messages": [], "total": 0}
 
-        lines = [f"Found {len(logs)} message(s):"]
+        items = []
         for l in logs:
-            tokens_info = (
-                f"prompt={l.prompt_tokens}, completion={l.completion_tokens}"
-                f"{f', cache={l.cache_tokens}' if l.cache_tokens and l.cache_tokens > 0 else ''}"
-                if l.total_tokens and l.total_tokens > 0
-                else "no tokens"
-            )
-            lines.append(
-                f"  [{l.id}] status={l.status} | {tokens_info} | "
-                f"duration={l.duration_ms}ms | {l.created_at}"
-            )
-        return "\n".join(lines)
+            items.append({
+                "id": l.id,
+                "status": l.status,
+                "duration_ms": l.duration_ms,
+                "prompt_tokens": l.prompt_tokens,
+                "completion_tokens": l.completion_tokens,
+                "cache_tokens": l.cache_tokens,
+                "total_tokens": l.total_tokens,
+                "cost": round(l.cost, 4) if l.cost is not None else None,
+                "created_at": l.created_at.isoformat() if hasattr(l.created_at, 'isoformat') else str(l.created_at),
+            })
+
+        return {
+            "messages": items,
+            "total": len(items),
+        }
 
     @mcp.tool()
-    async def query_cost_summary(days: int = 30) -> str:
+    async def query_cost_summary(days: int = 30) -> dict:
         """Get daily cost summary for the last N days.
 
         Args:
@@ -116,23 +118,26 @@ def register_stats_tools(mcp: FastMCP, db: Database) -> None:
         """
         summary = await db.get_cost_summary(days=days)
         if not summary:
-            return f"No cost data found for the last {days} days."
+            return {"error": f"No cost data found for the last {days} days."}
 
         total_cost = sum(s["total_cost"] for s in summary)
         total_calls = sum(s["total_calls"] for s in summary)
         total_tokens = sum(s["total_tokens"] for s in summary)
 
-        lines = [
-            f"Cost summary for the last {days} days:",
-            f"  Total calls: {total_calls}",
-            f"  Total cost: ${total_cost:.4f}",
-            f"  Total tokens: {total_tokens:,}",
-            "",
-            "Daily breakdown:",
-        ]
+        daily = []
         for s in summary:
-            lines.append(f"  {s['day']}: {s['total_calls']} calls, ${s['total_cost']:.4f}")
+            daily.append({
+                "day": s["day"],
+                "calls": s["total_calls"],
+                "cost": round(s["total_cost"], 4),
+                "tokens": s["total_tokens"],
+            })
 
-        return "\n".join(lines)
+        return {
+            "total_calls": total_calls,
+            "total_cost": round(total_cost, 4),
+            "total_tokens": total_tokens,
+            "daily": daily,
+        }
 
     log.info("MCP stats tools registered.")

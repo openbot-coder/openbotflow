@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from loguru import logger
@@ -20,7 +20,7 @@ async def cleanup_call_logs(db: Database, retention_days: int = 180) -> int:
     Returns:
         Number of deleted rows.
     """
-    cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
+    cutoff = (datetime.now() - timedelta(days=retention_days)).isoformat()
     deleted = await db.delete_old_call_logs(cutoff)
     if deleted > 0:
         logger.info("Cleaned up {} old call_log records (retention: {} days)", deleted, retention_days)

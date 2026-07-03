@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
@@ -18,8 +18,8 @@ class Provider(BaseModel):
     base_url: str = ""
     extra_config: dict[str, Any] = Field(default_factory=dict)
     is_enabled: bool = True
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    created_at: datetime = Field(default_factory=lambda: datetime.now())
+    updated_at: datetime = Field(default_factory=lambda: datetime.now())
 
 
 class Model(BaseModel):
@@ -34,8 +34,8 @@ class Model(BaseModel):
     cooldown_failure_threshold: int = 3
     extra_config: dict[str, Any] = Field(default_factory=dict)
     is_enabled: bool = True
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    created_at: datetime = Field(default_factory=lambda: datetime.now())
+    updated_at: datetime = Field(default_factory=lambda: datetime.now())
 
 
 class ModelGroup(BaseModel):
@@ -45,8 +45,8 @@ class ModelGroup(BaseModel):
     name: str
     description: str = ""
     is_enabled: bool = True
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    created_at: datetime = Field(default_factory=lambda: datetime.now())
+    updated_at: datetime = Field(default_factory=lambda: datetime.now())
 
 
 class GroupModel(BaseModel):
@@ -57,7 +57,7 @@ class GroupModel(BaseModel):
     model_id: int
     weight: float = 1.0
     is_enabled: bool = True
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    created_at: datetime = Field(default_factory=lambda: datetime.now())
 
 
 class GroupModelWithDetails(BaseModel):
@@ -96,7 +96,7 @@ class CallLog(BaseModel):
     tool_calls: Optional[str] = None  # JSON string of tool calls
     cost: Optional[float] = None
     error_message: Optional[str] = None
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    created_at: datetime = Field(default_factory=lambda: datetime.now())
 
 
 class ModelStats(BaseModel):
@@ -108,9 +108,12 @@ class ModelStats(BaseModel):
     success_calls: int = 0
     error_calls: int = 0
     avg_duration_ms: Optional[float] = None
+    min_duration_ms: Optional[float] = None
+    max_duration_ms: Optional[float] = None
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
     total_cache_tokens: int = 0
+    total_tokens: int = 0
     total_cost: float = 0.0
 
 
