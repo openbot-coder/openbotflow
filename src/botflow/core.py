@@ -56,8 +56,6 @@ log = get_logger("core")
 _db: Optional[Database] = None
 _cooldown_manager = CooldownManager()
 _config: Optional[BotflowSettings] = None
-_llm_key_cache: Optional[str] = None  # Cache for LLM key
-_llm_key_cache_time: float = 0.0  # Last cache refresh time
 
 
 def _get_db() -> Database:
@@ -65,16 +63,9 @@ def _get_db() -> Database:
     return _db
 
 
-async def _get_llm_key(force_refresh: bool = False) -> str:
-    """Get LLM key with caching (refresh every 60 seconds)."""
-    global _llm_key_cache, _llm_key_cache_time
-    now = time.time()
-    if not force_refresh and _llm_key_cache is not None and (now - _llm_key_cache_time) < 60:
-        return _llm_key_cache
+async def _get_llm_key() -> str:
     key = await _get_db().get_config("llm_key")
-    _llm_key_cache = key or ""
-    _llm_key_cache_time = now
-    return _llm_key_cache
+    return key or ""
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +344,8 @@ async def completions(request: Request):
         if isinstance(prompt, list):
             prompt = "\n".join(prompt)
         body["messages"] = [{"role": "user", "content": prompt}]
+        # Remove prompt field to avoid passing it to provider SDK
+        body.pop("prompt", None)
 
     internal = openai_to_internal(body)
     stream = internal["stream"]
