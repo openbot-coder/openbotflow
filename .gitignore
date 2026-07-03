@@ -31,6 +31,9 @@ htmlcov/
 data/
 *.db
 
+# Logs
+logs/
+
 # Environment variables
 .env
 .env.local
