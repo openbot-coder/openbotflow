@@ -16,7 +16,7 @@ def get_workspace_path(custom_path: str | None = None) -> Path:
 
     Priority:
         1. Custom path from CLI --workspace argument
-        2. Default: ~/.botflow/
+        2. Default: current directory (./)
 
     Args:
         custom_path: Optional custom workspace path from CLI.
@@ -26,7 +26,7 @@ def get_workspace_path(custom_path: str | None = None) -> Path:
     """
     if custom_path:
         return Path(custom_path).expanduser().resolve()
-    return (Path.home() / ".botflow").expanduser().resolve()
+    return Path.cwd().resolve()
 
 
 def init_workspace(workspace: Path) -> Path:

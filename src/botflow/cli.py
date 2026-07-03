@@ -20,7 +20,7 @@ def main() -> None:
 
     # botflow run
     run_parser = subparsers.add_parser("run", help="Start the main service (foreground)")
-    run_parser.add_argument("--workspace", default=None, help="Workspace path (default: ~/.botflow/)")
+    run_parser.add_argument("--workspace", default=None, help="Workspace path (default: current directory)")
     run_parser.add_argument("--host", default="0.0.0.0", help="HTTP server host")
     run_parser.add_argument("--port", type=int, default=8080, help="HTTP server port")
 
@@ -28,7 +28,7 @@ def main() -> None:
     set_parser = subparsers.add_parser("set", help="Set API keys")
     set_parser.add_argument("key_type", choices=["llm-key", "mcp-key"], help="Key type")
     set_parser.add_argument("key_value", help="The key value")
-    set_parser.add_argument("--workspace", default=None, help="Workspace path (default: ~/.botflow/)")
+    set_parser.add_argument("--workspace", default=None, help="Workspace path (default: current directory)")
 
     args = parser.parse_args()
 
