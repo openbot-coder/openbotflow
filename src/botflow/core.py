@@ -18,6 +18,7 @@ import json
 import os
 import time
 import traceback
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
@@ -166,50 +167,67 @@ app.mount("/mcp", mcp_server.sse_app())
 
 
 # ---------------------------------------------------------------------------
-# Middleware: Rate Limiting
+# Middleware: Rate Limiting (per API key)
 # ---------------------------------------------------------------------------
 
 
 class RateLimitMiddleware:
-    """Simple in-memory rate limiter middleware."""
-    
-    def __init__(self, app, max_requests: int = 100, window_seconds: int = 60):
+    """Rate limiter middleware using fixed-size deque per API key.
+
+    Pre-allocates deque with maxlen=max_requests.
+    Oldest timestamp at dq[0] determines if window has expired.
+    """
+
+    def __init__(self, app, max_requests: int = 300, window_seconds: int = 60):
         self.app = app
         self.max_requests = max_requests
         self.window_seconds = window_seconds
-        self.requests: dict[str, list[float]] = {}
-    
+        self._requests: dict[str, deque[float]] = {}
+
+    def _get_rate_limit_key(self, request) -> str:
+        """Extract rate limit key from request (LLM key or MCP key)."""
+        auth = request.headers.get("authorization", "")
+        if auth.startswith("Bearer "):
+            return auth[7:]
+
+        api_key = request.query_params.get("api_key")
+        if api_key:
+            return api_key
+
+        return request.client.host if request.client else "anonymous"
+
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
-        
+
         from starlette.requests import Request
         from starlette.responses import JSONResponse
-        
+
         request = Request(scope, receive)
-        client_ip = request.client.host if request.client else "unknown"
+
+        if request.url.path == "/health":
+            return await self.app(scope, receive, send)
+
+        key = self._get_rate_limit_key(request)
         now = time.time()
-        
-        # 清理过期记录
-        if client_ip in self.requests:
-            self.requests[client_ip] = [t for t in self.requests[client_ip] if now - t < self.window_seconds]
-        else:
-            self.requests[client_ip] = []
-        
-        # 检查速率限制
-        if len(self.requests[client_ip]) >= self.max_requests:
+
+        dq = self._requests.setdefault(key, deque([now-1],maxlen=self.max_requests))
+
+        # If deque full and oldest timestamp still in window -> rate limited
+        if  now - self.window_seconds <= dq[0] and len(dq) == self.max_requests:
+            retry_after = int(dq[0] + self.window_seconds - now) + 1
             response = JSONResponse(
                 status_code=429,
-                content={"error": "Too many requests", "retry_after": self.window_seconds}
+                content={"error": "Too many requests", "retry_after": retry_after},
             )
             return await response(scope, receive, send)
-        
-        self.requests[client_ip].append(now)
+
+        dq.append(now)
         return await self.app(scope, receive, send)
 
 
-# 添加速率限制中间件（跳过健康检查和MCP端点）
-app.add_middleware(RateLimitMiddleware, max_requests=100, window_seconds=60)
+# 添加速率限制中间件（每个 KEY 300 次/分钟）
+app.add_middleware(RateLimitMiddleware, max_requests=300, window_seconds=60)
 
 
 # ---------------------------------------------------------------------------
