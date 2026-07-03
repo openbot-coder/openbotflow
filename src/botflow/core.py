@@ -113,6 +113,17 @@ async def lifespan(app: FastAPI):
     log.info("MCP management service available via SSE at /mcp/sse")
     log.info("MCP tools: provider CRUD, model CRUD, group CRUD, stats queries")
 
+    # Auto-configure keys from environment variables (for Docker deployment)
+    db = _get_db()
+    env_llm_key = os.environ.get("LLM_KEY", "")
+    env_mcp_key = os.environ.get("MCP_KEY", "")
+    if env_llm_key and not await db.get_config("llm_key"):
+        await db.set_config("llm_key", env_llm_key)
+        log.info("LLM key configured from environment variable.")
+    if env_mcp_key and not await db.get_config("mcp_key"):
+        await db.set_config("mcp_key", env_mcp_key)
+        log.info("MCP key configured from environment variable.")
+
     # Start background cleanup task (every 24 hours)
     async def _periodic_cleanup():
         while True:
@@ -128,8 +139,13 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown
+    # Shutdown: gracefully cancel cleanup task
     cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+
     if _db:
         await _db.close()
     log.info("botflow service stopped.")
@@ -235,19 +251,35 @@ app.add_middleware(RateLimitMiddleware, max_requests=300, window_seconds=60)
 # ---------------------------------------------------------------------------
 
 
-@app.middleware("http")
-async def auth_middleware(request: Request, call_next):
-    # Skip auth for health check and MCP endpoints (SSE streaming incompatible with middleware)
-    if request.url.path == "/health" or request.url.path.startswith("/mcp/"):
-        return await call_next(request)
+class AuthMiddleware:
+    """Pure ASGI middleware for LLM key authentication."""
 
-    llm_key = await _get_llm_key()
-    if llm_key:
-        error_response = verify_llm_key(request, llm_key)
-        if error_response:
-            return error_response
+    def __init__(self, app):
+        self.app = app
 
-    return await call_next(request)
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse
+
+        request = Request(scope, receive)
+
+        # Skip auth for health check and MCP endpoints
+        if request.url.path == "/health" or request.url.path.startswith("/mcp/"):
+            return await self.app(scope, receive, send)
+
+        llm_key = await _get_llm_key()
+        if llm_key:
+            error_response = verify_llm_key(request, llm_key)
+            if error_response:
+                return await error_response(scope, receive, send)
+
+        return await self.app(scope, receive, send)
+
+
+app.add_middleware(AuthMiddleware)
 
 
 # ---------------------------------------------------------------------------

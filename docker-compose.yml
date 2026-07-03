@@ -1,0 +1,21 @@
+services:
+  botflow:
+    build: .
+    container_name: botflow
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - BOTFLOW_WORKSPACE=/app/data
+      - BOTFLOW_CORS_ORIGINS=http://localhost:3000,http://localhost:8080
+      # Uncomment and set your keys:
+      # - LLM_KEY=sk-your-llm-key
+      # - MCP_KEY=your-mcp-key
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
