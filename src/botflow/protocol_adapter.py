@@ -101,6 +101,19 @@ def internal_chunk_to_openai_sse(chunk: dict[str, Any]) -> dict[str, Any]:
     choice = choices[0] if choices else {}
     delta = choice.get("delta", {})
 
+    sse_delta: dict[str, Any] = {
+        "role": delta.get("role", ""),
+        "content": delta.get("content", ""),
+    }
+
+    # Forward tool_calls if present
+    if delta.get("tool_calls"):
+        sse_delta["tool_calls"] = delta["tool_calls"]
+
+    # Forward reasoning_content (thinking process) if present
+    if delta.get("reasoning_content") is not None:
+        sse_delta["reasoning_content"] = delta["reasoning_content"]
+
     sse_chunk = {
         "id": chunk.get("id", ""),
         "object": "chat.completion.chunk",
@@ -109,10 +122,7 @@ def internal_chunk_to_openai_sse(chunk: dict[str, Any]) -> dict[str, Any]:
         "choices": [
             {
                 "index": choice.get("index", 0),
-                "delta": {
-                    "role": delta.get("role", ""),
-                    "content": delta.get("content", ""),
-                },
+                "delta": sse_delta,
                 "finish_reason": choice.get("finish_reason"),
             }
         ],
@@ -154,7 +164,7 @@ def internal_chunk_to_anthropic_sse(chunk: dict[str, Any]) -> list[dict[str, Any
             },
         })
 
-    # Content block delta
+    # Content block delta (text)
     if content:
         events.append({
             "type": "content_block_delta",
@@ -164,6 +174,34 @@ def internal_chunk_to_anthropic_sse(chunk: dict[str, Any]) -> list[dict[str, Any
                 "text": content,
             },
         })
+
+    # Tool use delta
+    tool_calls = delta.get("tool_calls")
+    if tool_calls:
+        for tc in tool_calls:
+            tc_index = tc.get("index", 0)
+            tc_func = tc.get("function", {})
+            # Tool use start
+            if tc_func.get("name"):
+                events.append({
+                    "type": "content_block_start",
+                    "index": tc_index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tc.get("id", "toolu_" + _now_hex()),
+                        "name": tc_func["name"],
+                    },
+                })
+            # Tool use arguments delta
+            if tc_func.get("arguments"):
+                events.append({
+                    "type": "content_block_delta",
+                    "index": tc_index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": tc_func["arguments"],
+                    },
+                })
 
     # Finish event
     finish_reason = choice.get("finish_reason")

@@ -176,6 +176,14 @@ class OpenAICompatProvider(BaseProvider):
             "provider": provider,
         }
 
+        # Forward tool_calls if present
+        if delta.get("tool_calls"):
+            chunk["choices"][0]["delta"]["tool_calls"] = delta["tool_calls"]
+
+        # Forward reasoning_content (thinking process) if present
+        if delta.get("reasoning_content") is not None:
+            chunk["choices"][0]["delta"]["reasoning_content"] = delta["reasoning_content"]
+
         # Include usage on final chunk if provided
         usage = data.get("usage")
         if usage:
