@@ -46,3 +46,6 @@ desktop.ini
 # uv
 .python-version
 uv.lock
+
+.qoder/
+uv.lock

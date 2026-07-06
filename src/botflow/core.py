@@ -102,17 +102,20 @@ async def lifespan(app: FastAPI):
     register_stats_tools(mcp_server, _get_db())
     log.info(f"MCP tools registered: {list(mcp_server._tool_manager._tools.keys())}")
 
-    # Warn if MCP key is not configured
-    mcp_key = await _get_db().get_config("mcp_key") if _db else None
-    if not mcp_key:
-        log.warning("No MCP key configured - MCP tools have no authentication! "
-                     "Use 'botflow set mcp-key <key>' to configure.")
-    else:
-        log.info("MCP authentication is enabled.")
+    # Register MemWiki tools + Dream background task
+    from botflow.wiki.agent import MemoryAgent
+    from botflow.wiki.tools import register_tools as register_wiki_tools
+    from botflow.wiki.dream import start_dream_task
 
-    # Log MCP endpoints info
+    wiki_dir = Path(_config.workspace) / "MemWiki" if _config else Path.cwd() / "MemWiki"
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+    wiki_agent = MemoryAgent(wiki_dir=wiki_dir, model_group="fast")
+    register_wiki_tools(mcp_server, wiki_agent)
+    log.info("MemWiki agent initialized: {}", wiki_dir)
+
+    dream_task = asyncio.create_task(start_dream_task(wiki_dir))
+
     log.info("MCP management service available via SSE at /mcp/sse")
-    log.info("MCP tools: provider CRUD, model CRUD, group CRUD, stats queries")
 
     # Auto-configure keys from environment variables (for Docker deployment)
     db = _get_db()
@@ -140,7 +143,13 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown: gracefully cancel cleanup task
+    # Shutdown: gracefully cancel background tasks
+    dream_task.cancel()
+    try:
+        await dream_task
+    except asyncio.CancelledError:
+        pass
+
     cleanup_task.cancel()
     try:
         await cleanup_task
