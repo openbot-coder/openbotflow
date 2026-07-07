@@ -7,8 +7,8 @@ Endpoints:
   - POST /v1/embeddings         (OpenAI, compatibility)
   - GET  /v1/models             (OpenAI / Anthropic)
   - POST /v1/messages           (Anthropic)
-  - GET  /mcp/sse               (MCP SSE transport)
-  - POST /mcp/messages          (MCP messages endpoint)
+  - GET  /mcp                   (MCP streamable HTTP transport)
+  - POST /mcp                   (MCP messages endpoint)
 """
 
 from __future__ import annotations
@@ -115,7 +115,7 @@ async def lifespan(app: FastAPI):
 
     dream_task = asyncio.create_task(start_dream_task(wiki_dir))
 
-    log.info("MCP management service available via SSE at /mcp/sse")
+    log.info("MCP management service available via streamable HTTP at /mcp")
 
     # Auto-configure keys from environment variables (for Docker deployment)
     db = _get_db()
@@ -183,7 +183,7 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# MCP Server (SSE transport)
+# MCP Server (streamable HTTP transport)
 # ---------------------------------------------------------------------------
 
 mcp_server = FastMCP(
@@ -201,8 +201,8 @@ mcp_server = FastMCP(
     ),
 )
 
-# Mount MCP SSE app under /mcp path
-app.mount("/mcp", mcp_server.sse_app())
+# Mount MCP streamable HTTP app under /mcp path
+app.mount("/mcp", mcp_server.streamable_http_app())
 
 
 # ---------------------------------------------------------------------------
