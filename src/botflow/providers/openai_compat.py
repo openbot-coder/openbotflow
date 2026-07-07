@@ -123,7 +123,7 @@ class OpenAICompatProvider(BaseProvider):
 
         message: dict[str, Any] = {
             "role": msg.get("role", "assistant"),
-            "content": msg.get("content"),
+            "content": msg.get("content") or "",
         }
         if msg.get("tool_calls"):
             message["tool_calls"] = msg["tool_calls"]
