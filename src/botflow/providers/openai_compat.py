@@ -121,10 +121,22 @@ class OpenAICompatProvider(BaseProvider):
         usage = data.get("usage", {}) or {}
         prompt_details = usage.get("prompt_tokens_details", {}) or {}
 
+        content = msg.get("content") or ""
+        reasoning_content = msg.get("reasoning_content")
+
+        # If content is empty but reasoning_content exists, fall back to it
+        # Some models (stepfun, deepseek, mimo) in thinking mode return
+        # reasoning_content instead of content
+        if not content and reasoning_content:
+            content = reasoning_content
+            reasoning_content = None
+
         message: dict[str, Any] = {
             "role": msg.get("role", "assistant"),
-            "content": msg.get("content") or "",
+            "content": content,
         }
+        if reasoning_content:
+            message["reasoning_content"] = reasoning_content
         if msg.get("tool_calls"):
             message["tool_calls"] = msg["tool_calls"]
         if msg.get("function_call"):
@@ -155,10 +167,20 @@ class OpenAICompatProvider(BaseProvider):
         choice = raw_choices[0] if raw_choices and raw_choices[0] is not None else {}
         delta = choice.get("delta") or {}
 
+        delta_content = delta.get("content")
+        delta_reasoning = delta.get("reasoning_content")
+
+        # Streaming: if content is empty but reasoning_content exists, fall back
+        if not delta_content and delta_reasoning:
+            delta_content = delta_reasoning
+            delta_reasoning = None
+
         delta_out: dict[str, Any] = {
             "role": delta.get("role") or "assistant",
-            "content": delta.get("content"),
+            "content": delta_content,
         }
+        if delta_reasoning:
+            delta_out["reasoning_content"] = delta_reasoning
         if delta.get("tool_calls"):
             delta_out["tool_calls"] = delta["tool_calls"]
         if delta.get("function_call"):
