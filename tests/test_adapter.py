@@ -12,6 +12,7 @@ from botflow.protocol_adapter import (
     internal_to_openai,
     models_to_anthropic,
     models_to_openai,
+    normalize_messages,
     openai_to_internal,
 )
 
@@ -214,3 +215,143 @@ class TestModelsList:
         result = models_to_anthropic(models)
         assert "data" in result
         assert result["data"][0]["type"] == "model"
+
+
+# ---------------------------------------------------------------------------
+# normalize_messages tests
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeMessages:
+    def test_none_content_defaults_to_empty(self):
+        msgs = [{"role": "user", "content": None}]
+        result = normalize_messages(msgs)
+        assert result[0]["content"] == ""
+
+    def test_list_content_with_text_parts(self):
+        msgs = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is this?"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
+            ],
+        }]
+        result = normalize_messages(msgs)
+        assert len(result) == 1
+        assert isinstance(result[0]["content"], list)
+        assert result[0]["content"][0]["type"] == "text"
+        assert result[0]["content"][1]["type"] == "image_url"
+
+    def test_list_content_bare_strings(self):
+        msgs = [{"role": "user", "content": ["hello", "world"]}]
+        result = normalize_messages(msgs)
+        assert result[0]["content"][0] == {"type": "text", "text": "hello"}
+        assert result[0]["content"][1] == {"type": "text", "text": "world"}
+
+    def test_list_content_dict_without_type(self):
+        msgs = [{"role": "user", "content": [{"text": "hello"}]}]
+        result = normalize_messages(msgs)
+        assert result[0]["content"][0]["type"] == "text"
+
+    def test_list_content_dict_without_type_with_url(self):
+        msgs = [{"role": "user", "content": [{"url": "https://example.com/img.png"}]}]
+        result = normalize_messages(msgs)
+        assert result[0]["content"][0]["type"] == "image_url"
+
+    def test_duplicate_system_messages_collapsed(self):
+        msgs = [
+            {"role": "system", "content": "first"},
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "second"},
+        ]
+        result = normalize_messages(msgs)
+        systems = [m for m in result if m["role"] == "system"]
+        assert len(systems) == 1
+        assert systems[0]["content"] == "first"
+
+    def test_non_dict_messages_skipped(self):
+        msgs = ["bad", {"role": "user", "content": "ok"}]
+        result = normalize_messages(msgs)
+        assert len(result) == 1
+
+    def test_string_content_unchanged(self):
+        msgs = [{"role": "user", "content": "hello"}]
+        result = normalize_messages(msgs)
+        assert result[0]["content"] == "hello"
+
+    def test_empty_messages(self):
+        assert normalize_messages([]) == []
+
+
+# ---------------------------------------------------------------------------
+# OpenAI to internal with multimodal content
+# ---------------------------------------------------------------------------
+
+
+class TestOpenAIToInternalMultimodal:
+    def test_text_image_parts_preserved(self):
+        body = {
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What do you see?"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
+                ],
+            }],
+        }
+        result = openai_to_internal(body)
+        msg = result["messages"][0]
+        assert isinstance(msg["content"], list)
+        assert len(msg["content"]) == 2
+        assert msg["content"][0]["type"] == "text"
+        assert msg["content"][1]["type"] == "image_url"
+
+    def test_base64_image_preserved(self):
+        body = {
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this."},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+                ],
+            }],
+        }
+        result = openai_to_internal(body)
+        assert "data:image/png;base64" in result["messages"][0]["content"][1]["image_url"]["url"]
+
+
+# ---------------------------------------------------------------------------
+# Anthropic to internal with multimodal content
+# ---------------------------------------------------------------------------
+
+
+class TestAnthropicToInternalMultimodal:
+    def test_system_list_content_flattened(self):
+        body = {
+            "model": "claude-sonnet-4-20250514",
+            "system": [{"type": "text", "text": "You are helpful."}],
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        result = anthropic_to_internal(body)
+        # system should be prepended as a system message with string content
+        system_msg = result["messages"][0]
+        assert system_msg["role"] == "system"
+        assert system_msg["content"] == "You are helpful."
+
+    def test_user_multimodal_content_preserved(self):
+        body = {
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is this?"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "abc"}},
+                ],
+            }],
+        }
+        result = anthropic_to_internal(body)
+        msg = result["messages"][0]
+        assert isinstance(msg["content"], list)
+        assert len(msg["content"]) == 2
