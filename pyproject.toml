@@ -1,6 +1,6 @@
 [project]
 name = "botflow"
-version = "V0.2.1"
+version = "V0.2.2"
 description = "AI middleware platform - LLM Proxy, LLM-Wiki, IM Bridge"
 readme = "README.md"
 authors = [
