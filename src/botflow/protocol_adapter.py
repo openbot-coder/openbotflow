@@ -9,6 +9,57 @@ from __future__ import annotations
 from typing import Any
 
 
+def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize message list to a consistent internal format.
+
+    Ensures:
+    - All content fields are either str or list-of-parts (no mixed types)
+    - Each content part dict has required keys (type, text/url)
+    - Duplicate system messages are collapsed
+    - Empty/None content defaults to ""
+    """
+    result: list[dict[str, Any]] = []
+    system_seen = False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+
+        # Default None/missing to empty string
+        if content is None:
+            content = ""
+
+        # Normalize list content: ensure each part has a "type" key
+        if isinstance(content, list):
+            normalized_parts: list[dict[str, Any]] = []
+            for part in content:
+                if isinstance(part, str):
+                    # Bare string in a list -> treat as text block
+                    normalized_parts.append({"type": "text", "text": part})
+                elif isinstance(part, dict):
+                    # Ensure type field exists
+                    if "type" not in part:
+                        if "text" in part:
+                            normalized_parts.append({"type": "text", **part})
+                        elif "url" in part or "image_url" in part:
+                            normalized_parts.append({"type": "image_url", **part})
+                        else:
+                            normalized_parts.append({"type": "text", "text": str(part)})
+                    else:
+                        normalized_parts.append(part)
+            content = normalized_parts
+
+        # Collapse duplicate system messages
+        if role == "system":
+            if system_seen:
+                continue
+            system_seen = True
+
+        result.append({"role": role, "content": content})
+    return result
+
+
 def openai_to_internal(body: dict[str, Any]) -> dict[str, Any]:
     """Convert an OpenAI /v1/chat/completions request to internal parameters.
 
@@ -16,7 +67,7 @@ def openai_to_internal(body: dict[str, Any]) -> dict[str, Any]:
         Dict with keys: messages, model, temperature, max_tokens, stream, extra
     """
     return {
-        "messages": body.get("messages", []),
+        "messages": normalize_messages(body.get("messages", [])),
         "model": body.get("model", ""),
         "temperature": body.get("temperature"),
         "max_tokens": body.get("max_tokens"),
@@ -32,13 +83,17 @@ def anthropic_to_internal(body: dict[str, Any]) -> dict[str, Any]:
     """
     messages = body.get("messages", [])
 
-    # Anthropic has a separate "system" field
+    # Anthropic has a separate "system" field (string or list of content blocks)
     system = body.get("system", "")
+    if isinstance(system, list):
+        # Flatten list-type system to string
+        text_parts = [b.get("text", "") for b in system if isinstance(b, dict) and b.get("type") == "text"]
+        system = "\n".join(text_parts)
     if system:
         messages = [{"role": "system", "content": system}] + messages
 
     return {
-        "messages": messages,
+        "messages": normalize_messages(messages),
         "model": body.get("model", ""),
         "temperature": body.get("temperature"),
         "max_tokens": body.get("max_tokens", 4096),
