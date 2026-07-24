@@ -15,6 +15,7 @@ from botflow.common.exceptions import (
     NoAvailableModelError,
     ProviderError,
 )
+from botflow.common.context import truncate_to_context_window
 from botflow.common.logger import get_logger
 from botflow.providers.base import BaseProvider
 from botflow.providers.anthropic_provider import AnthropicProvider
@@ -233,10 +234,11 @@ class ModelEndpoint:
 class GroupRouter:
     """Routes requests through models in a group with retry and fallback."""
 
-    def __init__(self, group_id: int, db: Database, cooldown_manager: CooldownManager) -> None:
+    def __init__(self, group_id: int, db: Database, cooldown_manager: CooldownManager, fallback_group_id: int | None = None) -> None:
         self.group_id = group_id
         self.db = db
         self.cooldown = cooldown_manager
+        self.fallback_group_id = fallback_group_id
 
     async def _load_endpoints(self) -> list[ModelEndpoint]:
         """Load and build endpoints for all enabled models in the group (with caching)."""
@@ -314,11 +316,27 @@ class GroupRouter:
         while True:
             available = self._get_available(endpoints)
             if not available:
+                # All models on cooldown — try fallback group before raising
+                if self.fallback_group_id is not None:
+                    log.warning("Group {} all models on cooldown, falling back to group {}", self.group_id, self.fallback_group_id)
+                    fallback_router = GroupRouter(self.fallback_group_id, self.db, self.cooldown)
+                    return await fallback_router.route(
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        stream=False,
+                        **kwargs,
+                    )
                 raise AllModelsCooldownError(f"Group {self.group_id}: all models are on cooldown")
 
             selected = weighted_random_select([ep.detail for ep in available])
             matching_ep = next(ep for ep in available if ep.model_id == selected.model_id)
             used_endpoints.append(matching_ep)
+
+            context_windows = [ep.detail.context_window for ep in available if ep.detail.context_window > 0]
+            context_window = min(context_windows) if context_windows else 0
+            if context_window > 0:
+                messages = truncate_to_context_window(messages, context_window, max_tokens)
 
             result = await self._attempt_call(matching_ep, messages, temperature, max_tokens, **kwargs)
             if result is not None:
@@ -330,6 +348,16 @@ class GroupRouter:
 
             # If all endpoints have been tried and all failed
             if len(used_endpoints) >= len(endpoints):
+                if self.fallback_group_id is not None:
+                    log.warning("Group {} exhausted, falling back to group {}", self.group_id, self.fallback_group_id)
+                    fallback_router = GroupRouter(self.fallback_group_id, self.db, self.cooldown)
+                    return await fallback_router.route(
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        stream=False,
+                        **kwargs,
+                    )
                 raise ProviderError(f"Group {self.group_id}: all models exhausted")
 
     async def _route_stream(
@@ -342,16 +370,28 @@ class GroupRouter:
     ) -> dict[str, Any]:
         """Streaming routing — selects one model and returns generator info.
 
-        NOTE: Streaming path intentionally has no retry/fallback. Once a stream
-        starts, mid-stream failover would break the client's SSE frame sequence.
-        A single provider failure results in an error event to the client.
+        Falls back to fallback_group_id if all models in this group are on cooldown.
         """
         available = self._get_available(endpoints)
         if not available:
+            if self.fallback_group_id is not None:
+                log.warning("Group {} all models on cooldown, falling back to group {}", self.group_id, self.fallback_group_id)
+                fallback_router = GroupRouter(self.fallback_group_id, self.db, self.cooldown)
+                return await fallback_router.route(
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    stream=True,
+                    **kwargs,
+                )
             raise AllModelsCooldownError(f"Group {self.group_id}: all models are on cooldown")
 
         selected = weighted_random_select([ep.detail for ep in available])
         matching_ep = next(ep for ep in available if ep.model_id == selected.model_id)
+
+        context_windows = [ep.detail.context_window for ep in available if ep.detail.context_window > 0]
+        if context_windows:
+            messages = truncate_to_context_window(messages, min(context_windows), max_tokens)
 
         return {
             "endpoint": matching_ep,

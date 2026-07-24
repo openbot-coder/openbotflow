@@ -37,7 +37,7 @@ def setup_logging(log_dir: Path, level: str = "INFO") -> None:
         colorize=True,
     )
 
-    # File handler (rotation by size + time)
+    # File handler (rotation by size + time) — includes exception tracebacks
     logger.add(
         log_dir / "botflow-{time:YYYY-MM-DD}.log",
         format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {extra[module]:12} | {level:8} | {message}",
@@ -45,6 +45,8 @@ def setup_logging(log_dir: Path, level: str = "INFO") -> None:
         rotation="100 MB",
         retention="30 days",
         encoding="utf-8",
+        backtrace=True,
+        diagnose=True,
     )
 
 

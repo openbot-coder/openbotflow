@@ -12,6 +12,7 @@ def create_mcp_server() -> FastMCP:
         "botflow",
         sse_path="/",
         message_path="/",
+        streamable_http_path="/",
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
             allowed_hosts=[

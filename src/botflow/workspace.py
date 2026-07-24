@@ -6,7 +6,6 @@ The workspace is the root directory for all botflow runtime data:
     data/
       botflow.db   - SQLite database
     logs/          - Log files
-    MemWiki/       - OKF knowledge base (Phase 2)
 """
 
 from pathlib import Path
@@ -37,11 +36,6 @@ def init_workspace(workspace: Path) -> Path:
       {workspace}/
         data/
         logs/
-        MemWiki/
-          sources/
-          concepts/
-          entities/
-          syntheses/
 
     Args:
         workspace: Workspace root path.
@@ -52,23 +46,4 @@ def init_workspace(workspace: Path) -> Path:
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "data").mkdir(exist_ok=True)
     (workspace / "logs").mkdir(exist_ok=True)
-
-    # MemWiki knowledge base
-    wiki = workspace / "MemWiki"
-    wiki.mkdir(exist_ok=True)
-    for sub in ("sources", "concepts", "entities", "syntheses"):
-        (wiki / sub).mkdir(exist_ok=True)
-
-    # Ensure index.md and log.md exist
-    index = wiki / "index.md"
-    if not index.exists():
-        index.write_text(
-            "# MemWiki Index\n\n"
-            "## Sources\n\n## Concepts\n\n## Entities\n\n## Syntheses\n",
-            encoding="utf-8",
-        )
-    log_md = wiki / "log.md"
-    if not log_md.exists():
-        log_md.write_text("# MemWiki Log\n", encoding="utf-8")
-
     return workspace

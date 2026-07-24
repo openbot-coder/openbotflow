@@ -19,7 +19,3 @@ class ProviderError(BotflowError):
 
 class ConfigurationError(BotflowError):
     """Raised when configuration is invalid."""
-
-
-class PathTraversalError(BotflowError):
-    """Raised when a file path escapes the wiki sandbox."""

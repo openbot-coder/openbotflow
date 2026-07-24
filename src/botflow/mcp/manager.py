@@ -231,6 +231,7 @@ def register_manager_tools(mcp: FastMCP, db: Database) -> None:
         name: str | None = None,
         description: str | None = None,
         is_enabled: bool | None = None,
+        fallback_group_id: int | None = None,
     ) -> dict:
         """Update an existing group."""
         updates: dict[str, Any] = {}
@@ -240,6 +241,8 @@ def register_manager_tools(mcp: FastMCP, db: Database) -> None:
             updates["description"] = description
         if is_enabled is not None:
             updates["is_enabled"] = int(is_enabled)
+        if fallback_group_id is not None:
+            updates["fallback_group_id"] = int(fallback_group_id)
 
         if not updates:
             return {"updated": False, "message": "No updates provided."}

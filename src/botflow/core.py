@@ -155,7 +155,9 @@ async def lifespan(app: FastAPI):
 
     cleanup_task = asyncio.create_task(_periodic_cleanup())
 
-    yield
+    # Enter MCP session manager lifecycle
+    async with mcp_server._session_manager.run():
+        yield
 
     # Shutdown: gracefully cancel cleanup task
     cleanup_task.cancel()
@@ -195,7 +197,7 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 
 mcp_server = create_mcp_server()
-app.mount("/mcp", mcp_server.sse_app())
+app.mount("/mcp", mcp_server.streamable_http_app())
 
 
 # ---------------------------------------------------------------------------
@@ -344,8 +346,11 @@ app.add_middleware(McpAuthMiddleware)
 # ---------------------------------------------------------------------------
 
 
-def _get_router(group_id: int) -> GroupRouter:
-    return GroupRouter(group_id=group_id, db=_get_db(), cooldown_manager=_cooldown_manager)
+async def _get_router(group_id: int) -> GroupRouter:
+    db = _get_db()
+    group = await db.get_group(group_id)
+    fallback_group_id = group.fallback_group_id if group else None
+    return GroupRouter(group_id=group_id, db=db, cooldown_manager=_cooldown_manager, fallback_group_id=fallback_group_id)
 
 
 async def _get_group_id(request_body: dict) -> int:
@@ -557,7 +562,7 @@ async def _get_extra_route_params(internal: dict, stream: bool = False) -> tuple
     """Shared setup: resolve group, router, and safe extra kwargs."""
     model_name = internal.get("model", "")
     group_id = await _get_group_id({"model": model_name})
-    router = _get_router(group_id)
+    router = await _get_router(group_id)
     extra = internal.get("extra", {})
     if extra:
         log.debug("Extra kwargs for {}: {}", model_name, {k: type(v).__name__ for k, v in extra.items()})

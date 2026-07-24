@@ -34,6 +34,7 @@ class Model(BaseModel):
     cooldown_failure_threshold: int = 3
     extra_config: dict[str, Any] = Field(default_factory=dict)
     is_enabled: bool = True
+    context_window: int = 0  # 0 means unknown/no truncation
     created_at: datetime = Field(default_factory=lambda: datetime.now())
     updated_at: datetime = Field(default_factory=lambda: datetime.now())
 
@@ -45,6 +46,7 @@ class ModelGroup(BaseModel):
     name: str
     description: str = ""
     is_enabled: bool = True
+    fallback_group_id: Optional[int] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now())
     updated_at: datetime = Field(default_factory=lambda: datetime.now())
 
@@ -76,6 +78,7 @@ class GroupModelWithDetails(BaseModel):
     max_retries: int
     cooldown_seconds: int
     cooldown_failure_threshold: int
+    context_window: int = 0
 
 
 class CallLog(BaseModel):

@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS model_groups (
     name TEXT NOT NULL UNIQUE,
     description TEXT NOT NULL DEFAULT '',
     is_enabled INTEGER NOT NULL DEFAULT 1,
+    fallback_group_id INTEGER,
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
@@ -344,7 +345,7 @@ class Database:
         await conn.commit()
         return cursor.lastrowid  # type: ignore[return-value]
 
-    _GROUP_UPDATE_COLUMNS = {"name", "description", "is_enabled"}
+    _GROUP_UPDATE_COLUMNS = {"name", "description", "is_enabled", "fallback_group_id"}
 
     async def update_group(self, group_id: int, updates: dict[str, Any]) -> None:
         conn = await self._ensure_connection()
@@ -387,6 +388,7 @@ class Database:
             name=row["name"],
             description=row["description"],
             is_enabled=bool(row["is_enabled"]),
+            fallback_group_id=row["fallback_group_id"],
         )
 
     # ------------------------------------------------------------------
