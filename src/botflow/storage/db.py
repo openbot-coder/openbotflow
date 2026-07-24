@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS models (
     cooldown_failure_threshold INTEGER NOT NULL DEFAULT 3,
     extra_config TEXT NOT NULL DEFAULT '{}',
     is_enabled INTEGER NOT NULL DEFAULT 1,
+    context_window INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     UNIQUE(name, provider_id)
@@ -69,6 +70,7 @@ CREATE TABLE IF NOT EXISTS model_groups (
     name TEXT NOT NULL UNIQUE,
     description TEXT NOT NULL DEFAULT '',
     is_enabled INTEGER NOT NULL DEFAULT 1,
+    fallback_group_id INTEGER,
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
@@ -140,6 +142,13 @@ class Database:
         assert self._conn is not None
         await self._conn.executescript(CREATE_TABLES_SQL)
         await self._conn.executescript(CREATE_INDEXES_SQL)
+
+        # Migrations: add columns that may be missing from older databases
+        try:
+            await self._conn.execute("SELECT context_window FROM models LIMIT 1")
+        except sqlite3.OperationalError:
+            await self._conn.execute("ALTER TABLE models ADD COLUMN context_window INTEGER NOT NULL DEFAULT 0")
+
         await self._conn.commit()
 
     async def _ensure_connection(self) -> aiosqlite.Connection:
@@ -336,7 +345,7 @@ class Database:
         await conn.commit()
         return cursor.lastrowid  # type: ignore[return-value]
 
-    _GROUP_UPDATE_COLUMNS = {"name", "description", "is_enabled"}
+    _GROUP_UPDATE_COLUMNS = {"name", "description", "is_enabled", "fallback_group_id"}
 
     async def update_group(self, group_id: int, updates: dict[str, Any]) -> None:
         conn = await self._ensure_connection()
@@ -379,6 +388,7 @@ class Database:
             name=row["name"],
             description=row["description"],
             is_enabled=bool(row["is_enabled"]),
+            fallback_group_id=row["fallback_group_id"],
         )
 
     # ------------------------------------------------------------------
@@ -415,6 +425,7 @@ class Database:
                 gm.id, gm.group_id, gm.model_id, gm.weight, gm.is_enabled,
                 m.name AS model_name, m.display_name, m.provider_id,
                 m.max_retries, m.cooldown_seconds, m.cooldown_failure_threshold,
+                m.context_window,
                 p.name AS provider_name, p.provider_type
             FROM group_models gm
             JOIN models m ON m.id = gm.model_id
@@ -444,6 +455,7 @@ class Database:
             max_retries=row["max_retries"],
             cooldown_seconds=row["cooldown_seconds"],
             cooldown_failure_threshold=row["cooldown_failure_threshold"],
+            context_window=row["context_window"] or 0,
         )
 
     # ------------------------------------------------------------------

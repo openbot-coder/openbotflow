@@ -7,8 +7,8 @@ Endpoints:
   - POST /v1/embeddings         (OpenAI, compatibility)
   - GET  /v1/models             (OpenAI / Anthropic)
   - POST /v1/messages           (Anthropic)
-  - GET  /mcp/sse               (MCP SSE transport)
-  - POST /mcp/messages          (MCP messages endpoint)
+  - GET  /mcp/                  (MCP SSE transport)
+  - POST /mcp/                  (MCP messages endpoint)
 """
 
 from __future__ import annotations
@@ -21,18 +21,16 @@ import traceback
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Callable, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from loguru import logger
-from mcp.server.fastmcp import FastMCP
-from mcp.server.transport_security import TransportSecuritySettings
 
-from botflow.auth import verify_llm_key, verify_mcp_key
+from botflow.auth import verify_llm_key
 from botflow.common.logger import get_logger, setup_logging
 from botflow.config import BotflowSettings
+from botflow.mcp.server import create_mcp_server
 from botflow.protocol_adapter import (
     anthropic_to_internal,
     internal_chunk_to_anthropic_sse,
@@ -50,6 +48,25 @@ from botflow.storage.cleanup import cleanup_call_logs
 from botflow.workspace import get_workspace_path, init_workspace
 
 log = get_logger("core")
+
+# Whitelist of extra kwargs that can be safely passed to LLM providers.
+# All three streaming/non-streaming handlers share this list.
+SAFE_EXTRA_KEYS = frozenset({
+    "audio", "frequency_penalty", "function_call", "functions",
+    "logit_bias", "logprobs", "max_completion_tokens", "max_tokens",
+    "metadata", "modalities", "moderation", "n", "parallel_tool_calls",
+    "prediction", "presence_penalty", "prompt_cache_key",
+    "prompt_cache_retention", "reasoning_effort", "response_format",
+    "safety_identifier", "seed", "service_tier", "stop", "store",
+    "stream_options", "temperature", "tool_choice", "tools",
+    "top_logprobs", "top_p", "user", "verbosity", "web_search_options",
+    "extra_headers", "extra_query", "extra_body", "timeout",
+})
+
+
+def _filter_safe_extra(extra: dict[str, Any]) -> dict[str, Any]:
+    """Filter extra kwargs to only include safe keys for LLM providers."""
+    return {k: v for k, v in extra.items() if k in SAFE_EXTRA_KEYS}
 
 # ---------------------------------------------------------------------------
 # Global state
@@ -111,7 +128,7 @@ async def lifespan(app: FastAPI):
         log.info("MCP authentication is enabled.")
 
     # Log MCP endpoints info
-    log.info("MCP management service available via SSE at /mcp/sse")
+    log.info("MCP management service available at /mcp/")
     log.info("MCP tools: provider CRUD, model CRUD, group CRUD, stats queries")
 
     # Auto-configure keys from environment variables (for Docker deployment)
@@ -138,7 +155,9 @@ async def lifespan(app: FastAPI):
 
     cleanup_task = asyncio.create_task(_periodic_cleanup())
 
-    yield
+    # Enter MCP session manager lifecycle
+    async with mcp_server._session_manager.run():
+        yield
 
     # Shutdown: gracefully cancel cleanup task
     cleanup_task.cancel()
@@ -177,23 +196,8 @@ app.add_middleware(
 # MCP Server (SSE transport)
 # ---------------------------------------------------------------------------
 
-mcp_server = FastMCP(
-    "botflow",
-    transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=[
-            "api.vxquant.com",
-            "api.vxquant.com:*",
-            "127.0.0.1",
-            "127.0.0.1:*",
-            "localhost",
-            "localhost:*",
-        ],
-    ),
-)
-
-# Mount MCP SSE app under /mcp path
-app.mount("/mcp", mcp_server.sse_app())
+mcp_server = create_mcp_server()
+app.mount("/mcp", mcp_server.streamable_http_app())
 
 
 # ---------------------------------------------------------------------------
@@ -229,9 +233,6 @@ class RateLimitMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
-
-        from starlette.requests import Request
-        from starlette.responses import JSONResponse
 
         request = Request(scope, receive)
 
@@ -275,12 +276,9 @@ class AuthMiddleware:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
 
-        from starlette.requests import Request
-        from starlette.responses import JSONResponse
-
         request = Request(scope, receive)
 
-        # Skip auth for health check and MCP endpoints
+        # Skip auth for health check and MCP endpoints (MCP has its own auth)
         if request.url.path == "/health" or request.url.path.startswith("/mcp/"):
             return await self.app(scope, receive, send)
 
@@ -297,12 +295,62 @@ app.add_middleware(AuthMiddleware)
 
 
 # ---------------------------------------------------------------------------
+# Middleware: MCP-Key auth (for /mcp/ paths only)
+# ---------------------------------------------------------------------------
+
+
+class McpAuthMiddleware:
+    """Pure ASGI middleware for MCP key authentication.
+
+    Checks Bearer token against the MCP key stored in the database.
+    If no MCP key is configured, all requests are allowed through.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        request = Request(scope, receive)
+
+        # Only enforce auth on /mcp/ paths
+        if not request.url.path.startswith("/mcp/"):
+            return await self.app(scope, receive, send)
+
+        mcp_key = await _get_db().get_config("mcp_key")
+        if not mcp_key:
+            return await self.app(scope, receive, send)
+
+        import hmac as _hmac
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            response = JSONResponse(status_code=401, content={"error": "Missing or invalid Authorization header"})
+            return await response(scope, receive, send)
+
+        provided_key = auth_header.removeprefix("Bearer ").strip()
+        if not _hmac.compare_digest(provided_key, mcp_key):
+            log.warning("Invalid MCP key attempt from {}", request.client.host if request.client else "unknown")
+            response = JSONResponse(status_code=401, content={"error": "Invalid MCP key"})
+            return await response(scope, receive, send)
+
+        return await self.app(scope, receive, send)
+
+
+app.add_middleware(McpAuthMiddleware)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _get_router(group_id: int) -> GroupRouter:
-    return GroupRouter(group_id=group_id, db=_get_db(), cooldown_manager=_cooldown_manager)
+async def _get_router(group_id: int) -> GroupRouter:
+    db = _get_db()
+    group = await db.get_group(group_id)
+    fallback_group_id = group.fallback_group_id if group else None
+    return GroupRouter(group_id=group_id, db=db, cooldown_manager=_cooldown_manager, fallback_group_id=fallback_group_id)
 
 
 async def _get_group_id(request_body: dict) -> int:
@@ -481,8 +529,6 @@ async def health():
 @app.post("/v1/embeddings")
 async def embeddings(request: Request):
     """Stub endpoint for OpenAI-compatible embeddings."""
-    import time
-    from fastapi.responses import JSONResponse
     body = await request.json()
     model = body.get("model", "")
     input_text = body.get("input", [])
@@ -507,16 +553,29 @@ async def embeddings(request: Request):
 # ---------------------------------------------------------------------------
 
 
+def _request_summary(internal: dict) -> str:
+    """Build a truncated JSON summary of the request messages for logging."""
+    return json.dumps(internal.get("messages", [])[:500])
+
+
+async def _get_extra_route_params(internal: dict, stream: bool = False) -> tuple[int, GroupRouter, dict]:
+    """Shared setup: resolve group, router, and safe extra kwargs."""
+    model_name = internal.get("model", "")
+    group_id = await _get_group_id({"model": model_name})
+    router = await _get_router(group_id)
+    extra = internal.get("extra", {})
+    if extra:
+        log.debug("Extra kwargs for {}: {}", model_name, {k: type(v).__name__ for k, v in extra.items()})
+    return group_id, router, _filter_safe_extra(extra)
+
+
 async def _handle_chat_non_stream(
     internal: dict,
     request: Request,
     format_response,
 ) -> JSONResponse:
     """Handle a non-streaming chat request through the router."""
-    group_id = await _get_group_id({"model": internal.get("model", "")})
-    internal["_group_id"] = group_id
-    router = _get_router(group_id)
-
+    group_id, router, safe_extra = await _get_extra_route_params(internal)
     start = time.monotonic()
 
     try:
@@ -525,19 +584,18 @@ async def _handle_chat_non_stream(
             temperature=internal.get("temperature"),
             max_tokens=internal.get("max_tokens"),
             stream=False,
-            **(internal.get("extra", {})),
+            **safe_extra,
         )
 
         duration = int((time.monotonic() - start) * 1000)
         usage = result.get("usage", {})
         routing = result.pop("_routing", {})
 
-        # Log the call
         await _log_call(
             group_id=group_id,
             model_id=routing.get("model_id"),
             provider_id=routing.get("provider_id"),
-            request_body=json.dumps(internal.get("messages", [])[:500]),
+            request_body=_request_summary(internal),
             response_body=json.dumps(result)[:500],
             status="success",
             duration_ms=duration,
@@ -548,13 +606,13 @@ async def _handle_chat_non_stream(
 
     except Exception as e:
         duration = int((time.monotonic() - start) * 1000)
-        log.error("Chat request failed: {}", e)
+        log.opt(exception=True).error("Chat request failed: {}", e)
 
         await _log_call(
             group_id=group_id,
             model_id=None,
             provider_id=None,
-            request_body=json.dumps(internal.get("messages", [])[:500]),
+            request_body=_request_summary(internal),
             response_body=None,
             status="error",
             duration_ms=duration,
@@ -569,30 +627,61 @@ async def _handle_chat_non_stream(
 # Streaming handlers
 # ---------------------------------------------------------------------------
 
+# Type alias: serialize_chunk(chunk) -> (sse_lines: list[str], usage: dict|None)
+# sse_lines is a list of formatted SSE lines ready to yield.
+SerializeFn = Callable[[dict], tuple[list[str], dict | None]]
 
-async def _stream_openai(
+
+def _openai_serialize(chunk: dict) -> tuple[list[str], dict | None]:
+    """Serialize a raw provider chunk to OpenAI SSE format."""
+    sse_data = internal_chunk_to_openai_sse(chunk)
+    lines = [f"data: {json.dumps(sse_data, ensure_ascii=False)}\n\n"]
+    return lines, sse_data.get("usage")
+
+
+def _anthropic_serialize(chunk: dict) -> tuple[list[str], dict | None]:
+    """Serialize a raw provider chunk to Anthropic SSE format."""
+    try:
+        events = internal_chunk_to_anthropic_sse(chunk)
+    except Exception as e:
+        log.error("internal_chunk_to_anthropic_sse failed: {} chunk={}", e, chunk)
+        raise
+    lines = []
+    for event in events:
+        lines.append(f"event: {event['type']}\n")
+        lines.append(f"data: {json.dumps(event, ensure_ascii=False)}\n\n")
+    return lines, chunk.get("usage")
+
+
+async def _stream_common(
     internal: dict,
-    request: Request,
+    serialize: SerializeFn,
+    done_signal: str = "data: [DONE]\n\n",
 ) -> AsyncGenerator[str, None]:
-    """Stream response in OpenAI SSE format."""
+    """Shared streaming logic: route, iterate, serialize, log.
+
+    Args:
+        internal: Parsed internal request dict.
+        serialize: Chunk serializer returning (sse_lines, usage) per chunk.
+        done_signal: Final SSE line to yield after all chunks.
+    """
     model_name = internal.get("model", "")
     group_id = None
-    try:
-        group_id = await _get_group_id({"model": model_name})
-        router = _get_router(group_id)
+    group_id, router, safe_extra = await _get_extra_route_params(internal, stream=True)
 
+    try:
         route_result = await router.route(
             messages=internal["messages"],
             temperature=internal.get("temperature"),
             max_tokens=internal.get("max_tokens"),
             stream=True,
-            **(internal.get("extra", {})),
+            **safe_extra,
         )
 
         ep = route_result["endpoint"]
         start = time.monotonic()
-
         usage_final = None
+
         async for chunk in ep.provider.chat_stream(
             messages=route_result["messages"],
             model=ep.detail.model_name,
@@ -600,19 +689,24 @@ async def _stream_openai(
             max_tokens=route_result.get("max_tokens"),
             **route_result.get("kwargs", {}),
         ):
-            sse_data = internal_chunk_to_openai_sse(chunk)
-            if sse_data.get("usage"):
-                usage_final = sse_data["usage"]
-            yield f"data: {json.dumps(sse_data, ensure_ascii=False)}\n\n"
+            try:
+                lines, usage = serialize(chunk)
+            except Exception as serialize_err:
+                log.error("Serialize error for chunk: {}", chunk)
+                raise
+            if usage:
+                usage_final = usage
+            for line in lines:
+                yield line
 
-        yield "data: [DONE]\n\n"
+        yield done_signal
 
         duration = int((time.monotonic() - start) * 1000)
         await _log_call(
             group_id=group_id,
             model_id=ep.model_id,
             provider_id=ep.detail.provider_id,
-            request_body=json.dumps(internal.get("messages", [])[:500]),
+            request_body=_request_summary(internal),
             response_body=None,
             status="success",
             duration_ms=duration,
@@ -620,12 +714,12 @@ async def _stream_openai(
         )
 
     except Exception as e:
-        log.error("Stream failed for model {}: {}", model_name, e)
+        log.opt(exception=True).error("Stream failed for model {}: {}", model_name, e)
         await _log_call(
             group_id=group_id,
             model_id=None,
             provider_id=None,
-            request_body=json.dumps(internal.get("messages", [])[:500]),
+            request_body=_request_summary(internal),
             response_body=None,
             status="error",
             duration_ms=None,
@@ -634,7 +728,16 @@ async def _stream_openai(
         )
         error_data = {"error": {"message": str(e), "type": "server_error"}}
         yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
-        yield "data: [DONE]\n\n"
+        yield done_signal
+
+
+async def _stream_openai(
+    internal: dict,
+    request: Request,
+) -> AsyncGenerator[str, None]:
+    """Stream response in OpenAI SSE format."""
+    async for line in _stream_common(internal, _openai_serialize):
+        yield line
 
 
 async def _stream_anthropic(
@@ -642,67 +745,8 @@ async def _stream_anthropic(
     request: Request,
 ) -> AsyncGenerator[str, None]:
     """Stream response in Anthropic SSE format."""
-    model_name = internal.get("model", "")
-    group_id = None
-    try:
-        group_id = await _get_group_id({"model": model_name})
-        router = _get_router(group_id)
-
-        route_result = await router.route(
-            messages=internal["messages"],
-            temperature=internal.get("temperature"),
-            max_tokens=internal.get("max_tokens"),
-            stream=True,
-            **(internal.get("extra", {})),
-        )
-
-        ep = route_result["endpoint"]
-        start = time.monotonic()
-
-        usage_final = None
-        async for chunk in ep.provider.chat_stream(
-            messages=route_result["messages"],
-            model=ep.detail.model_name,
-            temperature=route_result.get("temperature"),
-            max_tokens=route_result.get("max_tokens"),
-            **route_result.get("kwargs", {}),
-        ):
-            events = internal_chunk_to_anthropic_sse(chunk)
-            for event in events:
-                yield f"event: {event['type']}\n"
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-            if chunk.get("usage"):
-                usage_final = chunk["usage"]
-
-        duration = int((time.monotonic() - start) * 1000)
-        await _log_call(
-            group_id=group_id,
-            model_id=ep.model_id,
-            provider_id=ep.detail.provider_id,
-            request_body=json.dumps(internal.get("messages", [])[:500]),
-            response_body=None,
-            status="success",
-            duration_ms=duration,
-            usage=usage_final,
-        )
-
-    except Exception as e:
-        log.error("Anthropic stream failed: {}", e)
-        await _log_call(
-            group_id=group_id,
-            model_id=None,
-            provider_id=None,
-            request_body=json.dumps(internal.get("messages", [])[:500]),
-            response_body=None,
-            status="error",
-            duration_ms=None,
-            usage=None,
-            error_message=str(e),
-        )
-        error_event = {"type": "error", "error": {"message": str(e)}}
-        yield f"event: error\n"
-        yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
-        yield "data: [DONE]\n\n"
+    async for line in _stream_common(internal, _anthropic_serialize):
+        yield line
 
 
 # ---------------------------------------------------------------------------

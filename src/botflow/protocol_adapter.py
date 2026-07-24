@@ -172,12 +172,17 @@ def internal_chunk_to_anthropic_sse(chunk: dict[str, Any]) -> list[dict[str, Any
     """
     events: list[dict[str, Any]] = []
     choices = chunk.get("choices") or []
-    choice = choices[0] if choices and choices[0] is not None else {}
+    if not choices or choices[0] is None:
+        return events
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return events
     delta = choice.get("delta") or {}
     content = delta.get("content") or ""
 
-    # Message start event
-    if delta.get("role") == "assistant":
+    # Message start event — only emit once (first chunk with role, content not None)
+    content_is_set = delta.get("content") is not None
+    if delta.get("role") == "assistant" and content_is_set:
         events.append({
             "type": "message_start",
             "message": {

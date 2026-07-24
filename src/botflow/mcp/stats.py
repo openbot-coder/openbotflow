@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from loguru import logger
 from mcp.server.fastmcp import FastMCP
 
 from botflow.common.logger import get_logger

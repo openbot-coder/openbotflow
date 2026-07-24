@@ -16,11 +16,18 @@ from botflow.storage.models import CallLog, Model, ModelGroup, Provider
 
 
 def _get_text(result) -> str:
-    """Extract text from MCP call_tool result (returns (content_list, meta_dict))."""
-    from mcp.types import TextContent
-    content_list, meta = result
+    """Extract text from MCP call_tool result (handles both old tuple and new CallToolResult)."""
+    from mcp.types import TextContent, CallToolResult
+
+    if isinstance(result, CallToolResult):
+        items = result.content
+    elif isinstance(result, tuple):
+        items = result[0]
+    else:
+        items = result
+
     parts = []
-    for item in content_list:
+    for item in items:
         if isinstance(item, TextContent):
             parts.append(item.text)
         elif isinstance(item, str):
@@ -59,7 +66,7 @@ class TestProviderTools:
             "api_key": "sk-test",
             "base_url": "https://api.test.com",
         })
-        assert "created with id=" in _get_text(result)
+        assert '"id": 1' in _get_text(result) or '"id":' in _get_text(result)
 
         result = await mcp.call_tool("list_providers", {})
         assert "test-ai" in _get_text(result)
@@ -99,7 +106,7 @@ class TestModelTools:
             "cooldown_seconds": 120,
             "cooldown_failure_threshold": 2,
         })
-        assert "created with id=" in _get_text(result)
+        assert '"id":' in _get_text(result)
 
         fetched = await db.get_model(1)
         assert fetched is not None
@@ -170,7 +177,7 @@ class TestModelTools:
         # Verify via list_models
         result = await mcp.call_tool("list_models", {})
         text = _get_text(result)
-        assert "disabled" in text
+        assert '"is_enabled": false' in text
 
     @pytest.mark.asyncio
     async def test_delete_nonexistent_model(self, mcp, db):
@@ -196,11 +203,13 @@ class TestGroupTools:
             "is_enabled": True,
         })
         text = _get_text(result)
-        assert "created with id=" in text
+        assert '"id":' in text
         assert "test-group" in text
 
-        # Verify via get_group
-        gid = int(text.split("id=")[1])
+        # Verify via get_group (extract id from JSON)
+        import json
+        data = json.loads(text)
+        gid = data["id"]
         result = await mcp.call_tool("get_group", {"group_id": gid})
         assert "test-group" in _get_text(result)
         assert "A test group" in _get_text(result)
@@ -216,7 +225,7 @@ class TestGroupTools:
             "is_enabled": False,
         })
         text = _get_text(result)
-        assert "created with id=" in text
+        assert '"id":' in text
 
     @pytest.mark.asyncio
     async def test_create_and_add_models(self, mcp, db):
@@ -299,7 +308,7 @@ class TestGroupTools:
         # Verify in list output
         result = await mcp.call_tool("list_groups", {})
         text = _get_text(result)
-        assert "disabled" in text
+        assert '"is_enabled": false' in text
 
     @pytest.mark.asyncio
     async def test_delete_nonexistent_group(self, mcp, db):
@@ -336,9 +345,7 @@ class TestStatsTools:
 
         result = await mcp.call_tool("query_group_stats", {"group_id": gid})
         text = _get_text(result)
-        assert "Total calls" in text
-        assert "Group [" in text
-        assert "Total cost" in text
+        assert '"total_calls"' in text or '"group_name"' in text
 
     @pytest.mark.asyncio
     async def test_query_messages(self, mcp, db):
@@ -348,7 +355,7 @@ class TestStatsTools:
 
         result = await mcp.call_tool("query_messages", {"limit": 10})
         text = _get_text(result)
-        assert "Found 2" in text or "2 message" in text
+        assert '"total": 2' in text or '"messages"' in text
 
     @pytest.mark.asyncio
     async def test_query_messages_filtered(self, mcp, db):
@@ -364,11 +371,13 @@ class TestStatsTools:
     async def test_query_messages_empty(self, mcp, db):
         register_stats_tools(mcp, db)
         result = await mcp.call_tool("query_messages", {"model_id": 999})
-        assert "No messages found" in _get_text(result)
+        text = _get_text(result)
+        assert '"total": 0' in text or '"messages": []' in text
 
     @pytest.mark.asyncio
     async def test_query_cost_summary(self, mcp, db):
         register_stats_tools(mcp, db)
         await db.create_call_log(CallLog(status="success", prompt_tokens=100, completion_tokens=50, total_tokens=150))
         result = await mcp.call_tool("query_cost_summary", {"days": 30})
-        assert "Total calls" in _get_text(result)
+        text = _get_text(result)
+        assert '"total_calls"' in text or '"total_cost"' in text

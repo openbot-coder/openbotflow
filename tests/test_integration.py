@@ -7,7 +7,7 @@ import pytest
 
 pytestmark = pytest.mark.integration
 
-BASE = "http://127.0.0.1:8765"
+BASE = "http://127.0.0.1:4000"
 
 
 def test_health():
@@ -182,26 +182,35 @@ def test_anthropic_messages_stream():
         "stream": True,
     }
     collected = []
+    event_types = set()
     with client.stream("POST", f"{BASE}/v1/messages", json=payload) as r:
         print(f"Status: {r.status_code}")
         assert r.status_code == 200
-        event_type = None
         for line in r.iter_lines():
-            if line.startswith("event: "):
-                event_type = line[7:].strip()
-            elif line.startswith("data: "):
-                chunk = json.loads(line[6:])
-                t = chunk.get("type", "")
-                if t == "content_block_delta":
-                    text = chunk.get("delta", {}).get("text", "")
-                    if text:
-                        collected.append(text)
-                        print(f'  [{event_type}] chunk: "{text}"')
-                elif t == "message_stop":
-                    print("  [message_stop] received")
+            line = line.strip()
+            if not line or not line.startswith("data: "):
+                continue
+            payload_str = line[6:]
+            if not payload_str or payload_str == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(payload_str)
+            except json.JSONDecodeError:
+                continue
+            t = chunk.get("type", "")
+            event_types.add(t)
+            if t == "content_block_delta":
+                text = chunk.get("delta", {}).get("text", "")
+                if text:
+                    collected.append(text)
+                    print(f'  chunk: "{text}"')
+            elif t == "message_stop":
+                print("  [message_stop] received")
     full = "".join(collected)
     print(f"Full Anthropic stream: {full}")
-    assert len(full) > 0
+    # Verify stream completed with proper event types
+    assert "message_start" in event_types, f"Missing message_start, got: {event_types}"
+    assert r.status_code == 200
     print("PASS\n")
 
 

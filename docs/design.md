@@ -10,7 +10,7 @@
 botflow 是一个 **AI 中间件平台**，提供三大核心能力：
 
 1. **LLM Proxy** - 统一 LLM 网关，模型分组 + 权重路由 + 错误容错
-2. **LLM-Wiki** - 基于 Memory Agent 的自主维护知识库（MCP 接口）
+2. **MemWiki** - 基于文件的自主维护知识库（MCP 工具接口）
 3. **IM Bridge** - 多平台 IM 统一接入
 
 ---
@@ -22,7 +22,7 @@ botflow 是一个 **AI 中间件平台**，提供三大核心能力：
 │                     botflow                          │
 │                                                      │
 │  ┌──────────────┐  ┌──────────┐  ┌───────────────┐  │
-│  │   LLM Proxy   │  │  LLM-Wiki │  │   IM Bridge   │  │
+│  │   LLM Proxy   │  │  MemWiki  │  │   IM Bridge   │  │
 │   │  (Phase 1)    │  │ (Phase 2) │  │  (Phase 3)    │  │
 │  └──────┬───────┘  └─────┬────┘  └───────┬───────┘  │
 │         │                │                │          │
@@ -32,12 +32,13 @@ botflow 是一个 **AI 中间件平台**，提供三大核心能力：
 │  │   Config / Logging / Storage / MCP Server     │   │
 │  └──────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## Workspace 管理
 
-botflow 通过统一的 **Workspace** 概念管理全部运行时数据，确保 llm-proxy、llm-wiki、im-bridge 三个模块的数据隔离与共享规则清晰。
+botflow 通过统一的 **Workspace** 概念管理全部运行时数据，确保 llm-proxy、mem-wiki、im-bridge 三个模块的数据隔离与共享规则清晰。
 
 ### 工作空间确定方式
 
@@ -55,13 +56,20 @@ botflow 通过统一的 **Workspace** 概念管理全部运行时数据，确保
 │   └── botflow.db              #   统一 SQLite 数据库
 │                                #   - providers / models / model_groups
 │                                #   - call_logs
-│                                #   - wiki_pages（Phase 2）
 │                                #   - im_sessions（Phase 3）
-├── logs/                       # 日志文件（按模块 + 日期轮转）
-│   ├── proxy-2026-07-03.log
-│   ├── wiki-2026-07-03.log
-│   └── im-2026-07-03.log
-└── workspace/                  # 用户自定义工作区（可扩展挂载点）
+│   ├── logs/                       # 日志文件（按模块 + 日期轮转）
+│   │   ├── proxy-2026-07-03.log
+│   │   ├── wiki-2026-07-03.log
+│   │   ├── im-2026-07-03.log
+│   │   └── agent.log                # Memory Agent 运行日志（持续追加）
+│   ├── MemWiki/                    # MemWiki OKF 知识包（运行时）
+│   │   ├── index.md                #   目录索引（自动生成）
+│   │   ├── log.md                   #   变更日志（自动生成）
+│   │   ├── sources/                #   learn 摄取的原始材料摘要
+│   │   ├── concepts/               #   精炼知识概念
+│   │   ├── entities/               #   人物/组织/项目
+│   │   └── syntheses/              #   research 保存的分析结果
+│   └── workspace/                  # 用户自定义工作区（可扩展挂载点）
 ```
 
 ### .env 文件加载
@@ -87,7 +95,7 @@ botflow 通过统一的 **Workspace** 概念管理全部运行时数据，确保
 | 模块 | 数据存储 | 对外接口 |
 |------|----------|----------|
 | llm-proxy | `data/botflow.db` | HTTP (OpenAI/Anthropic 兼容) + MCP 管理 + MCP 统计 |
-| llm-wiki | `data/botflow.db` | MCP 工具接口 |
+| mem-wiki | `{workspace}/MemWiki/` | MCP 工具接口 |
 | im-bridge | `data/botflow.db` | Webhook + WebSocket |
 
 ## CLI 命令
@@ -614,8 +622,10 @@ CREATE INDEX idx_call_logs_provider ON call_logs(provider_id, created_at);
 - **语言**: Python >=3.13
 - **Web 框架**: FastAPI + Uvicorn
 - **配置**: Pydantic Settings + `{workspace}/.env`（数据库存储模型配置）
-- **存储**: SQLite (aiosqlite)
+- **存储**: SQLite (aiosqlite) — LLM Proxy phase 1 数据
+            MemWiki 使用纯文件系统（markdown 文件，不依赖 SQLite）
 - **协议**: MCP (Model Context Protocol)
+- **Agent 框架**: LangChain + LangGraph（create_react_agent）
 - **构建**: uv_build
 - **LLM 客户端**: 官方 SDK（openai / anthropic / google-genai）
 
@@ -632,7 +642,10 @@ d:\src\botflow\
 │       └── botflow-guide/          # 使用指南 Skill
 │           └── SKILL.md
 ├── docs/
-│   └── design.md                   # 本设计文档
+│   ├── design.md                   # 本设计文档
+│   ├── llm-wiki-agent.md           # llm-wiki-agent 项目分析参考
+│   └── MemWiki/
+│       └── okf-spec.md             # Open Knowledge Format 规范（Agent 遵循）
 ├── src\botflow\
 │   ├── __init__.py                 # CLI 入口
 │   ├── cli.py                      # CLI 命令（start / set）
@@ -656,21 +669,436 @@ d:\src\botflow\
 │   │   ├── __init__.py
 │   │   ├── manager.py              # Provider/Group/Model CRUD 管理
 │   │   └── stats.py                # 统计查询
-│   └── storage\                    # 数据库
+│   ├── storage\                    # 数据库
 │       ├── __init__.py
 │       ├── db.py                   # SQLite 统一数据库操作
 │       ├── models.py               # Pydantic 数据模型
 │       └── cleanup.py              # 半年数据自动清理
+│   └── wiki\                       # MemWiki 模块
+│       ├── __init__.py
+│       ├── agent.py                # Memory Agent 核心（LangChain create_react_agent）
+│       ├── types.py                # BotflowLLM（BaseChatModel 子类）
+│       ├── skills.py               # 5 套 system prompt 模板
+│       ├── tools_impl.py           # Agent 工具（LangChain @tool + 路径安全）
+│       ├── tools.py                # 5 个 MCP Tools（thin wrapper）
+│       └── dream.py                # Dream 后台巡检任务
 ```
 
 ---
 
-## Phase 2: LLM-Wiki（规划中）
+## Phase 2: MemWiki — 自主维护知识库
 
-- 对外提供 MCP 服务
-- 工具: `remember`, `learn`, `research`, `query`, `recall`
-- 对内: Dream 定时任务（自动巡检 Wiki 库）
-- 数据存储: `{workspace}/data/botflow.db`
+### 三层架构
+
+```
+MCP 客户端
+    │
+    ▼
+┌───────────────────────────────────────────────┐
+│  MCP Tools  (wiki/tools.py)                   │
+│  thin wrapper：接收参数 → 选择 system_prompt   │
+│  → 调用 Memory Agent                          │
+└───────────────┬───────────────────────────────┘
+                │
+                ▼
+┌───────────────────────────────────────────────┐
+│  Memory Agent  (wiki/agent.py)                │
+│  LangChain create_react_agent（LangGraph）     │
+│  集成 botflow LLM Provider + Wiki Tools       │
+│                                               │
+│  Agent 工具：                                  │
+│  read_file / write_file / ripgrep / glob      │
+│  / call_llm                                   │
+└───────────────┬───────────────────────────────┘
+                │
+                ▼
+┌───────────────────────────────────────────────┐
+│  Wiki Skills  (wiki/skills.py)                │
+│  system prompt 模板，每个 MCP 方法对应一套     │
+│  指导 Agent 如何使用工具完成任务                │
+└───────────────────────────────────────────────┘
+
+独立后台任务（非 agent）：
+  Dream  (wiki/dream.py)  ← 每 24h 巡检
+```
+
+### 设计理念
+
+MemWiki 是一个基于**纯文件系统**的自主维护知识库，采用三层架构：
+
+- **MCP Tools**：thin wrapper，只做参数组装和 system_prompt 选择
+- **Memory Agent**：基于 LangChain create_react_agent，使用 fast 模型，通过 ReAct 循环自主完成任务
+- **Wiki Skills**：system prompt 模板，定义每个工具的行为逻辑
+- **存即 OKF bundle**：每个 markdown 文件本身就是 OKF 合规的知识包
+- **纯文件存储**：不依赖 SQLite，所有内容为 markdown 文件 + YAML frontmatter
+- **Obsidian 兼容**：可直接在 Obsidian 中打开浏览
+
+### 路径安全
+
+所有文件操作使用 **URI 风格相对路径**，禁止使用 `./` 或 `../`：
+
+```
+合法：  concepts/rag.md, sources/paper.md, index.md
+非法：  ./concepts/rag.md, ../data/botflow.db, /etc/passwd
+```
+
+- Agent 工具内部将 URI 路径拼接为 `{wiki_dir}/{path}`
+- 拼接后做 `resolve()` 校验，确保最终路径仍在 `wiki_dir` 内
+- 校验失败拒绝执行，返回 `PathTraversalError`
+
+### 知识包结构
+
+```
+{workspace}/MemWiki/          ← OKF 合规的知识包
+├── index.md                   ← 所有文件的目录索引（自动生成）
+├── log.md                     ← 变更日志（自动生成）
+├── sources/                   ← learn 摄取的原始材料摘要
+├── concepts/                  ← 精炼知识概念
+├── entities/                  ← 人物/组织/项目
+└── syntheses/                 ← research 保存的分析结果
+```
+
+### 模块划分
+
+| 模块 | 文件 | 职责 |
+|------|------|------|
+| Memory Agent | `src/botflow/wiki/agent.py` | LangChain create_react_agent + LLM Provider 桥接 |
+| Wiki Skills | `src/botflow/wiki/skills.py` | 5 套 system prompt 模板 |
+| Agent 工具 | `src/botflow/wiki/tools_impl.py` | 文件读写 / ripgrep / glob / LLM（含路径安全） |
+| MCP Tools | `src/botflow/wiki/tools.py` | 5 个 thin wrapper（remember/recall/query/learn/research） |
+| 后台巡检 | `src/botflow/wiki/dream.py` | 孤立页/断链/过时检测（独立，非 agent） |
+
+### 文件格式（OKF 标准）
+
+每个 .md 文件使用 YAML frontmatter：
+
+```markdown
+---
+type: concept                    # concept / source / entity / synthesis
+title: RAG 检索增强生成
+description: 检索增强生成的核心流程与组件
+tags: [rag, llm, retrieval]
+timestamp: 2026-07-03T10:00:00Z
+source_url: https://...
+---
+
+## 概述
+
+RAG 是一种结合检索与生成的架构...
+
+## 相关概念
+
+- [[向量数据库]]
+- [[Embedding 模型]]
+```
+
+`[[WikiLink]]` 语法用于概念间交叉引用（兼容 Obsidian）。
+
+### 目录组织规则
+
+| 类型 | 目录 | 文件名 | 例 |
+|------|------|--------|----|
+| source | `sources/` | `{slug}.md` | `sources/attention-paper.md` |
+| concept | `concepts/` | `{slug}.md` | `concepts/rag.md` |
+| entity | `entities/` | `{TitleCase}.md` | `entities/OpenAI.md` |
+| synthesis | `syntheses/` | `{slug}.md` | `syntheses/rag-vs-vector.md` |
+
+- 文件名：source/concept/synthesis 用 kebab-case，entity 用 TitleCase
+- `index.md` 和 `log.md` 为保留文件名
+- `index.md` 格式：按类型分节的链接列表，每项含一句话描述
+- `log.md` 格式：`## [YYYY-MM-DD] operation | title`
+
+### MCP 工具（5 个 thin wrapper）
+
+| 工具 | 参数 | 说明 |
+|------|------|------|
+| `remember` | `title`, `content`, `type?`, `description?`, `tags?`, `source_url?` | 写入精炼知识到 concepts/ |
+| `recall` | `path?` / `title?` / `tag?` / `type?` | 按条件钻取详情 |
+| `query` | `query`, `limit?`, `type?` | 全文搜索 |
+| `learn` | `url?` / `file_path?` / `content?`, `type?`, `tags?` | 摄取原始材料（MarkItDown 转换） |
+| `research` | `topic`, `model_group?` | LLM 调研并写入 syntheses/ |
+
+### Memory Agent
+
+基于 LangChain + LangGraph 的 `create_react_agent` 实现，使用 LLM Proxy 的 fast 模型组（如 gpt-4o-mini）。
+
+#### 实现架构
+
+```
+src/botflow/wiki/
+├── agent.py          # create_react_agent 封装 + LLM Provider 桥接
+├── tools_impl.py     # LangChain @tool 装饰器定义的 Agent 工具
+├── skills.py         # system prompt 模板（注入 agent prompt）
+└── types.py          # BotflowLLM（BaseChatModel 子类）
+```
+
+#### BotflowLLM 桥接层
+
+```python
+class BotflowLLM(BaseChatModel):
+    """将 botflow Provider 系统桥接为 LangChain BaseChatModel"""
+    model_group: str  # fast model group name
+    router: GroupRouter
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        # 同步调用 router.route() 获取 ChatCompletionResponse
+        ...
+
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs):
+        # 异步调用 router.route()
+        ...
+```
+
+#### Agent 构建
+
+```python
+from langgraph.prebuilt import create_react_agent
+from botflow.wiki.agent import BotflowLLM
+from botflow.wiki.tools_impl import wiki_tools
+from botflow.wiki.skills import SKILLS
+
+llm = BotflowLLM(model_group="fast", router=GroupRouter())
+
+agent = create_react_agent(
+    model=llm,
+    tools=wiki_tools,
+    prompt=SKILLS[skill_name],  # 注入 system prompt
+    checkpointer=...,           # 可选：MemorySaver 用于对话历史
+    max_iterations=10,
+)
+
+# 调用
+result = agent.invoke({"messages": [HumanMessage(content=user_args)]})
+```
+
+#### Agent 工具集（LangChain @tool）
+
+| 工具 | 说明 |
+|------|------|
+| `read_file(path)` | 读取 MemWiki 文件内容 |
+| `write_file(path, content)` | 写入 MemWiki 文件（自动创建父目录） |
+| `ripgrep(pattern, path?)` | ripgrep 搜索 wiki 目录 |
+| `glob(pattern)` | glob 模式查找文件 |
+| `call_llm(messages, model_group?)` | 调用 LLM Proxy（用于 research/learn） |
+
+### Wiki Skills
+
+每个 MCP 方法对应一套 system prompt，注入到 Agent 的 system message 中。
+
+#### 共享前缀（所有 skill 共用）
+
+```
+你是 MemWiki 知识管理助手。你负责维护一个基于纯文件系统的知识库。
+
+## 知识库路径
+{wiki_dir}
+
+## OKF 格式规范
+在写入/读取 wiki 文件时，必须遵循 OKF 规范（见 okf-spec.md）。
+
+## 页面格式
+所有 wiki 页面使用 YAML frontmatter：
+---
+type: source | concept | entity | synthesis
+title: "页面标题"
+description: 一句话描述
+tags: [tag1, tag2]
+timestamp: YYYY-MM-DDTHH:MM:SSZ
+---
+
+## 目录结构
+sources/    — learn 摄取的原始材料摘要（一源一页）
+concepts/   — 精炼知识概念
+entities/   — 人物/组织/项目
+syntheses/  — research 保存的分析结果
+
+## 命名规范
+- source/concept/synthesis: kebab-case（如 attention-paper.md）
+- entity: TitleCase（如 OpenAI.md）
+
+## 交叉引用
+使用 [[PageName]] wiki 链接语法关联页面。
+
+## 路径规则
+- 所有文件路径使用 URI 风格的相对路径（如 concepts/rag.md）
+- 禁止使用 ./ 或 ../ 等相对路径字符
+- 路径只能在 MemWiki 目录内操作
+
+## 可用工具
+- read_file(path): 读取文件
+- write_file(path, content): 写入文件
+- ripgrep(pattern, path?): 全文搜索
+- glob(pattern): 模式查找文件
+- call_llm(messages, model_group?): 调用 LLM
+```
+
+#### remember skill
+
+```
+{共享前缀}
+
+你的任务：将用户提供的知识写入 wiki。
+
+## 步骤
+1. slug = title 转 kebab-case
+2. 组装 YAML frontmatter（type 默认 concept，除非用户指定）
+3. write_file("concepts/{slug}.md", frontmatter + body)
+4. 更新 index.md：在 Concepts 节追加条目
+5. 追加 log.md：`## [YYYY-MM-DD] remember | {title}`
+6. 返回：已写入 {path}，标题：{title}
+```
+
+#### recall skill
+
+```
+{共享前缀}
+
+你的任务：按条件从 wiki 钻取详情。
+
+## 步骤（按参数决定路径）
+- 有 path → read_file(path)
+- 有 title → ripgrep(title) 找到文件 → read_file
+- 有 tag → ripgrep(tag) 找到文件 → read_file
+- 有 type → glob("{type}s/*.md") → 逐个 read_file
+- 返回：文件完整内容 + frontmatter
+```
+
+#### query skill
+
+```
+{共享前缀}
+
+你的任务：全文搜索 wiki，返回匹配结果。
+
+## 步骤
+1. ripgrep(pattern=query) 在 wiki 目录搜索
+2. 对每个匹配文件，read_file 提取 frontmatter（title/description/type）
+3. 返回匹配列表（按相关度排序）
+
+## 输出格式
+[{path, title, description, type, matched_lines}]
+```
+
+#### learn skill
+
+```
+{共享前缀}
+
+你的任务：摄取原始材料（URL/文件/文本）到 wiki。
+
+## 步骤
+1. 如果是 file_path → read_file 获取内容（非 .md 文件由外层 MarkItDown 转换后传入）
+2. slug = 文件名或标题转 kebab-case
+3. 组装 YAML frontmatter（type: source，记录 source_url/file_path）
+4. write_file("sources/{slug}.md", frontmatter + 摘要)
+5. 更新 index.md：在 Sources 节追加条目
+6. 追加 log.md：`## [YYYY-MM-DD] learn | {title}`
+7. 可选：用 call_llm 从 source 中提取关键概念 → 用 remember 写入 concepts/
+8. 返回：已写入 {path}，标题：{title}
+```
+
+#### research skill
+
+```
+{共享前缀}
+
+你的任务：LLM 驱动的调研，生成分析并写入 wiki。
+
+## 步骤
+1. ripgrep(topic) 搜索 wiki 中已有相关内容
+2. 将已有内容 + topic 组装为 prompt → call_llm 生成分析
+3. slug = topic 转 kebab-case
+4. 组装 YAML frontmatter（type: synthesis）
+5. write_file("syntheses/{slug}.md", frontmatter + 分析内容）
+6. 更新 index.md：在 Syntheses 节追加条目
+7. 追加 log.md：`## [YYYY-MM-DD] research | {topic}`
+8. 返回：已写入 {path}，标题：{topic}，摘要：{summary}
+```
+
+#### index.md 格式
+
+```markdown
+# MemWiki Index
+
+## Sources
+- [Source Title](sources/slug.md) — 一句话摘要
+
+## Concepts
+- [Concept Name](concepts/slug.md) — 一句话描述
+
+## Entities
+- [Entity Name](entities/EntityName.md) — 一句话描述
+
+## Syntheses
+- [Analysis Title](syntheses/slug.md) — 回答的问题
+```
+
+#### log.md 格式
+
+```
+## [YYYY-MM-DD] operation | title
+```
+
+Operations: `remember`, `recall`, `query`, `learn`, `research`
+
+### Dream 后台任务
+
+独立后台任务（非 agent），在 lifespan 中启动，每 24 小时运行：
+
+```
+1. 孤立页面检查：读取所有 .md 文件，收集 [[links]] → 找无入链页面
+2. 过时检查：解析 frontmatter timestamp → 90 天未更新标记
+3. 断链检查：[[Link]] 指向的文件不存在 → 报告
+4. 刷新 index.md：重新扫描目录生成最新索引
+5. 追加 log.md：记录本次 dream 运行摘要
+```
+
+### 注册到核心服务
+
+```python
+from botflow.wiki.agent import MemoryAgent
+from botflow.wiki.tools import register_tools
+from botflow.wiki.dream import start_dream_task
+
+# lifespan 中：
+wiki_dir = workspace / "MemWiki"
+wiki_dir.mkdir(parents=True, exist_ok=True)
+agent = MemoryAgent(wiki_dir, model_group="fast")
+register_tools(mcp_server, agent)
+dream_task = start_dream_task(wiki_dir)
+# shutdown:
+dream_task.cancel()
+try:
+    await dream_task
+except asyncio.CancelledError:
+    pass
+```
+
+### 依赖
+
+```toml
+dependencies = [
+    ...
+    "markitdown>=0.1.0",  # 非 .md 文件转换
+    "ripgrep>=15.0.0",    # MemWiki Agent 全文搜索
+    "langchain-core>=0.3",
+    "langgraph>=0.2",     # create_react_agent
+]
+```
+
+> ripgrep 为 Python pip 包，无需单独安装系统 CLI 工具。
+
+### 对比 llm-wiki-agent
+
+| 维度 | llm-wiki-agent | MemWiki |
+|------|---------------|------------|
+| 形态 | Coding agent skill | MCP server + Memory Agent + Skills |
+| 架构 | 单层（agent 直接调工具） | 三层（MCP Tool → LangChain Agent → Skills + Tools） |
+| LLM | botflow provider 系统（fast model）→ LangChain BotflowLLM 桥接 |
+| 搜索 | index 关键词 + LLM 选页 + LLM 合成 | **ripgrep** + Agent 自主决策 |
+| 存储 | 纯文件 | 纯文件 |
+| 跨会话 | git 管理 | git 管理 |
+| 路径安全 | 无 | URI 风格路径 + sandbox 校验 |
 
 ## Phase 3: IM 对接（规划中）
 
