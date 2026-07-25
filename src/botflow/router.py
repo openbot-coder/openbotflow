@@ -21,6 +21,7 @@ from botflow.providers.base import BaseProvider
 from botflow.providers.anthropic_provider import AnthropicProvider
 from botflow.providers.google_provider import GoogleProvider
 from botflow.providers.openai_compat import OpenAICompatProvider
+from botflow.providers.deepseek_provider import DeepSeekProvider
 from botflow.storage.db import Database
 from botflow.storage.models import GroupModelWithDetails
 
@@ -104,6 +105,7 @@ PROVIDER_TYPE_MAP: dict[str, type[BaseProvider]] = {
     "azure": OpenAICompatProvider,
     "ollama": OpenAICompatProvider,
     "vllm": OpenAICompatProvider,
+    "deepseek": DeepSeekProvider,
     "anthropic": AnthropicProvider,
     "google": GoogleProvider,
 }

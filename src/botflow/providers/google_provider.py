@@ -10,6 +10,7 @@ from typing import Any, AsyncGenerator
 
 from google import genai
 from google.genai.types import (
+    Blob,
     Content,
     GenerateContentConfig,
     GenerateContentResponse,
@@ -56,7 +57,7 @@ class GoogleProvider(BaseProvider):
         **kwargs: Any,
     ) -> dict[str, Any]:
         contents, system = self._convert_messages(messages)
-        config = self._build_config(temperature, max_tokens, **kwargs)
+        config = self._build_config(temperature, max_tokens, system=system, **kwargs)
 
         try:
             response = await self.client.aio.models.generate_content(
@@ -77,7 +78,7 @@ class GoogleProvider(BaseProvider):
         **kwargs: Any,
     ) -> AsyncGenerator[dict[str, Any], None]:
         contents, system = self._convert_messages(messages)
-        config = self._build_config(temperature, max_tokens, **kwargs)
+        config = self._build_config(temperature, max_tokens, system=system, **kwargs)
 
         try:
             async for chunk in await self.client.aio.models.generate_content_stream(
@@ -116,21 +117,59 @@ class GoogleProvider(BaseProvider):
             config_params["max_output_tokens"] = max_tokens
         return GenerateContentConfig(**config_params)
 
-    def _convert_messages(self, messages: list[dict[str, Any]]) -> tuple[list[Content], str]:
-        """Convert OpenAI-style messages to Gemini format."""
+    @staticmethod
+    def _convert_messages(messages: list[dict[str, Any]]) -> tuple[list[Content], str]:
+        """Convert OpenAI-style messages to Gemini format.
+
+        Handles both string and list-type content (multimodal).
+        List content with text/image_url blocks is converted to Gemini Part objects.
+        """
         contents: list[Content] = []
         system = ""
         for msg in messages:
             role = msg.get("role", "")
             content = msg.get("content", "")
             if role == "system":
-                system = content
+                system = _extract_system_text(content)
                 continue
             gemini_role = "model" if role in ("assistant", "model") else "user"
-            contents.append(Content(role=gemini_role, parts=[Part(text=content)]))
+
+            if isinstance(content, str):
+                contents.append(Content(role=gemini_role, parts=[Part(text=content)]))
+            elif isinstance(content, list):
+                parts = GoogleProvider._convert_content_parts(content)
+                if parts:
+                    contents.append(Content(role=gemini_role, parts=parts))
+            else:
+                contents.append(Content(role=gemini_role, parts=[Part(text=str(content))]))
+
         if not contents:
             contents.append(Content(role="user", parts=[Part(text="")]))
         return contents, system
+
+    @staticmethod
+    def _convert_content_parts(content_blocks: list[dict[str, Any]]) -> list[Part]:
+        """Convert OpenAI-format content blocks to Gemini Part objects.
+
+        Handles:
+        - {"type": "text", "text": "..."} → Part(text=...)
+        - {"type": "image_url", "image_url": {"url": "data:mime;base64,..."}} → Part(inline_data=Blob(...))
+        """
+        parts: list[Part] = []
+        for block in content_blocks:
+            block_type = block.get("type", "")
+            if block_type == "text":
+                parts.append(Part(text=block.get("text", "")))
+            elif block_type == "image_url":
+                image_url = block.get("image_url", {})
+                url = image_url.get("url", "")
+                if url.startswith("data:"):
+                    mime_type, b64_data = _parse_data_url(url)
+                    if mime_type and b64_data:
+                        parts.append(Part(inline_data=Blob(mime_type=mime_type, data=b64_data)))
+                else:
+                    parts.append(Part(file_data={"file_uri": url}))
+        return parts
 
     def _to_unified(self, response: GenerateContentResponse, model: str) -> dict[str, Any]:
         """Convert Google Gemini response to unified format."""
@@ -189,3 +228,34 @@ class GoogleProvider(BaseProvider):
             }
 
         return result
+
+
+def _extract_system_text(content: Any) -> str:
+    """Extract plain text from system content, handling both str and list formats.
+
+    Gemini system_instruction only accepts str, so list content must be reduced.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return "\n".join(parts) if parts else ""
+    return str(content) if content else ""
+
+
+def _parse_data_url(url: str) -> tuple[str, str] | None:
+    """Parse a data URI into (mime_type, base64_data).
+
+    Example: "data:image/png;base64,iVBOR..." → ("image/png", "iVBOR...")
+    Returns None if not a valid data URI.
+    """
+    if not url.startswith("data:"):
+        return None
+    header, _, b64 = url.partition(",")
+    # header = "data:image/png;base64"
+    mime_part = header.split(":", 1)[1] if ":" in header else "text/plain"
+    mime_type = mime_part.split(";")[0]
+    return mime_type, b64

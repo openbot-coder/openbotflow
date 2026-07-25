@@ -10,11 +10,49 @@ from typing import Any, AsyncGenerator
 
 from anthropic import AsyncAnthropic
 
+from botflow.common.content_converters import openai_to_anthropic_content
 from botflow.common.exceptions import ProviderError
 from botflow.common.logger import get_logger
 from botflow.providers.base import BaseProvider
 
 logger = get_logger("providers.anthropic")
+
+
+def _extract_text_content(content: Any) -> str:
+    """Extract plain text from content, handling both str and list formats.
+
+    Multimodal content is a list of dicts like:
+        [{"type": "text", "text": "..."}, {"type": "image", ...}]
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return "\n".join(parts) if parts else ""
+    return str(content) if content else ""
+
+
+def _extract_response_content(content_blocks: list[dict[str, Any]]) -> tuple[str, str]:
+    """Extract content and reasoning from Anthropic content blocks.
+
+    Returns (content, reasoning) where reasoning comes from thinking blocks.
+    """
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+
+    for block in content_blocks:
+        block_type = block.get("type", "")
+        if block_type == "text":
+            text_parts.append(block.get("text", ""))
+        elif block_type == "thinking":
+            reasoning_parts.append(block.get("thinking", ""))
+
+    content = "\n".join(text_parts)
+    reasoning = "\n".join(reasoning_parts)
+    return content, reasoning
 
 
 class AnthropicProvider(BaseProvider):
@@ -108,20 +146,30 @@ class AnthropicProvider(BaseProvider):
         filtered = []
         for msg in messages:
             if msg.get("role") == "system":
-                system = msg.get("content", "")
+                raw = msg.get("content", "")
+                system = _extract_text_content(raw)
             else:
-                filtered.append(msg)
+                # Convert OpenAI-format multimodal content to Anthropic blocks
+                converted = dict(msg)
+                raw_content = msg.get("content", "")
+                if isinstance(raw_content, list):
+                    converted["content"] = openai_to_anthropic_content(raw_content)
+                filtered.append(converted)
         return system, filtered
 
     def _to_unified(self, data: dict, model: str) -> dict[str, Any]:
         """Convert Anthropic response to unified format."""
-        content = ""
         content_blocks = data.get("content", []) or []
-        text_blocks = [b for b in content_blocks if b.get("type") == "text"]
-        if text_blocks:
-            content = text_blocks[0].get("text", "")
+        content, reasoning = _extract_response_content(content_blocks)
 
         usage = data.get("usage", {}) or {}
+
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": content,
+        }
+        if reasoning:
+            message["reasoning_content"] = reasoning
 
         return {
             "id": data.get("id", ""),
@@ -129,10 +177,7 @@ class AnthropicProvider(BaseProvider):
             "choices": [
                 {
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": content,
-                    },
+                    "message": message,
                     "finish_reason": data.get("stop_reason", "end_turn"),
                 }
             ],
