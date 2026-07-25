@@ -20,6 +20,29 @@ from botflow.providers.base import BaseProvider
 logger = get_logger("providers.openai")
 
 
+def _extract_text_from_content(content: Any) -> str:
+    """Extract plain text from content, handling both str and list formats.
+
+    LLM providers (DeepSeek, OpenAI, etc.) may return multimodal content as::
+
+        [{"type": "text", "text": "..."}, {"type": "image_url", ...}]
+
+    Downstream consumers (protocol_adapter, history) expect ``content`` to be
+    a plain string.  This helper extracts only text blocks and joins them.
+
+    Also used in ``common.context.estimate_tokens()`` for token estimation.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+        return " ".join(parts)
+    return str(content) if content else ""
+
+
 class OpenAICompatProvider(BaseProvider):
     """Provider for OpenAI-compatible APIs.
 
@@ -121,7 +144,7 @@ class OpenAICompatProvider(BaseProvider):
         usage = data.get("usage", {}) or {}
         prompt_details = usage.get("prompt_tokens_details", {}) or {}
 
-        content = msg.get("content") or ""
+        content = _extract_text_from_content(msg.get("content") or "")
         reasoning_content = msg.get("reasoning_content")
 
         # If content is empty but reasoning_content exists, fall back to it
@@ -167,7 +190,7 @@ class OpenAICompatProvider(BaseProvider):
         choice = raw_choices[0] if raw_choices and raw_choices[0] is not None else {}
         delta = choice.get("delta") or {}
 
-        delta_content = delta.get("content")
+        delta_content = _extract_text_from_content(delta.get("content"))
         delta_reasoning = delta.get("reasoning_content")
 
         # Streaming: if content is empty but reasoning_content exists, fall back

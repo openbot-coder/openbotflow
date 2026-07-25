@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from botflow.common.content_converters import anthropic_to_openai_content
+
 
 def openai_to_internal(body: dict[str, Any]) -> dict[str, Any]:
     """Convert an OpenAI /v1/chat/completions request to internal parameters.
@@ -29,6 +31,7 @@ def anthropic_to_internal(body: dict[str, Any]) -> dict[str, Any]:
     """Convert an Anthropic /v1/messages request to internal parameters.
 
     Handles system prompt extraction from top-level field.
+    Converts Anthropic content blocks to OpenAI format for provider compatibility.
     """
     messages = body.get("messages", [])
 
@@ -37,8 +40,16 @@ def anthropic_to_internal(body: dict[str, Any]) -> dict[str, Any]:
     if system:
         messages = [{"role": "system", "content": system}] + messages
 
+    # Convert Anthropic content blocks to OpenAI format
+    converted_messages = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = anthropic_to_openai_content(content)
+        converted_messages.append({**msg, "content": content})
+
     return {
-        "messages": messages,
+        "messages": converted_messages,
         "model": body.get("model", ""),
         "temperature": body.get("temperature"),
         "max_tokens": body.get("max_tokens", 4096),
