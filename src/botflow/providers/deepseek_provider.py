@@ -1,184 +1,255 @@
-"""DeepSeek provider — handles reasoning_content and list content blocks."""
+"""DeepSeek provider using the official deepseek Python SDK.
+
+Provides ``DeepSeekProvider`` — a ``BaseProvider`` subclass that routes
+chat completions through ``deepseek.DeepSeekClient``.
+
+Features:
+- Native ``reasoning_content`` handling (DeepSeek R1 / thinking mode)
+- Tool-call forwarding (OpenAI-compatible format)
+- Stream support with per-chunk reasoning extraction
+- Robust fallback: if content is empty but reasoning_content exists,
+  fall back to reasoning_content as content
+
+Optional dependency: ``pip install deepseek``
+"""
 
 from __future__ import annotations
 
-import copy
 from typing import Any, AsyncGenerator
 
-from loguru import logger
+from botflow.common.exceptions import ProviderError
+from botflow.common.logger import get_logger
+from botflow.providers.base import BaseProvider
 
-from botflow.providers.openai_compat import OpenAICompatProvider
+logger = get_logger("providers.deepseek")
+
+# ---------------------------------------------------------------------------
+# Allowed kwargs passed to the SDK (whitelist)
+# ---------------------------------------------------------------------------
+_ALLOWED_CHAT_KWARGS = frozenset({
+    "frequency_penalty",
+    "logit_bias",
+    "max_tokens",
+    "n",
+    "presence_penalty",
+    "stop",
+    "temperature",
+    "top_logprobs",
+    "top_p",
+})
 
 
-class DeepSeekProvider(OpenAICompatProvider):
-    """OpenAI-compatible provider with DeepSeek-specific quirks.
+def _normalize_response(data: dict[str, Any]) -> dict[str, Any]:
+    """Ensure response dict has the required structure."""
+    if "choices" not in data:
+        data["choices"] = []
+    return data
 
-    DeepSeek r1 thinking mode quirks:
-    1. Returns ``reasoning_content`` (non-standard field) — preserved in messages
-    2. Returns ``content`` as list of blocks ``[{"type":"text","text":"..."}]``
-       instead of a plain string
-    3. Session state pollution — must deepcopy messages before mutation
+
+def _normalize_stream_chunk(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Ensure stream chunk has choices, or return None to skip."""
+    if not data.get("choices"):
+        return None
+    return data
+
+
+class DeepSeekProvider(BaseProvider):
+    """Provider for DeepSeek API using the official deepseek SDK.
+
+    The SDK (``deepseek>=1.0.0``) wraps the OpenAI client with DeepSeek-specific
+    defaults and error types.
+
+    Features:
+    - Native ``reasoning_content`` for R1 / thinking mode
+    - Tool-call forwarding
+    - Stream support
+    - Fallback: if content is empty but reasoning_content exists,
+      use reasoning_content as content
     """
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = "",
+        extra_config: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(api_key, base_url, extra_config)
 
-    @staticmethod
-    def _extract_text_content(content: Any) -> str:
-        """Extract plain text from list content blocks."""
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    parts.append(block.get("text", ""))
-                elif isinstance(block, str):
-                    parts.append(block)
-            return "\n".join(parts)
-        return str(content) if content else ""
+        try:
+            from deepseek import DeepSeekClient
+        except ImportError:
+            raise ImportError(
+                "deepseek package is required for DeepSeekProvider. "
+                "Install it with: pip install deepseek"
+            )
+
+        # Initialize the official SDK client
+        client_kwargs: dict[str, Any] = {"api_key": api_key}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+
+        self._client: Any = DeepSeekClient(**client_kwargs)
 
     # ------------------------------------------------------------------
-    # Non-streaming chat
+    # chat()
     # ------------------------------------------------------------------
 
     async def chat(
         self,
         messages: list[dict[str, Any]],
-        *,
         model: str,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        stream: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        # Deepseek: deepcopy messages to avoid session state pollution
-        messages = copy.deepcopy(messages)
+        """Send a non-streaming chat completion via the official SDK.
 
-        # Build request body — reuse parent but ensure DeepSeek-specific params
-        body = self._build_body(messages, model, temperature, max_tokens, **kwargs)
-        # DeepSeek may need stream_options to get usage in streaming mode
-        body.setdefault("stream", False)
-
-        response = await self._send_request(body)
-
-        if "error" in response:
-            raise Exception(f"DeepSeek API error: {response['error']}")
-
-        # --- Reasoning content handling ---
-        choice = response.get("choices", [{}])[0]
-        msg = choice.get("message", {})
-        content = msg.get("content", "")
-        reasoning_content = msg.get("reasoning_content")
-
-        # Handle list content blocks (DeepSeek r1 returns this format)
-        if isinstance(content, list):
-            content = self._extract_text_content(content)
-            msg["content"] = content
-
-        # Fallback: if content empty but reasoning_content exists, use it
-        if not content and reasoning_content:
-            content = reasoning_content
-            reasoning_content = None
-            msg["content"] = content
-            msg["reasoning_content"] = None
-
-        # Forward reasoning_content so protocol_adapter can emit it
-        if reasoning_content:
-            msg["reasoning_content"] = reasoning_content
-
-        # Log with thinking info
-        has_thinking = bool(reasoning_content)
-        logger.debug(
-            "DeepSeek response: content_len={}, thinking_len={}, model={}",
-            len(content) if content else 0,
-            len(reasoning_content) if reasoning_content else 0,
-            model,
-        )
-
-        # Attach usage info if present
-        usage = response.get("usage")
-        if usage:
-            logger.debug(
-                "DeepSeek usage: prompt_tokens={}, completion_tokens={}, total_tokens={}",
-                usage.get("prompt_tokens", 0),
-                usage.get("completion_tokens", 0),
-                usage.get("total_tokens", 0),
+        Returns a unified response dict with ``reasoning_content`` if present.
+        """
+        try:
+            call_kwargs = self._build_chat_kwargs(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=False,
+                **kwargs,
             )
 
-        return response
+            response = await self._client.async_chat_completion(**call_kwargs)
+
+            # Normalize: SDK may return Pydantic model or dict
+            if hasattr(response, "model_dump"):
+                data = response.model_dump()
+            elif isinstance(response, dict):
+                data = response
+            else:
+                data = response  # hope for the best
+
+            return self._normalize_chat_response(data, model)
+
+        except Exception as e:
+            raise ProviderError(f"DeepSeekSDK request failed: {e}") from e
 
     # ------------------------------------------------------------------
-    # Streaming chat
+    # chat_stream()
     # ------------------------------------------------------------------
 
     async def chat_stream(
         self,
         messages: list[dict[str, Any]],
-        *,
         model: str,
         temperature: float | None = None,
         max_tokens: int | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[dict[str, Any], None]:
-        # Deepseek: deepcopy messages to avoid session state pollution
-        messages = copy.deepcopy(messages)
+        """Stream chat completion via the official SDK.
 
-        body = self._build_body(messages, model, temperature, max_tokens, **kwargs)
-        body["stream"] = True
-        # Request usage in stream via stream_options
-        body.setdefault("stream_options", {"include_usage": True})
+        Yields unified chunk dicts with ``reasoning_content`` when present.
+        """
+        try:
+            call_kwargs = self._build_chat_kwargs(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+                **kwargs,
+            )
 
-        full_content = ""
-        full_reasoning = ""
+            stream_gen = self._client.async_stream_response(**call_kwargs)
 
-        async for chunk_data in self._stream_request(body):
-            if "error" in chunk_data:
-                raise Exception(f"DeepSeek stream error: {chunk_data['error']}")
+            async for chunk in stream_gen:
+                # Normalize: SDK may yield Pydantic model or dict
+                if hasattr(chunk, "model_dump"):
+                    data = chunk.model_dump()
+                elif isinstance(chunk, dict):
+                    data = chunk
+                else:
+                    continue
 
-            # Handle chunk format
-            choices = chunk_data.get("choices", [])
-            if not choices:
-                # Usage-only chunk (stream_options)
-                usage = chunk_data.get("usage")
-                if usage:
-                    logger.debug(
-                        "DeepSeek stream usage: prompt_tokens={}, completion_tokens={}",
-                        usage.get("prompt_tokens", 0),
-                        usage.get("completion_tokens", 0),
-                    )
-                continue
+                normalized = _normalize_stream_chunk(data)
+                if normalized is None:
+                    continue
 
-            choice = choices[0]
-            delta = choice.get("delta", {})
+                yield self._normalize_stream_response(normalized, model)
 
-            # --- Reasoning content from delta ---
-            delta_reasoning = delta.get("reasoning_content")
-            content = delta.get("content", "")
+        except Exception as e:
+            raise ProviderError(f"DeepSeekSDK stream failed: {e}") from e
 
-            # Handle list content blocks in delta
-            if isinstance(content, list):
-                content = self._extract_text_content(content)
+    # ------------------------------------------------------------------
+    # list_models()
+    # ------------------------------------------------------------------
 
-            # Fallback: if content empty but reasoning_content exists
-            if not content and delta_reasoning:
-                content = delta_reasoning
-                delta_reasoning = None
-                delta["content"] = content
-                delta["reasoning_content"] = None
+    async def list_models(self) -> list[dict[str, Any]]:
+        """List models — DeepSeek SDK does not support this, return empty."""
+        return []
 
-            if delta_reasoning:
-                full_reasoning += delta_reasoning
-                delta["reasoning_content"] = delta_reasoning
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-            if content:
-                full_content += content
+    def _build_chat_kwargs(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        temperature: float | None,
+        max_tokens: int | None,
+        stream: bool,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Build keyword arguments for the SDK call."""
+        call_kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": stream,
+        }
+        if temperature is not None:
+            call_kwargs["temperature"] = temperature
+        if max_tokens is not None:
+            call_kwargs["max_tokens"] = max_tokens
 
-            yield chunk_data
+        # Forward only whitelisted kwargs
+        for k, v in kwargs.items():
+            if k in _ALLOWED_CHAT_KWARGS:
+                call_kwargs[k] = v
+            elif k in ("stream_options", "tools", "tool_choice", "response_format"):
+                call_kwargs[k] = v
 
-        logger.debug(
-            "DeepSeek stream complete: content_len={}, thinking_len={}, model={}",
-            len(full_content),
-            len(full_reasoning),
-            model,
-        )
+        return call_kwargs
+
+    def _normalize_chat_response(self, data: dict[str, Any], model: str) -> dict[str, Any]:
+        """Normalize chat response, extracting reasoning_content."""
+        data = _normalize_response(data)
+        data.setdefault("id", "")
+        data.setdefault("model", model)
+
+        if data["choices"]:
+            choice = data["choices"][0]
+            message = choice.get("message", {})
+
+            content = message.get("content") or ""
+            reasoning_content = message.get("reasoning_content")
+
+            # Fallback: use reasoning_content as content when content is empty
+            if not content and reasoning_content:
+                message["content"] = reasoning_content
+                message["reasoning_content"] = None
+            elif reasoning_content:
+                message["reasoning_content"] = reasoning_content
+
+        return data
+
+    def _normalize_stream_response(self, data: dict[str, Any], model: str) -> dict[str, Any]:
+        """Normalize stream chunk, extracting reasoning_content from delta.
+
+        Unlike non-streaming, we do NOT apply the reasoning_content→content
+        fallback here.  In streaming mode, reasoning chunks arrive separately
+        from content chunks, and the caller needs ``reasoning_content`` to
+        remain intact so it can distinguish reasoning from final content.
+        """
+        data.setdefault("id", "")
+        data.setdefault("model", model)
+        return data

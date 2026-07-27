@@ -29,6 +29,7 @@ dev = [
     "pytest-cov>=5.0.0",
     "httpx>=0.28.0",
 ]
+deepseek = ["deepseek>=1.0.0"]
 
 [project.scripts]
 botflow = "botflow.cli:main"
