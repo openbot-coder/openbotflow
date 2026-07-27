@@ -75,6 +75,12 @@ class DeepSeekProvider(BaseProvider):
     ) -> None:
         super().__init__(api_key, base_url, extra_config)
 
+        if not api_key:
+            raise ValueError(
+                "DeepSeekProvider requires a non-empty api_key. "
+                "Set DEEPSEEK_API_KEY or pass api_key in provider config."
+            )
+
         try:
             from deepseek import DeepSeekClient
         except ImportError:
@@ -179,12 +185,20 @@ class DeepSeekProvider(BaseProvider):
             raise ProviderError(f"DeepSeekSDK stream failed: {e}") from e
 
     # ------------------------------------------------------------------
-    # list_models()
+    # list_models() / health_check()
     # ------------------------------------------------------------------
 
     async def list_models(self) -> list[dict[str, Any]]:
         """List models — DeepSeek SDK does not support this, return empty."""
         return []
+
+    async def health_check(self) -> dict[str, Any]:
+        """Health check — probe list_models as lightweight liveness test."""
+        try:
+            models = await self.list_models()
+            return {"status": "ok", "models": len(models)}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -220,7 +234,8 @@ class DeepSeekProvider(BaseProvider):
 
         return call_kwargs
 
-    def _normalize_chat_response(self, data: dict[str, Any], model: str) -> dict[str, Any]:
+    @staticmethod
+    def _normalize_chat_response(data: dict[str, Any], model: str) -> dict[str, Any]:
         """Normalize chat response, extracting reasoning_content."""
         data = _normalize_response(data)
         data.setdefault("id", "")
@@ -242,7 +257,8 @@ class DeepSeekProvider(BaseProvider):
 
         return data
 
-    def _normalize_stream_response(self, data: dict[str, Any], model: str) -> dict[str, Any]:
+    @staticmethod
+    def _normalize_stream_response(data: dict[str, Any], model: str) -> dict[str, Any]:
         """Normalize stream chunk, extracting reasoning_content from delta.
 
         Unlike non-streaming, we do NOT apply the reasoning_content→content
