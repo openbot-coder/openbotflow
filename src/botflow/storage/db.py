@@ -522,6 +522,7 @@ class Database:
         return CallLog(
             id=row["id"],
             group_id=row["group_id"],
+            model_id=row["model_id"],
             provider_id=row["provider_id"],
             request_body=row["request_body"],
             response_body=row["response_body"],
