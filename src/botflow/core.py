@@ -56,7 +56,7 @@ SAFE_EXTRA_KEYS = frozenset({
     "logit_bias", "logprobs", "max_completion_tokens", "max_tokens",
     "metadata", "modalities", "moderation", "n", "parallel_tool_calls",
     "prediction", "presence_penalty", "prompt_cache_key",
-    "prompt_cache_retention", "reasoning_effort", "response_format",
+    "prompt_cache_retention", "reasoning_effort", "reasoning_content", "response_format",
     "safety_identifier", "seed", "service_tier", "stop", "store",
     "stream_options", "temperature", "tool_choice", "tools",
     "top_logprobs", "top_p", "user", "verbosity", "web_search_options",
