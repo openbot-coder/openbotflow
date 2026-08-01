@@ -14,6 +14,7 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
 import time
@@ -182,12 +183,15 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS - 允许所有来源
-cors_origins = os.environ.get("BOTFLOW_CORS_ORIGINS", "*").split(",")
+# CORS - 安全配置
+# HTTP CORS 规范：当 allow_credentials=True 时不允许 "*" 作为 origin。
+# 若配置了 "*"，则关闭 credentials 以保证浏览器兼容。
+cors_origins = [o.strip() for o in os.environ.get("BOTFLOW_CORS_ORIGINS", "*").split(",") if o.strip()]
+_wildcard = "*" in cors_origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins,
-    allow_credentials=True,
+    allow_origins=["*"] if _wildcard else cors_origins,
+    allow_credentials=not _wildcard,
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
     allow_headers=["Authorization", "Content-Type", "Accept"],
 )
@@ -323,14 +327,13 @@ class McpAuthMiddleware:
         if not mcp_key:
             return await self.app(scope, receive, send)
 
-        import hmac as _hmac
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
             response = JSONResponse(status_code=401, content={"error": "Missing or invalid Authorization header"})
             return await response(scope, receive, send)
 
         provided_key = auth_header.removeprefix("Bearer ").strip()
-        if not _hmac.compare_digest(provided_key, mcp_key):
+        if not hmac.compare_digest(provided_key, mcp_key):
             log.warning("Invalid MCP key attempt from {}", request.client.host if request.client else "unknown")
             response = JSONResponse(status_code=401, content={"error": "Invalid MCP key"})
             return await response(scope, receive, send)
@@ -412,14 +415,6 @@ def _estimate_cost(usage: dict[str, Any]) -> float:
     For accurate cost tracking, implement per-model pricing tables.
     """
     return 0.0
-
-
-def _extract_model_route_info(response: dict, internal_params: dict) -> tuple[int | None, int | None, int | None]:
-    """Extract model/provider IDs from response metadata if available."""
-    model_id = None
-    provider_id = None
-    group_id = internal_params.get("_group_id")
-    return group_id, model_id, provider_id
 
 
 # ---------------------------------------------------------------------------
@@ -666,7 +661,6 @@ async def _stream_common(
         done_signal: Final SSE line to yield after all chunks.
     """
     model_name = internal.get("model", "")
-    group_id = None
     group_id, router, safe_extra = await _get_extra_route_params(internal, stream=True)
 
     try:
