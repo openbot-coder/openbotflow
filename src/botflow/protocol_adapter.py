@@ -67,6 +67,8 @@ def internal_to_openai(internal: dict[str, Any]) -> dict[str, Any]:
             "role": msg.get("role", "assistant"),
             "content": msg.get("content", ""),
         }
+        if msg.get("reasoning_content") is not None:
+            message["reasoning_content"] = msg["reasoning_content"]
         if msg.get("tool_calls"):
             message["tool_calls"] = msg["tool_calls"]
         if msg.get("function_call"):
