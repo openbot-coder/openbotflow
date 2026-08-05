@@ -35,6 +35,9 @@ def create_mcp_server(registry: ToolRegistry) -> FastMCP:
             "  3) tool_call    — invoke any internal tool by name + arguments\n\n"
             "Workflow: tool_search → tool_describe → tool_call"
         ),
+        # Serve the SSE GET endpoint at /mcp/ (instead of /mcp/sse).
+        # Messages endpoint stays at /mcp/messages.
+        sse_path="/",
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=False,
             allowed_hosts=["api.vxquant.com", "localhost", "127.0.0.1", "0.0.0.0"],

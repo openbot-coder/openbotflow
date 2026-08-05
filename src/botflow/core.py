@@ -335,9 +335,9 @@ app.add_middleware(
 
 _registry = ToolRegistry()
 mcp_server = create_mcp_server(_registry)
-# Expose MCP via SSE transport at /mcp/sse (and /mcp/messages for POST).
-# FastMCP's sse_app(mount_path="/") routes internally to /sse and /messages,
-# so mounting under /mcp yields /mcp/sse and /mcp/messages.
+# Expose MCP via SSE transport at /mcp/ (and /mcp/messages for POST).
+# FastMCP's sse_app(mount_path="/") routes internally to sse_path="/" and /messages,
+# so mounting under /mcp yields /mcp/ (SSE GET) and /mcp/messages (POST).
 app.mount("/mcp", mcp_server.sse_app(mount_path="/"))
 
 
