@@ -12,6 +12,7 @@ import json
 from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.server import TransportSecuritySettings
 
 from botflow import __version__
 
@@ -33,6 +34,10 @@ def create_mcp_server(registry: ToolRegistry) -> FastMCP:
             "  2) tool_describe — view tool parameter details\n"
             "  3) tool_call    — invoke any internal tool by name + arguments\n\n"
             "Workflow: tool_search → tool_describe → tool_call"
+        ),
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=False,
+            allowed_hosts=["api.vxquant.com", "localhost", "127.0.0.1", "0.0.0.0"],
         ),
     )
 

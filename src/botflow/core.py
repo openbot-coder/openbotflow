@@ -273,9 +273,9 @@ async def lifespan(app: FastAPI):
 
     dedup_cleanup_task = asyncio.create_task(_periodic_dedup_cleanup())
 
-    # Enter MCP session manager lifecycle
-    async with mcp_server._session_manager.run():
-        yield
+    # MCP session lifecycle is managed internally by FastMCP's app;
+    # the outer lifespan only manages botflow's own background tasks.
+    yield
 
     # Shutdown: gracefully stop log writer
     if _log_writer:
@@ -335,7 +335,10 @@ app.add_middleware(
 
 _registry = ToolRegistry()
 mcp_server = create_mcp_server(_registry)
-app.mount("/mcp", mcp_server.streamable_http_app())
+# Expose MCP via SSE transport at /mcp/sse (and /mcp/messages for POST).
+# FastMCP's sse_app(mount_path="/") routes internally to /sse and /messages,
+# so mounting under /mcp yields /mcp/sse and /mcp/messages.
+app.mount("/mcp", mcp_server.sse_app(mount_path="/"))
 
 
 # ---------------------------------------------------------------------------
