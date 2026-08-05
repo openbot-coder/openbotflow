@@ -5,10 +5,9 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, Optional
+from dataclasses import dataclass
+from typing import Any
 
-from loguru import logger
 
 from botflow.common.exceptions import (
     AllModelsCooldownError,
@@ -41,10 +40,14 @@ class CooldownState:
 
 
 class CooldownManager:
-    """Manages cooldown states for all models across groups."""
+    """Manages cooldown states for all models across groups.
+
+    Supports persistence to survive service restarts.
+    """
 
     def __init__(self) -> None:
         self._states: dict[tuple[int, int], CooldownState] = {}  # (group_id, model_id) -> state
+        self._monotonic_start = time.monotonic()  # Track startup time for relative->absolute conversion
 
     def record_success(self, group_id: int, model_id: int) -> None:
         """Reset failure count on success."""
@@ -94,6 +97,42 @@ class CooldownManager:
         key = (group_id, model_id)
         state = self._states.get(key)
         return state.consecutive_failures if state else 0
+
+    def get_all_active_cooldowns(self) -> list[dict]:
+        """Get all models currently in cooldown.
+
+        Returns wall-clock ``cooldown_until`` values so they survive restarts.
+        """
+        result = []
+        now_mono = time.monotonic()
+        wall_now = time.time()
+        for (group_id, model_id), state in self._states.items():
+            if state.cooldown_until > now_mono:
+                remaining = state.cooldown_until - now_mono
+                result.append({
+                    "group_id": group_id,
+                    "model_id": model_id,
+                    "consecutive_failures": state.consecutive_failures,
+                    "cooldown_until": wall_now + remaining,  # wall clock for persistence
+                })
+        return result
+
+    def restore_state(self, group_id: int, model_id: int, failures: int, cooldown_until: float) -> None:
+        """Restore a cooldown state from persistence.
+
+        ``cooldown_until`` is wall-clock time; convert back to monotonic.
+        """
+        remaining = cooldown_until - time.time()
+        if remaining <= 0:
+            return  # already expired, skip restore
+        mono_until = time.monotonic() + remaining
+        key = (group_id, model_id)
+        state = CooldownState(consecutive_failures=failures, cooldown_until=mono_until)
+        self._states[key] = state
+        log.info(
+            "Restored cooldown for model {} (group {}): {}s remaining",
+            model_id, group_id, int(remaining),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +207,23 @@ def weighted_random_select(models: list[GroupModelWithDetails]) -> GroupModelWit
 
     # Fallback (shouldn't reach here due to floating point, but defensive)
     return models[-1]
+
+
+def weighted_random_order(models: list[GroupModelWithDetails]) -> list[GroupModelWithDetails]:
+    """Order models by weighted random sampling without replacement.
+
+    The first element follows the same distribution as weighted_random_select,
+    so fallback order respects model weights. Zero-weight models are excluded.
+    """
+    remaining = [m for m in models if m.weight > 0]
+    if not remaining:
+        raise NoAvailableModelError("No available models (total weight is 0 or negative)")
+    ordered: list[GroupModelWithDetails] = []
+    while remaining:
+        selected = weighted_random_select(remaining)
+        remaining.remove(selected)
+        ordered.append(selected)
+    return ordered
 
 
 # ---------------------------------------------------------------------------
@@ -370,9 +426,12 @@ class GroupRouter:
         max_tokens: int | None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Streaming routing — selects one model and returns generator info.
+        """Streaming routing — returns candidate endpoints in weighted order.
 
-        Falls back to fallback_group_id if all models in this group are on cooldown.
+        The caller tries each endpoint in order until one starts streaming,
+        then falls back to the next on pre-stream failure (mirrors
+        ``_route_non_stream`` fallback). Falls back to ``fallback_group_id``
+        if all models in this group are on cooldown.
         """
         available = self._get_available(endpoints)
         if not available:
@@ -388,15 +447,16 @@ class GroupRouter:
                 )
             raise AllModelsCooldownError(f"Group {self.group_id}: all models are on cooldown")
 
-        selected = weighted_random_select([ep.detail for ep in available])
-        matching_ep = next(ep for ep in available if ep.model_id == selected.model_id)
+        ordered = weighted_random_order([ep.detail for ep in available])
+        endpoints_ordered = [next(ep for ep in available if ep.model_id == d.model_id) for d in ordered]
 
         context_windows = [ep.detail.context_window for ep in available if ep.detail.context_window > 0]
         if context_windows:
             messages = truncate_to_context_window(messages, min(context_windows), max_tokens)
 
         return {
-            "endpoint": matching_ep,
+            "endpoints": endpoints_ordered,
+            "group_id": self.group_id,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,

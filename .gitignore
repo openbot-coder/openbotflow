@@ -25,7 +25,6 @@ ENV/
 .coverage.*
 htmlcov/
 .pytest_cache/
-.coverage
 
 # Database (runtime data, not source)
 data/
@@ -47,5 +46,5 @@ desktop.ini
 .python-version
 uv.lock
 
+# Tools
 .qoder/
-uv.lock

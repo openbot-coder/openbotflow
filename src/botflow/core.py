@@ -17,7 +17,6 @@ import asyncio
 import json
 import os
 import time
-import traceback
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -28,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from botflow.auth import verify_llm_key
+from botflow.common.exceptions import ProviderError
 from botflow.common.logger import get_logger, setup_logging
 from botflow.config import BotflowSettings
 from botflow.mcp.server import create_mcp_server
@@ -41,7 +41,12 @@ from botflow.protocol_adapter import (
     models_to_openai,
     openai_to_internal,
 )
-from botflow.router import CooldownManager, GroupRouter
+from botflow.router import (
+    CooldownManager,
+    GroupRouter,
+    exponential_backoff,
+    is_retryable_error,
+)
 from botflow.storage.db import Database
 from botflow.storage.models import CallLog
 from botflow.storage.cleanup import cleanup_call_logs
@@ -77,6 +82,67 @@ _cooldown_manager = CooldownManager()
 _config: Optional[BotflowSettings] = None
 
 
+class CallLogWriter:
+    """Batched call log writer with background flush.
+
+    Buffers log entries and flushes them to the database in batches
+    to reduce database write overhead under high load.
+    """
+
+    def __init__(self, db: Database, flush_interval: float = 5.0, max_buffer: int = 100):
+        self._db = db
+        self._buffer: list[CallLog] = []
+        self._flush_interval = flush_interval
+        self._max_buffer = max_buffer
+        self._lock = asyncio.Lock()
+        self._flush_task: asyncio.Task | None = None
+
+    async def start(self) -> None:
+        """Start the background flush task."""
+        self._flush_task = asyncio.create_task(self._flush_loop())
+
+    async def stop(self) -> None:
+        """Stop the background flush task and flush remaining entries."""
+        if self._flush_task:
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                pass
+        await self._flush()  # Final flush
+
+    async def log(self, log_entry: CallLog) -> None:
+        """Add a log entry to the buffer."""
+        async with self._lock:
+            self._buffer.append(log_entry)
+            if len(self._buffer) >= self._max_buffer:
+                await self._flush()
+
+    async def _flush_loop(self) -> None:
+        """Background task to periodically flush the buffer."""
+        while True:
+            await asyncio.sleep(self._flush_interval)
+            await self._flush()
+
+    async def _flush(self) -> None:
+        """Flush buffered log entries to the database."""
+        async with self._lock:
+            if not self._buffer:
+                return
+
+            batch = self._buffer.copy()
+            self._buffer.clear()
+
+        try:
+            for entry in batch:
+                await self._db.create_call_log(entry)
+        except Exception as e:
+            log.error("Failed to flush {} call log entries: {}", len(batch), e)
+
+
+_log_writer: Optional[CallLogWriter] = None
+
+
 def _get_db() -> Database:
     assert _db is not None, "Database not initialized"
     return _db
@@ -95,7 +161,7 @@ async def _get_llm_key() -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: startup/shutdown."""
-    global _db, _config
+    global _db, _config, _log_writer
 
     # Auto-initialize if not already configured (e.g., direct uvicorn start)
     if _db is None:
@@ -111,6 +177,11 @@ async def lifespan(app: FastAPI):
         setup_logging(log_dir, _config.log_level)
 
     log.info("botflow service starting...")
+
+    # Initialize call log writer
+    _log_writer = CallLogWriter(_get_db(), flush_interval=5.0, max_buffer=100)
+    await _log_writer.start()
+    log.info("Call log writer started (buffer=100, flush=5s)")
 
     # Register MCP tools
     from botflow.mcp.manager import register_manager_tools
@@ -142,6 +213,21 @@ async def lifespan(app: FastAPI):
         await db.set_config("mcp_key", env_mcp_key)
         log.info("MCP key configured from environment variable.")
 
+    # Restore cooldown states from database
+    try:
+        cooldown_states = await db.load_cooldown_states()
+        for state in cooldown_states:
+            _cooldown_manager.restore_state(
+                state["group_id"],
+                state["model_id"],
+                state["consecutive_failures"],
+                state["cooldown_until"],
+            )
+        if cooldown_states:
+            log.info("Restored {} cooldown states from database", len(cooldown_states))
+    except Exception as e:
+        log.warning("Failed to restore cooldown states: {}", e)
+
     # Start background cleanup task (every 24 hours)
     async def _periodic_cleanup():
         while True:
@@ -155,9 +241,63 @@ async def lifespan(app: FastAPI):
 
     cleanup_task = asyncio.create_task(_periodic_cleanup())
 
+    # Periodic cooldown state save (every 5 minutes)
+    async def _periodic_cooldown_save():
+        while True:
+            await asyncio.sleep(5 * 60)  # 5 minutes
+            try:
+                active = _cooldown_manager.get_all_active_cooldowns()
+                if active:
+                    await _get_db().save_cooldown_state(active)
+                    log.debug("Saved {} active cooldown states", len(active))
+            except Exception as e:
+                log.error("Cooldown state save failed: {}", e)
+
+    cooldown_save_task = asyncio.create_task(_periodic_cooldown_save())
+
+    # Periodic deduplication cache cleanup (every 10 minutes)
+    async def _periodic_dedup_cleanup():
+        while True:
+            await asyncio.sleep(10 * 60)  # 10 minutes
+            try:
+                db = _get_db()
+                conn = await db._ensure_connection()
+                # Delete dedup entries older than 10 minutes
+                import sqlite3
+                cutoff = time.time() - 600
+                await conn.execute(
+                    "DELETE FROM config WHERE key LIKE 'dedup:%' AND updated_at < datetime(?, 'unixepoch')",
+                    (cutoff,),
+                )
+                await conn.commit()
+                log.debug("Cleaned up old deduplication entries")
+            except Exception as e:
+                log.debug("Dedup cleanup failed: {}", e)
+
+    dedup_cleanup_task = asyncio.create_task(_periodic_dedup_cleanup())
+
     # Enter MCP session manager lifecycle
     async with mcp_server._session_manager.run():
         yield
+
+    # Shutdown: gracefully stop log writer
+    if _log_writer:
+        await _log_writer.stop()
+        log.info("Call log writer stopped.")
+
+    # Shutdown: gracefully cancel cooldown save task
+    cooldown_save_task.cancel()
+    try:
+        await cooldown_save_task
+    except asyncio.CancelledError:
+        pass
+
+    # Shutdown: gracefully cancel dedup cleanup task
+    dedup_cleanup_task.cancel()
+    try:
+        await dedup_cleanup_task
+    except asyncio.CancelledError:
+        pass
 
     # Shutdown: gracefully cancel cleanup task
     cleanup_task.cancel()
@@ -210,13 +350,17 @@ class RateLimitMiddleware:
 
     Pre-allocates deque with maxlen=max_requests.
     Oldest timestamp at dq[0] determines if window has expired.
+    Includes automatic cleanup of inactive keys to prevent memory leaks.
     """
 
-    def __init__(self, app, max_requests: int = 300, window_seconds: int = 60):
+    def __init__(self, app, max_requests: int = 300, window_seconds: int = 60, max_keys: int = 10000):
         self.app = app
         self.max_requests = max_requests
         self.window_seconds = window_seconds
+        self._max_keys = max_keys
         self._requests: dict[str, deque[float]] = {}
+        self._last_access: dict[str, float] = {}  # Track last access time for cleanup
+        self._request_count: int = 0  # Counter for periodic cleanup
 
     def _get_rate_limit_key(self, request) -> str:
         """Extract rate limit key from request (LLM key or MCP key)."""
@@ -230,6 +374,14 @@ class RateLimitMiddleware:
 
         return request.client.host if request.client else "anonymous"
 
+    def _cleanup_old_keys(self, now: float) -> None:
+        """Remove keys that haven't been accessed in the last 5 minutes."""
+        cutoff = now - 300  # 5 minutes
+        stale_keys = [k for k, ts in self._last_access.items() if ts < cutoff]
+        for k in stale_keys:
+            self._requests.pop(k, None)
+            self._last_access.pop(k, None)
+
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
@@ -242,10 +394,16 @@ class RateLimitMiddleware:
         key = self._get_rate_limit_key(request)
         now = time.time()
 
-        dq = self._requests.setdefault(key, deque([now-1],maxlen=self.max_requests))
+        # Periodic cleanup every 1000 requests
+        self._request_count += 1
+        if self._request_count % 1000 == 0 and len(self._requests) > self._max_keys:
+            self._cleanup_old_keys(now)
+
+        dq = self._requests.setdefault(key, deque([now-1], maxlen=self.max_requests))
+        self._last_access[key] = now
 
         # If deque full and oldest timestamp still in window -> rate limited
-        if  now - self.window_seconds <= dq[0] and len(dq) == self.max_requests:
+        if now - self.window_seconds <= dq[0] and len(dq) == self.max_requests:
             retry_after = int(dq[0] + self.window_seconds - now) + 1
             response = JSONResponse(
                 status_code=429,
@@ -258,7 +416,7 @@ class RateLimitMiddleware:
 
 
 # 添加速率限制中间件（每个 KEY 300 次/分钟）
-app.add_middleware(RateLimitMiddleware, max_requests=300, window_seconds=60)
+app.add_middleware(RateLimitMiddleware, max_requests=300, window_seconds=60, max_keys=10000)
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +544,8 @@ async def _log_call(
     usage: dict[str, Any] | None,
     error_message: str | None = None,
 ) -> None:
-    """Write a call log entry asynchronously."""
+    """Write a call log entry asynchronously (buffered)."""
+    global _log_writer
     log_entry = CallLog(
         group_id=group_id,
         model_id=model_id,
@@ -402,7 +561,11 @@ async def _log_call(
         cost=_estimate_cost(usage) if usage else None,
         error_message=error_message,
     )
-    await _get_db().create_call_log(log_entry)
+    if _log_writer:
+        await _log_writer.log(log_entry)
+    else:
+        # Fallback: direct write if writer not initialized
+        await _get_db().create_call_log(log_entry)
 
 
 def _estimate_cost(usage: dict[str, Any]) -> float:
@@ -422,6 +585,42 @@ def _extract_model_route_info(response: dict, internal_params: dict) -> tuple[in
     return group_id, model_id, provider_id
 
 
+def _generate_request_id(body: dict) -> str:
+    """Generate a deterministic request ID for deduplication."""
+    import hashlib
+    # Create a hash based on request content
+    content = json.dumps(body, sort_keys=True, default=str)
+    return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+
+async def _check_request_deduplication(request_id: str, ttl_seconds: int = 300) -> Optional[dict]:
+    """Check if request has been processed recently. Returns cached result if found."""
+    import json
+    try:
+        cached = await _get_db().get_config(f"dedup:{request_id}")
+        if cached:
+            data = json.loads(cached)
+            # Check if still valid (within TTL)
+            if time.time() - data.get("timestamp", 0) < ttl_seconds:
+                return data.get("result")
+    except Exception:
+        pass
+    return None
+
+
+async def _cache_request_result(request_id: str, result: dict, ttl_seconds: int = 300) -> None:
+    """Cache request result for deduplication."""
+    import json
+    try:
+        data = {
+            "result": result,
+            "timestamp": time.time(),
+        }
+        await _get_db().set_config(f"dedup:{request_id}", json.dumps(data))
+    except Exception as e:
+        log.debug("Failed to cache request result for deduplication: {}", e)
+
+
 # ---------------------------------------------------------------------------
 # Endpoint: OpenAI /v1/chat/completions
 # ---------------------------------------------------------------------------
@@ -433,6 +632,14 @@ async def chat_completions(request: Request):
     internal = openai_to_internal(body)
     stream = internal["stream"]
 
+    # Request deduplication for non-streaming requests
+    request_id = body.get("request_id") or _generate_request_id(body)
+    if not stream:
+        cached_result = await _check_request_deduplication(request_id)
+        if cached_result:
+            log.debug("Returning cached result for request {}", request_id)
+            return JSONResponse(content=json.loads(cached_result) if isinstance(cached_result, str) else cached_result)
+
     if stream:
         return StreamingResponse(
             _stream_openai(internal, request),
@@ -440,7 +647,13 @@ async def chat_completions(request: Request):
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
         )
 
-    return await _handle_chat_non_stream(internal, request, internal_to_openai)
+    result = await _handle_chat_non_stream(internal, request, internal_to_openai)
+
+    # Cache successful result for deduplication
+    if result.status_code == 200:
+        await _cache_request_result(request_id, result.body.decode())
+
+    return result
 
 
 @app.post("/v1/completions")
@@ -553,9 +766,9 @@ async def embeddings(request: Request):
 # ---------------------------------------------------------------------------
 
 
-def _request_summary(internal: dict) -> str:
-    """Build a truncated JSON summary of the request messages for logging."""
-    return json.dumps(internal.get("messages", [])[:500])
+def _request_summary(internal: dict) -> str | None:
+    """No longer storing request body — return None to save ~136KB per row."""
+    return None
 
 
 async def _get_extra_route_params(internal: dict, stream: bool = False) -> tuple[int, GroupRouter, dict]:
@@ -586,6 +799,9 @@ async def _handle_chat_non_stream(
             stream=False,
             **safe_extra,
         )
+
+        # Override model with the original requested model name
+        result["model"] = internal["model"]
 
         duration = int((time.monotonic() - start) * 1000)
         usage = result.get("usage", {})
@@ -653,21 +869,38 @@ def _anthropic_serialize(chunk: dict) -> tuple[list[str], dict | None]:
     return lines, chunk.get("usage")
 
 
+async def _chain_first(first_chunk: dict, rest: AsyncGenerator[dict, None]) -> AsyncGenerator[dict, None]:
+    """Yield the first chunk (already pulled for fallback detection), then the rest of the stream."""
+    yield first_chunk
+    async for chunk in rest:
+        yield chunk
+
+
 async def _stream_common(
     internal: dict,
     serialize: SerializeFn,
     done_signal: str = "data: [DONE]\n\n",
+    request: Request | None = None,
 ) -> AsyncGenerator[str, None]:
     """Shared streaming logic: route, iterate, serialize, log.
+
+    Tries candidate endpoints in weighted order; if a stream fails before its
+    first chunk, the next endpoint is attempted (mirrors non-streaming
+    fallback, per design.md: 可重试错误重试后 fallback，不可重试错误立即 fallback).
+    Once a stream has started, later failures are not retried — they propagate
+    to the client as an SSE error event.
 
     Args:
         internal: Parsed internal request dict.
         serialize: Chunk serializer returning (sse_lines, usage) per chunk.
         done_signal: Final SSE line to yield after all chunks.
+        request: Optional Request object for disconnect detection.
     """
     model_name = internal.get("model", "")
     group_id = None
     group_id, router, safe_extra = await _get_extra_route_params(internal, stream=True)
+    used_ep = None
+    last_error: Exception | None = None
 
     try:
         route_result = await router.route(
@@ -677,48 +910,114 @@ async def _stream_common(
             stream=True,
             **safe_extra,
         )
-
-        ep = route_result["endpoint"]
+        routed_group_id = route_result.get("group_id", group_id)
         start = time.monotonic()
         usage_final = None
+        stream_timeout = 30  # 30 seconds timeout for first chunk
 
-        async for chunk in ep.provider.chat_stream(
-            messages=route_result["messages"],
-            model=ep.detail.model_name,
-            temperature=route_result.get("temperature"),
-            max_tokens=route_result.get("max_tokens"),
-            **route_result.get("kwargs", {}),
-        ):
-            try:
-                lines, usage = serialize(chunk)
-            except Exception as serialize_err:
-                log.error("Serialize error for chunk: {}", chunk)
-                raise
-            if usage:
-                usage_final = usage
-            for line in lines:
-                yield line
+        for ep in route_result["endpoints"]:
+            attempts = max(ep.max_retries, 1)
+            for attempt in range(attempts):
+                gen: AsyncGenerator[dict, None] | None = None
+                try:
+                    gen = ep.provider.chat_stream(
+                        messages=route_result["messages"],
+                        model=ep.detail.model_name,
+                        temperature=route_result.get("temperature"),
+                        max_tokens=route_result.get("max_tokens"),
+                        **route_result.get("kwargs", {}),
+                    )
+                    async with asyncio.timeout(stream_timeout):
+                        first_chunk = await gen.__anext__()
+                except asyncio.TimeoutError:
+                    last_error = ProviderError(f"Model {ep.detail.model_name} timed out waiting for first chunk")
+                    log.warning("{}", last_error)
+                    if gen:
+                        await gen.aclose()
+                    gen = None
+                    break
+                except StopAsyncIteration:
+                    last_error = ProviderError(f"Model {ep.detail.model_name} returned an empty stream")
+                    log.warning("{}", last_error)
+                    gen = None
+                    break
+                except Exception as e:
+                    last_error = e
+                    log.warning(
+                        "Model {} stream failed (attempt {}/{}): {}",
+                        ep.detail.model_name,
+                        attempt + 1,
+                        attempts,
+                        e,
+                    )
+                    if gen:
+                        await gen.aclose()
+                    if is_retryable_error(e) and attempt < attempts - 1:
+                        await exponential_backoff(attempt)
+                        continue
+                    break
 
-        yield done_signal
+                if gen is None:
+                    break  # empty stream: move to next endpoint
 
-        duration = int((time.monotonic() - start) * 1000)
-        await _log_call(
-            group_id=group_id,
-            model_id=ep.model_id,
-            provider_id=ep.detail.provider_id,
-            request_body=_request_summary(internal),
-            response_body=None,
-            status="success",
-            duration_ms=duration,
-            usage=usage_final,
-        )
+                # Stream started: commit to this model.
+                used_ep = ep
+                last_error = None
+                router.cooldown.record_success(routed_group_id, ep.model_id)
+
+                try:
+                    async for chunk in _chain_first(first_chunk, gen):
+                        # Check if client disconnected
+                        if request and await request.is_disconnected():
+                            log.info("Client disconnected, aborting stream for model {}", ep.detail.model_name)
+                            break
+
+                        # Override model with the original requested model name
+                        chunk["model"] = model_name
+                        try:
+                            lines, usage = serialize(chunk)
+                        except Exception:
+                            log.error("Serialize error for chunk: {}", chunk)
+                            raise
+                        if usage:
+                            usage_final = usage
+                        for line in lines:
+                            yield line
+                except Exception as e:
+                    log.error("Stream failed mid-way on model {}: {}", ep.detail.model_name, e)
+                    raise
+
+                yield done_signal
+
+                duration = int((time.monotonic() - start) * 1000)
+                await _log_call(
+                    group_id=group_id,
+                    model_id=used_ep.model_id,
+                    provider_id=used_ep.detail.provider_id,
+                    request_body=_request_summary(internal),
+                    response_body=None,
+                    status="success",
+                    duration_ms=duration,
+                    usage=usage_final,
+                )
+                return
+
+            # All attempts on this endpoint failed — cool it down, try next.
+            router.cooldown.record_failure(
+                routed_group_id,
+                ep.model_id,
+                ep.cooldown_threshold,
+                ep.cooldown_seconds,
+            )
+
+        raise last_error if last_error is not None else ProviderError(f"No models available to stream for model {model_name}")
 
     except Exception as e:
         log.opt(exception=True).error("Stream failed for model {}: {}", model_name, e)
         await _log_call(
             group_id=group_id,
-            model_id=None,
-            provider_id=None,
+            model_id=used_ep.model_id if used_ep else None,
+            provider_id=used_ep.detail.provider_id if used_ep else None,
             request_body=_request_summary(internal),
             response_body=None,
             status="error",
@@ -736,7 +1035,7 @@ async def _stream_openai(
     request: Request,
 ) -> AsyncGenerator[str, None]:
     """Stream response in OpenAI SSE format."""
-    async for line in _stream_common(internal, _openai_serialize):
+    async for line in _stream_common(internal, _openai_serialize, request=request):
         yield line
 
 
@@ -745,7 +1044,7 @@ async def _stream_anthropic(
     request: Request,
 ) -> AsyncGenerator[str, None]:
     """Stream response in Anthropic SSE format."""
-    async for line in _stream_common(internal, _anthropic_serialize):
+    async for line in _stream_common(internal, _anthropic_serialize, request=request):
         yield line
 
 

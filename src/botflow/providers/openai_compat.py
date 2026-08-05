@@ -147,13 +147,6 @@ class OpenAICompatProvider(BaseProvider):
         content = _extract_text_from_content(msg.get("content") or "")
         reasoning_content = msg.get("reasoning_content")
 
-        # If content is empty but reasoning_content exists, fall back to it
-        # Some models (stepfun, deepseek, mimo) in thinking mode return
-        # reasoning_content instead of content
-        if not content and reasoning_content:
-            content = reasoning_content
-            reasoning_content = None
-
         message: dict[str, Any] = {
             "role": msg.get("role", "assistant"),
             "content": content,
@@ -167,7 +160,7 @@ class OpenAICompatProvider(BaseProvider):
 
         return {
             "id": data.get("id", ""),
-            "model": data.get("model", model),
+            "model": model,
             "choices": [
                 {
                     "index": choice.get("index", 0),
@@ -193,11 +186,6 @@ class OpenAICompatProvider(BaseProvider):
         delta_content = _extract_text_from_content(delta.get("content"))
         delta_reasoning = delta.get("reasoning_content")
 
-        # Streaming: if content is empty but reasoning_content exists, fall back
-        if not delta_content and delta_reasoning:
-            delta_content = delta_reasoning
-            delta_reasoning = None
-
         delta_out: dict[str, Any] = {
             "role": delta.get("role") or "assistant",
             "content": delta_content,
@@ -212,7 +200,7 @@ class OpenAICompatProvider(BaseProvider):
         chunk: dict[str, Any] = {
             "id": data.get("id", ""),
             "object": "chat.completion.chunk",
-            "model": data.get("model", model),
+            "model": model,
             "choices": [
                 {
                     "index": choice.get("index", 0),

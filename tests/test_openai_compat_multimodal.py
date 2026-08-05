@@ -6,7 +6,7 @@ Covers:
 - _extract_text_from_content: None / empty → ""
 - _to_unified: list content blocks → plain text in output
 - _chunk_to_unified: list content delta → plain text in output
-- DeepSeek reasoning_content fallback when content is list
+- DeepSeek reasoning_content preservation when content is empty/list
 """
 
 from __future__ import annotations
@@ -116,8 +116,14 @@ class TestToUnifiedMultimodal:
         result = provider._to_unified(data, "gpt-4")
         assert result["choices"][0]["message"]["content"] == "plain text"
 
-    def test_reasoning_content_fallback_with_list(self):
-        """When content is empty list and reasoning_content exists, fallback works."""
+    def test_reasoning_content_preserved_when_content_empty(self):
+        """When content is empty and reasoning_content exists, both fields are preserved.
+
+        The old 'fallback' merged reasoning_content into content, which broke
+        round-trip: upstream APIs like mimo require reasoning_content to be
+        passed back verbatim in subsequent requests.  Keeping them separate
+        ensures the client can echo reasoning_content back.
+        """
         provider = _make_provider()
         data = {
             "id": "chatcmpl-test",
@@ -137,9 +143,9 @@ class TestToUnifiedMultimodal:
         }
         result = provider._to_unified(data, "deepseek-reasoner")
         msg = result["choices"][0]["message"]
-        # Empty list extracts to "" → fallback to reasoning_content
-        assert msg["content"] == "thinking step by step..."
-        assert msg.get("reasoning_content") is None
+        # Empty list extracts to "" — reasoning_content stays separate
+        assert msg["content"] == ""
+        assert msg["reasoning_content"] == "thinking step by step..."
 
 
 # ---------------------------------------------------------------------------

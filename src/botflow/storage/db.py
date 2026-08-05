@@ -187,6 +187,50 @@ class Database:
         )
         await conn.commit()
 
+    async def save_cooldown_state(self, states: list[dict]) -> None:
+        """Save cooldown states to config table."""
+        import json
+        for state in states:
+            key = f"cooldown:{state['group_id']}:{state['model_id']}"
+            value = json.dumps({
+                "failures": state["consecutive_failures"],
+                "cooldown_until": state["cooldown_until"],
+            })
+            await self.set_config(key, value)
+
+    async def load_cooldown_states(self) -> list[dict]:
+        """Load all cooldown states from config table."""
+        import json
+        conn = await self._ensure_connection()
+        cursor = await conn.execute(
+            "SELECT key, value FROM config WHERE key LIKE 'cooldown:%'"
+        )
+        rows = await cursor.fetchall()
+        states = []
+        for row in rows:
+            try:
+                key = row["key"]
+                parts = key.split(":")
+                if len(parts) == 3:
+                    group_id = int(parts[1])
+                    model_id = int(parts[2])
+                    data = json.loads(row["value"])
+                    states.append({
+                        "group_id": group_id,
+                        "model_id": model_id,
+                        "consecutive_failures": data["failures"],
+                        "cooldown_until": data["cooldown_until"],
+                    })
+            except Exception:
+                pass
+        return states
+
+    async def clear_cooldown_states(self) -> None:
+        """Clear all cooldown states from config table."""
+        conn = await self._ensure_connection()
+        await conn.execute("DELETE FROM config WHERE key LIKE 'cooldown:%'")
+        await conn.commit()
+
     # ------------------------------------------------------------------
     # Provider CRUD
     # ------------------------------------------------------------------

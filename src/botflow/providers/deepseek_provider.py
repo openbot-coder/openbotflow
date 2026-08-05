@@ -1,7 +1,12 @@
-"""DeepSeek provider using the official deepseek Python SDK.
+"""DeepSeek provider using an OpenAI-compatible client.
 
-Provides ``DeepSeekProvider`` — a ``BaseProvider`` subclass that routes
-chat completions through ``deepseek.DeepSeekClient``.
+Provides ``DeepSeekProvider`` — a ``BaseProvider`` subclass that routes chat
+completions through ``AsyncOpenAI`` pointed at DeepSeek's API (or any
+OpenAI-compatible gateway that serves DeepSeek models).
+
+DeepSeek's own documentation recommends the OpenAI SDK (the ``deepseek``
+package on PyPI is a toy wrapper with a hardcoded endpoint and no async
+support), so we use ``AsyncOpenAI`` with a configurable ``base_url``.
 
 Features:
 - Native ``reasoning_content`` handling (DeepSeek R1 / thinking mode)
@@ -9,13 +14,13 @@ Features:
 - Stream support with per-chunk reasoning extraction
 - Robust fallback: if content is empty but reasoning_content exists,
   fall back to reasoning_content as content
-
-Optional dependency: ``pip install deepseek``
 """
 
 from __future__ import annotations
 
 from typing import Any, AsyncGenerator
+
+from openai import AsyncOpenAI
 
 from botflow.common.exceptions import ProviderError
 from botflow.common.logger import get_logger
@@ -38,6 +43,8 @@ _ALLOWED_CHAT_KWARGS = frozenset({
     "top_p",
 })
 
+_DEFAULT_BASE_URL = "https://api.deepseek.com"
+
 
 def _normalize_response(data: dict[str, Any]) -> dict[str, Any]:
     """Ensure response dict has the required structure."""
@@ -54,10 +61,11 @@ def _normalize_stream_chunk(data: dict[str, Any]) -> dict[str, Any] | None:
 
 
 class DeepSeekProvider(BaseProvider):
-    """Provider for DeepSeek API using the official deepseek SDK.
+    """Provider for DeepSeek models via an OpenAI-compatible endpoint.
 
-    The SDK (``deepseek>=1.0.0``) wraps the OpenAI client with DeepSeek-specific
-    defaults and error types.
+    Uses ``AsyncOpenAI`` (the SDK DeepSeek officially recommends) with a
+    configurable ``base_url`` — either ``https://api.deepseek.com`` or any
+    OpenAI-compatible gateway serving DeepSeek models.
 
     Features:
     - Native ``reasoning_content`` for R1 / thinking mode
@@ -81,20 +89,14 @@ class DeepSeekProvider(BaseProvider):
                 "Set DEEPSEEK_API_KEY or pass api_key in provider config."
             )
 
-        try:
-            from deepseek import DeepSeekClient
-        except ImportError:
-            raise ImportError(
-                "deepseek package is required for DeepSeekProvider. "
-                "Install it with: pip install deepseek"
-            )
+        if not self.base_url:
+            self.base_url = _DEFAULT_BASE_URL
 
-        # Initialize the official SDK client
-        client_kwargs: dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            client_kwargs["base_url"] = base_url
-
-        self._client: Any = DeepSeekClient(**client_kwargs)
+        self._client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=self.base_url,
+            timeout=self.extra_config.get("timeout", 120.0),
+        )
 
     # ------------------------------------------------------------------
     # chat()
@@ -109,7 +111,7 @@ class DeepSeekProvider(BaseProvider):
         stream: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Send a non-streaming chat completion via the official SDK.
+        """Send a non-streaming chat completion.
 
         Returns a unified response dict with ``reasoning_content`` if present.
         """
@@ -123,20 +125,11 @@ class DeepSeekProvider(BaseProvider):
                 **kwargs,
             )
 
-            response = await self._client.async_chat_completion(**call_kwargs)
-
-            # Normalize: SDK may return Pydantic model or dict
-            if hasattr(response, "model_dump"):
-                data = response.model_dump()
-            elif isinstance(response, dict):
-                data = response
-            else:
-                data = response  # hope for the best
-
-            return self._normalize_chat_response(data, model)
+            response = await self._client.chat.completions.create(**call_kwargs)
+            return self._normalize_chat_response(response.model_dump(), model)
 
         except Exception as e:
-            raise ProviderError(f"DeepSeekSDK request failed: {e}") from e
+            raise ProviderError(f"DeepSeek request failed: {e}") from e
 
     # ------------------------------------------------------------------
     # chat_stream()
@@ -150,7 +143,7 @@ class DeepSeekProvider(BaseProvider):
         max_tokens: int | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[dict[str, Any], None]:
-        """Stream chat completion via the official SDK.
+        """Stream chat completion.
 
         Yields unified chunk dicts with ``reasoning_content`` when present.
         """
@@ -164,33 +157,30 @@ class DeepSeekProvider(BaseProvider):
                 **kwargs,
             )
 
-            stream_gen = self._client.async_stream_response(**call_kwargs)
+            stream = await self._client.chat.completions.create(**call_kwargs)
 
-            async for chunk in stream_gen:
-                # Normalize: SDK may yield Pydantic model or dict
-                if hasattr(chunk, "model_dump"):
-                    data = chunk.model_dump()
-                elif isinstance(chunk, dict):
-                    data = chunk
-                else:
-                    continue
-
-                normalized = _normalize_stream_chunk(data)
+            async for chunk in stream:
+                normalized = _normalize_stream_chunk(chunk.model_dump())
                 if normalized is None:
                     continue
 
                 yield self._normalize_stream_response(normalized, model)
 
         except Exception as e:
-            raise ProviderError(f"DeepSeekSDK stream failed: {e}") from e
+            raise ProviderError(f"DeepSeek stream failed: {e}") from e
 
     # ------------------------------------------------------------------
     # list_models() / health_check()
     # ------------------------------------------------------------------
 
     async def list_models(self) -> list[dict[str, Any]]:
-        """List models — DeepSeek SDK does not support this, return empty."""
-        return []
+        """List available models from the configured endpoint."""
+        try:
+            response = await self._client.models.list()
+            return [{"id": m.id, "object": "model"} for m in response.data]
+        except Exception as e:
+            logger.warning("Failed to list models from {}: {}", self.base_url, e)
+            return []
 
     async def health_check(self) -> dict[str, Any]:
         """Health check — probe list_models as lightweight liveness test."""

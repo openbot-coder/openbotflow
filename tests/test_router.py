@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
-from botflow.common.exceptions import NoAvailableModelError, AllModelsCooldownError, ProviderError
+from botflow.common.exceptions import (
+    AllModelsCooldownError,
+    NoAvailableModelError,
+    ProviderError,
+)
 from botflow.router import (
     CooldownManager,
     GroupRouter,
+    weighted_random_order,
     weighted_random_select,
     is_retryable_error,
     exponential_backoff,
@@ -79,6 +84,37 @@ class TestWeightedRandomSelect:
             counts[selected.model_id] += 1
         assert counts[1] > counts[2]
         assert 800 <= counts[1] <= 1000  # ~90%
+
+
+class TestWeightedRandomOrder:
+    def test_order_is_permutation(self):
+        models = [_make_model_detail(1, 1.0), _make_model_detail(2, 2.0), _make_model_detail(3, 3.0)]
+        for _ in range(20):
+            ordered = weighted_random_order(models)
+            assert len(ordered) == 3
+            assert {m.model_id for m in ordered} == {1, 2, 3}  # each model exactly once
+
+    def test_zero_weight_excluded(self):
+        models = [_make_model_detail(1, 0.0), _make_model_detail(2, 1.0)]
+        for _ in range(20):
+            ordered = weighted_random_order(models)
+            assert [m.model_id for m in ordered] == [2]
+
+    def test_all_zero_weights_raises(self):
+        models = [_make_model_detail(1, 0.0), _make_model_detail(2, 0.0)]
+        with pytest.raises(NoAvailableModelError):
+            weighted_random_order(models)
+
+    def test_empty_list_raises(self):
+        with pytest.raises(NoAvailableModelError):
+            weighted_random_order([])
+
+    def test_first_element_weighted(self):
+        """First element follows weighted distribution (heavier model first more often)."""
+        models = [_make_model_detail(1, 90.0), _make_model_detail(2, 10.0)]
+        first_ids = [weighted_random_order(models)[0].model_id for _ in range(1000)]
+        assert first_ids.count(1) > first_ids.count(2)
+        assert 800 <= first_ids.count(1) <= 1000
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +222,13 @@ class TestExponentialBackoff:
 # ---------------------------------------------------------------------------
 
 class TestGroupRouter:
+    @pytest.fixture(autouse=True)
+    def _clear_caches(self):
+        # 全局 endpoint/provider 缓存会让测试顺序相关，每个测试前清空
+        from botflow.router import _endpoint_cache, _provider_cache
+        _endpoint_cache.clear()
+        _provider_cache.clear()
+
     @pytest.fixture
     def mock_db(self):
         return AsyncMock()
@@ -211,7 +254,6 @@ class TestGroupRouter:
 
     @pytest.mark.asyncio
     async def test_disabled_provider_skipped(self, router, mock_db):
-        from botflow.storage.models import Provider
         mock_db.get_group_models.return_value = [
             _make_model_detail(1, 1.0)
         ]
@@ -219,3 +261,64 @@ class TestGroupRouter:
         mock_db.get_provider.return_value = disabled_provider
         with pytest.raises(NoAvailableModelError):
             await router.route(messages=[{"role": "user", "content": "hi"}])
+
+    # -- streaming routing -------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_route_stream_returns_all_available_in_weighted_order(self, router, mock_db):
+        mock_db.get_group_models.return_value = [
+            _make_model_detail(1, 1.0),
+            _make_model_detail(2, 2.0),
+        ]
+        mock_db.get_provider.return_value = Provider(id=1, name="p", provider_type="openai")
+
+        msgs = [{"role": "user", "content": "hi"}]
+        result = await router.route(messages=msgs, temperature=0.5, max_tokens=100, stream=True, tools=[{"type": "function"}])
+
+        assert result["group_id"] == 1
+        assert {ep.model_id for ep in result["endpoints"]} == {1, 2}  # 所有可用模型都作为候选
+        assert result["temperature"] == 0.5
+        assert result["max_tokens"] == 100
+        assert result["kwargs"] == {"tools": [{"type": "function"}]}
+        assert result["messages"] == msgs
+
+    @pytest.mark.asyncio
+    async def test_route_stream_excludes_cooldown_models(self, mock_db):
+        cm = CooldownManager()
+        cm.record_failure(1, 2, 1, 60)  # model 2 冷却中
+        router = GroupRouter(group_id=1, db=mock_db, cooldown_manager=cm)
+        mock_db.get_group_models.return_value = [
+            _make_model_detail(1, 1.0),
+            _make_model_detail(2, 2.0),
+        ]
+        mock_db.get_provider.return_value = Provider(id=1, name="p", provider_type="openai")
+
+        result = await router.route(messages=[{"role": "user", "content": "hi"}], stream=True)
+
+        assert [ep.model_id for ep in result["endpoints"]] == [1]
+
+    @pytest.mark.asyncio
+    async def test_route_stream_all_on_cooldown_raises(self, mock_db):
+        cm = CooldownManager()
+        cm.record_failure(1, 1, 1, 60)
+        router = GroupRouter(group_id=1, db=mock_db, cooldown_manager=cm)
+        mock_db.get_group_models.return_value = [_make_model_detail(1, 1.0)]
+        mock_db.get_provider.return_value = Provider(id=1, name="p", provider_type="openai")
+
+        with pytest.raises(AllModelsCooldownError):
+            await router.route(messages=[{"role": "user", "content": "hi"}], stream=True)
+
+    @pytest.mark.asyncio
+    async def test_route_stream_falls_back_to_group_when_all_on_cooldown(self, mock_db):
+        cm = CooldownManager()
+        cm.record_failure(1, 1, 1, 60)
+        router = GroupRouter(group_id=1, db=mock_db, cooldown_manager=cm, fallback_group_id=4)
+        mock_db.get_group_models.side_effect = (
+            lambda gid, enabled_only=True: [_make_model_detail(1, 1.0)] if gid == 1 else [_make_model_detail(2, 1.0)]
+        )
+        mock_db.get_provider.return_value = Provider(id=1, name="p", provider_type="openai")
+
+        result = await router.route(messages=[{"role": "user", "content": "hi"}], stream=True)
+
+        assert result["group_id"] == 4  # 结果是 fallback 组的
+        assert [ep.model_id for ep in result["endpoints"]] == [2]
