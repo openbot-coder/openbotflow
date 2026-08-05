@@ -187,6 +187,18 @@ class Database:
         )
         await conn.commit()
 
+    # W14: public method for cleaning up config entries by key prefix
+    async def cleanup_config_by_prefix(self, prefix: str, older_than_seconds: int) -> int:
+        """Delete config entries matching a key prefix older than N seconds. Returns count deleted."""
+        conn = await self._ensure_connection()
+        cutoff = time.time() - older_than_seconds
+        cursor = await conn.execute(
+            "DELETE FROM config WHERE key LIKE ? AND updated_at < datetime(?, 'unixepoch')",
+            (prefix, cutoff),
+        )
+        await conn.commit()
+        return cursor.rowcount
+
     async def save_cooldown_state(self, states: list[dict]) -> None:
         """Save cooldown states to config table."""
         import json

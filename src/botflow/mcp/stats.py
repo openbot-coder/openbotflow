@@ -1,142 +1,129 @@
-"""MCP statistics query tools."""
+"""MCP Tools for Stats querying.
+
+Tools registered via ToolRegistry (not directly on FastMCP).
+Uses the flat Database API.
+"""
 
 from __future__ import annotations
 
-from mcp.server.fastmcp import FastMCP
+import json
+from typing import TYPE_CHECKING
 
-from botflow.common.logger import get_logger
 from botflow.storage.db import Database
 
-log = get_logger("mcp.stats")
+if TYPE_CHECKING:
+    from botflow.mcp.registry import ToolRegistry
 
 
-def register_stats_tools(mcp: FastMCP, db: Database) -> None:
-    """Register all statistics tools with the provided MCP server."""
+def register_stats_tools(registry: ToolRegistry, db: Database) -> None:
+    """Register all stats tools into the internal ToolRegistry."""
 
-    @mcp.tool()
-    async def query_model_stats(model_id: int) -> dict:
-        """Get aggregated statistics for a specific model.
+    # W11: pre-build name→id lookups via helper
+    async def _find_model_id(model_name: str) -> int | None:
+        models = await db.list_models()
+        return next((m.id for m in models if m.name == model_name), None)
 
-        Args:
-            model_id: ID of the model.
-        """
-        stats = await db.get_model_stats(model_id)
+    async def _find_group_id(group_name: str) -> int | None:
+        groups = await db.list_groups()
+        return next((g.id for g in groups if g.name == group_name), None)
+
+    # W12: consistent JSON serializer
+    def _json(obj: object) -> str:
+        return json.dumps(obj, ensure_ascii=False, default=str, indent=2)
+
+    async def query_model_stats(model_name: str) -> str:
+        """Query stats for a model by name."""
+        mid = await _find_model_id(model_name)
+        if mid is None:
+            return _json({"error": f"Model '{model_name}' not found"})
+        stats = await db.get_model_stats(mid)
         if stats is None:
-            return {"error": f"No stats found for model id={model_id}."}
+            return _json({"model_name": model_name, "total_calls": 0})
+        return _json(stats.model_dump())
 
-        return {
-            "model_id": stats.model_id,
-            "model_name": stats.model_name,
-            "total_calls": stats.total_calls,
-            "success": stats.success_calls,
-            "errors": stats.error_calls,
-            "avg_duration_ms": stats.avg_duration_ms,
-            "min_duration_ms": stats.min_duration_ms,
-            "max_duration_ms": stats.max_duration_ms,
-            "prompt_tokens": stats.total_prompt_tokens,
-            "completion_tokens": stats.total_completion_tokens,
-            "cache_tokens": stats.total_cache_tokens,
-            "total_tokens": stats.total_tokens,
-            "total_cost": round(stats.total_cost, 4),
-        }
+    registry.register(
+        name="query_model_stats",
+        description="查询模型调用统计：总调用次数、成功/失败次数、Token 用量、平均耗时等",
+        parameters={
+            "type": "object",
+            "properties": {
+                "model_name": {"type": "string", "description": "模型名称"},
+            },
+            "required": ["model_name"],
+        },
+        handler=query_model_stats,
+    )
 
-    @mcp.tool()
-    async def query_group_stats(group_id: int) -> dict:
-        """Get aggregated statistics for a specific group.
-
-        Args:
-            group_id: ID of the group.
-        """
-        stats = await db.get_group_stats(group_id)
+    async def query_group_stats(group_name: str) -> str:
+        """Query stats for a group by name."""
+        gid = await _find_group_id(group_name)
+        if gid is None:
+            return _json({"error": f"Group '{group_name}' not found"})
+        stats = await db.get_group_stats(gid)
         if stats is None:
-            return {"error": f"No stats found for group id={group_id}."}
+            return _json({"group_name": group_name, "total_calls": 0})
+        return _json(stats.model_dump())
 
-        return {
-            "group_id": stats.group_id,
-            "group_name": stats.group_name,
-            "total_calls": stats.total_calls,
-            "success": stats.success_calls,
-            "errors": stats.error_calls,
-            "avg_duration_ms": stats.avg_duration_ms,
-            "total_cost": round(stats.total_cost, 4),
+    registry.register(
+        name="query_group_stats",
+        description="查询分组调用统计：总调用次数、成功/失败次数、总 Token、估算费用",
+        parameters={
+            "type": "object",
+            "properties": {
+                "group_name": {"type": "string", "description": "分组名称"},
+            },
+            "required": ["group_name"],
+        },
+        handler=query_group_stats,
+    )
+
+    async def query_call_logs(
+        status: str | None = None, limit: int = 100, offset: int = 0,
+    ) -> str:
+        """Query call log records with optional status filter and pagination."""
+        # W10: bounds check
+        limit = max(1, min(limit, 1000))
+        offset = max(0, offset)
+        items = await db.query_call_logs(status=status, limit=limit, offset=offset)
+        # W9: total should reflect actual count, not page count
+        all_items = await db.query_call_logs(status=status, limit=10000, offset=0)
+        result = {
+            "total": len(all_items),
+            "offset": offset,
+            "count": len(items),
+            "items": [m.model_dump() for m in items],
         }
+        return _json(result)
 
-    @mcp.tool()
-    async def query_messages(
-        group_id: int | None = None,
-        model_id: int | None = None,
-        status: str | None = None,
-        limit: int = 20,
-        offset: int = 0,
-    ) -> dict:
-        """Query recent call logs with optional filters.
+    registry.register(
+        name="query_call_logs",
+        description="查询消息调用记录，支持按状态筛选和分页",
+        parameters={
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "description": "状态筛选（可选，如 success/error）"},
+                "limit": {"type": "integer", "description": "返回数量上限，默认 100（最大 1000）"},
+                "offset": {"type": "integer", "description": "偏移量，默认 0"},
+            },
+        },
+        handler=query_call_logs,
+    )
 
-        Args:
-            group_id: Filter by group ID (optional).
-            model_id: Filter by model ID (optional).
-            status: Filter by status (success/error).
-            limit: Maximum number of results (default 20, max 100).
-            offset: Number of results to skip.
-        """
-        limit = min(limit, 100)
-        logs = await db.query_call_logs(
-            group_id=group_id,
-            model_id=model_id,
-            status=status,
-            limit=limit,
-            offset=offset,
-        )
-        if not logs:
-            return {"messages": [], "total": 0}
+    async def query_cost_summary(days: int = 30) -> str:
+        """Query daily cost summary for the last N days."""
+        # W10: bounds check
+        days = max(1, min(days, 365))
+        items = await db.get_cost_summary(days=days)
+        return _json({"items": items})
 
-        items = []
-        for l in logs:
-            items.append({
-                "id": l.id,
-                "status": l.status,
-                "duration_ms": l.duration_ms,
-                "prompt_tokens": l.prompt_tokens,
-                "completion_tokens": l.completion_tokens,
-                "cache_tokens": l.cache_tokens,
-                "total_tokens": l.total_tokens,
-                "cost": round(l.cost, 4) if l.cost is not None else None,
-                "created_at": l.created_at.isoformat() if hasattr(l.created_at, 'isoformat') else str(l.created_at),
-            })
-
-        return {
-            "messages": items,
-            "total": len(items),
-        }
-
-    @mcp.tool()
-    async def query_cost_summary(days: int = 30) -> dict:
-        """Get daily cost summary for the last N days.
-
-        Args:
-            days: Number of days to look back (default 30).
-        """
-        summary = await db.get_cost_summary(days=days)
-        if not summary:
-            return {"error": f"No cost data found for the last {days} days."}
-
-        total_cost = sum(s["total_cost"] for s in summary)
-        total_calls = sum(s["total_calls"] for s in summary)
-        total_tokens = sum(s["total_tokens"] for s in summary)
-
-        daily = []
-        for s in summary:
-            daily.append({
-                "day": s["day"],
-                "calls": s["total_calls"],
-                "cost": round(s["total_cost"], 4),
-                "tokens": s["total_tokens"],
-            })
-
-        return {
-            "total_calls": total_calls,
-            "total_cost": round(total_cost, 4),
-            "total_tokens": total_tokens,
-            "daily": daily,
-        }
-
-    log.info("MCP stats tools registered.")
+    registry.register(
+        name="query_cost_summary",
+        description="查询近 N 天的每日费用汇总：调用次数、Token 用量、费用",
+        parameters={
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "查询天数，默认 30（最大 365）"},
+            },
+        },
+        handler=query_cost_summary,
+    )

@@ -57,19 +57,18 @@ botflow 通过统一的 **Workspace** 概念管理全部运行时数据，确保
 │                                #   - providers / models / model_groups
 │                                #   - call_logs
 │                                #   - im_sessions（Phase 3）
-│   ├── logs/                       # 日志文件（按模块 + 日期轮转）
-│   │   ├── proxy-2026-07-03.log
-│   │   ├── wiki-2026-07-03.log
-│   │   ├── im-2026-07-03.log
-│   │   └── agent.log                # Memory Agent 运行日志（持续追加）
-│   ├── MemWiki/                    # MemWiki OKF 知识包（运行时）
-│   │   ├── index.md                #   目录索引（自动生成）
-│   │   ├── log.md                   #   变更日志（自动生成）
-│   │   ├── sources/                #   learn 摄取的原始材料摘要
-│   │   ├── concepts/               #   精炼知识概念
-│   │   ├── entities/               #   人物/组织/项目
-│   │   └── syntheses/              #   research 保存的分析结果
-│   └── workspace/                  # 用户自定义工作区（可扩展挂载点）
+├── logs/                        # 日志文件（按模块 + 日期轮转）
+│   ├── proxy-2026-07-03.log
+│   ├── im-2026-07-03.log
+│   └── agent.log                # Memory Agent 运行日志（持续追加）
+├── MemWiki/                     # MemWiki OKF 知识包（运行时）
+│   ├── index.md                #   目录索引（自动生成）
+│   ├── log.md                   #   变更日志（自动生成）
+│   ├── sources/                #   learn 摄取的原始材料摘要
+│   ├── concepts/               #   精炼知识概念
+│   ├── entities/               #   人物/组织/项目
+│   └── syntheses/              #   research 保存的分析结果
+├── workspace/                   # 用户自定义工作区（可扩展挂载点）
 ```
 
 ### .env 文件加载
@@ -196,28 +195,43 @@ botflow run --workspace ~/my-botflow --host 0.0.0.0 --port 8080
                      └──────────────────────────────────┘
 ```
 
-### MCP 统计查询接口
+### MCP 元工具架构
+
+外部 MCP 客户端只看到 **3 个元工具**，所有内部操作通过 `tool_call` 统一调用：
 
 ```
 ┌──────────────┐    MCP Protocol    ┌───────────────────┐
-│  MCP Client   │◄──────────────────►│  MCP Stats Server │
+│  MCP Client   │◄──────────────────►│  MCP Server       │
 │  (Cursor/etc) │                    │  (FastMCP)        │
-└──────────────┘                    │  Tools:            │
-                                     │  - query_model_stats(model, start, end)
-                                     │    → token_usage, call_count, cost
-                                     │  - query_group_stats(group, start, end)
-                                     │    → group aggregated stats
-                                     │  - query_messages(start, end, filters)
-                                     │    → message detail list
-                                     │  - query_cost_summary(start, end)
-                                     │    → cost breakdown by model/group
-                                     └───────────────────┘
+└──────────────┘                    │  对外 3 个工具:    │
+                                    │  - tool_search     │  ← BM25 关键词搜索
+                                    │  - tool_describe   │  ← 查看工具参数定义
+                                    │  - tool_call       │  ← 调用任意内部工具
+                                    └────────┬──────────┘
+                                             │
+                                    ┌────────▼──────────┐
+                                    │  ToolRegistry      │
+                                    │  (BM25 索引)       │
+                                    │                    │
+                                    │  内部工具:          │
+                                    │  - Provider CRUD   │
+                                    │  - Model CRUD      │
+                                    │  - Group CRUD      │
+                                    │  - Stats 查询      │
+                                    └───────────────────┘
 ```
 
 **技术实现**:
-- 使用 `FastMCP.sse_app()` 生成 Starlette 应用，挂载到 `/mcp` 路径
-- SSE 传输协议，支持长连接和实时事件推送
-- 工具在应用启动时通过 `register_manager_tools()` 和 `register_stats_tools()` 注册
+- `ToolRegistry` + `SimpleBM25` 实现零依赖的 BM25 搜索（`registry.py`）
+- 工具在应用启动时通过 `register_manager_tools(registry, db)` 和 `register_stats_tools(registry, db)` 注册到内部注册表
+- 外部 MCP 客户端只看到 `tool_search` / `tool_describe` / `tool_call` 三个元工具
+
+**调用流程**:
+```
+1. tool_search("provider")           → 找到 create_provider 等工具
+2. tool_describe("create_provider")  → 查看参数定义
+3. tool_call("create_provider", {name: "my-openai", ...})  → 执行
+```
 
 ### 模块划分
 
@@ -233,8 +247,9 @@ botflow run --workspace ~/my-botflow --host 0.0.0.0 --port 8080
 | 数据库存储 | `src/botflow/storage/db.py` | SQLite 统一数据库操作 |
 | 存储模型 | `src/botflow/storage/models.py` | Pydantic 数据模型定义 |
 | 存储清理 | `src/botflow/storage/cleanup.py` | 半年数据自动清理 |
-| MCP 管理服务 | `src/botflow/mcp/manager.py` | MCP Provider/Group/Model CRUD 管理 |
-| MCP 统计服务 | `src/botflow/mcp/stats.py` | MCP 统计查询服务 |
+| MCP 管理服务 | `src/botflow/mcp/manager.py` | Provider/Group/Model CRUD 管理（注册到 ToolRegistry） |
+| MCP 统计服务 | `src/botflow/mcp/stats.py` | 统计查询服务（注册到 ToolRegistry） |
+| MCP 工具注册表 | `src/botflow/mcp/registry.py` | ToolRegistry + SimpleBM25（元工具核心） |
 | 前端协议适配 | `src/botflow/protocol_adapter.py` | OpenAI/Anthropic 请求→统一内部格式 |
 
 ### 前端协议适配
@@ -409,8 +424,8 @@ def weighted_random_select(models: list[Model]) -> Model:
 -- ==================== 供应商管理 ====================
 CREATE TABLE providers (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    name            TEXT UNIQUE NOT NULL,  -- 供应商名称: openai / anthropic / google
-    provider_type   TEXT NOT NULL,         -- 类型: openai_compat / anthropic / google
+    name            TEXT UNIQUE NOT NULL,  -- 供应商名称: openai / anthropic / moonshot / dashscope / openai_compat
+    provider_type   TEXT NOT NULL,         -- 类型: openai_compat / anthropic / openai / moonshot / dashscope
     api_key         TEXT NOT NULL,         -- API Key（从 .env 引用或明文）
     base_url        TEXT,                  -- 自定义端点（可选）
     extra_config    TEXT,                  -- 扩展配置（JSON）
@@ -425,6 +440,7 @@ CREATE TABLE models (
     name            TEXT NOT NULL,         -- 模型名称: gpt-4o / claude-3-opus
     provider_id     INTEGER NOT NULL,      -- 所属供应商
     display_name    TEXT,                  -- 显示名称
+    context_window  INTEGER DEFAULT 0,    -- 上下文窗口大小（tokens）
     max_retries           INTEGER DEFAULT 3,     -- 最大重试次数
     cooldown_seconds       INTEGER DEFAULT 60,  -- 冷却时间（秒）
     cooldown_failure_threshold INTEGER DEFAULT 3, -- 触发冷却的连续失败次数
@@ -464,18 +480,15 @@ CREATE TABLE call_logs (
     group_id        INTEGER,              -- 使用的模型分组
     model_id        INTEGER,              -- 实际调用的模型
     provider_id     INTEGER,              -- 供应商
-    group_name      TEXT,                  -- 冗余: 分组名称（便于查询）
-    selected_model  TEXT,                  -- 冗余: 模型名称
-    provider_name   TEXT,                  -- 冗余: 供应商名称
     request_body    TEXT,                  -- 原始请求（raw JSON）
     response_body   TEXT,                  -- 原始响应（raw JSON）
     status          TEXT,                  -- success / failed / fallback
     duration_ms     INTEGER,               -- 调用耗时（毫秒）
     prompt_tokens   INTEGER,               -- 输入 tokens
     completion_tokens INTEGER,             -- 输出 tokens
-    cache_tokens    INTEGER DEFAULT 0,     -- 缓存命中 tokens（参考LLM返回的 prompt_tokens_details.cached_tokens / cache_read_input_tokens）
+    cache_tokens    INTEGER DEFAULT 0,     -- 缓存命中 tokens
     total_tokens    INTEGER,               -- 总 tokens
-    tool_calls      TEXT,                  -- Tool call 记录（JSON 数组，记录调用的 tool name、arguments、results）
+    tool_calls      TEXT,                  -- Tool call 记录（JSON 数组）
     cost            REAL,                  -- 估算费用（美元）
     error_message   TEXT,                  -- 错误信息（如有）
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -555,16 +568,24 @@ CREATE INDEX idx_call_logs_provider ON call_logs(provider_id, created_at);
 | 中危 | 缺少速率限制 | ✅ 已修复 |
 | 低危 | API 密钥明文存储 | 📋 计划中 |
 
-### MCP 统计查询工具
+### MCP 元工具接口
 
-| 工具 | 参数 | 返回 |
-|------|------|------|
-| `query_model_stats` | `model_name`, `start_time`, `end_time`, `group_name?` | `{total_calls, success_calls, failed_calls, prompt_tokens, completion_tokens, total_tokens, avg_duration_ms}` |
-| `query_group_stats` | `group_name`, `start_time`, `end_time` | `{total_calls, model_stats[...], total_tokens, avg_cost}` |
-| `query_messages` | `start_time`, `end_time`, `group_name?`, `model_name?`, `status?`, `page?`, `page_size?` | `{total, page, page_size, items: [{id, group, model, status, tokens, duration, created_at, request_preview, response_preview}]}` |
-| `query_cost_summary` | `start_time`, `end_time`, `group_by?` (model/group/day) | `{items: [{name, total_calls, total_tokens, estimated_cost}]}` |
+外部 MCP 客户端只暴露 3 个元工具：
 
-### MCP 管理工具（Provider + 分组管理）
+| 元工具 | 参数 | 返回 | 说明 |
+|--------|------|------|------|
+| `tool_search` | `query: str` | `{results: [{name, description, score}]}` | BM25 搜索可用工具 |
+| `tool_describe` | `tool_name: str` | `{name, description, parameters}` | 查看工具参数定义 |
+| `tool_call` | `tool_name: str, arguments?: dict` | 工具返回值或 `{error}` | 调用任意内部工具 |
+
+**调用流程**:
+```
+tool_search("provider")           → [{name: "create_provider", ...}, ...]
+tool_describe("create_provider")  → {name, description, parameters: {...}}
+tool_call("create_provider", {name: "my-openai", ...})  → {"id": 1, ...}
+```
+
+### 内部工具列表（通过 tool_call 调用）
 
 **Provider 管理**:
 
@@ -583,7 +604,7 @@ CREATE INDEX idx_call_logs_provider ON call_logs(provider_id, created_at);
 | `create_model` | `name`, `provider_id`, `display_name?`, `max_retries?`, `cooldown_seconds?`, `cooldown_failure_threshold?` | `{id, name, provider_id}` | 新增模型 |
 | `update_model` | `id`, `name?`, `max_retries?`, `cooldown_seconds?`, `cooldown_failure_threshold?`, `is_enabled?` | `{id, updated}` | 更新模型配置 |
 | `delete_model` | `id` | `{deleted}` | 删除模型 |
-| `list_models` | `group_name?` | `{models: [{id, name, provider, group, weight, status(active/cooldown)}]}` | 列出所有可用模型 |
+| `list_models` | - | `{models: [{id, name, provider, is_enabled}]}` | 列出所有可用模型 |
 
 **分组管理**:
 
@@ -599,20 +620,30 @@ CREATE INDEX idx_call_logs_provider ON call_logs(provider_id, created_at);
 
 | 工具 | 参数 | 返回 | 说明 |
 |------|------|------|------|
-| `add_model_to_group` | `group_id`, `model_id`, `weight` | `{id, group_id, model_id, weight}` | 添加模型到分组 |
+| `add_model_to_group` | `group_id`, `model_id`, `weight` | `{id, group_id, model_id, group_name, model_name, weight}` | 添加模型到分组 |
 | `remove_model_from_group` | `group_id`, `model_id` | `{deleted}` | 从分组移除模型 |
 | `update_model_weight` | `group_id`, `model_id`, `weight` | `{updated}` | 修改模型在分组中的权重 |
 
-#### 管理工具使用流程示例
+**统计查询**:
+
+| 工具 | 参数 | 返回 | 说明 |
+|------|------|------|------|
+| `query_model_stats` | `model_name` | `{total_calls, success, failed, tokens, avg_duration_ms}` | 模型调用统计 |
+| `query_group_stats` | `group_name` | `{total_calls, ...}` | 分组调用统计 |
+| `query_call_logs` | `status?`, `limit?`, `offset?` | `{total, offset, items: [...]}` | 调用记录列表 |
+| `query_cost_summary` | `days?` (默认 30) | `{items: [...]}` | 费用汇总 |
+
+#### 使用流程示例
 
 ```
-1. 创建 Provider:  create_provider(name="my-openai", provider_type="openai_compat", api_key="${MY_KEY}")
-2. 创建 Model:     create_model(name="gpt-4o", provider_id=1, max_retries=3)
-3. 创建 Group:     create_group(name="fast-group", description="快速响应组")
-4. 添加模型:       add_model_to_group(group_id=1, model_id=1, weight=5)
-5. 查询分组:       get_group(id=1)  →  查看分组下所有模型及权重
-6. 调整权重:       update_model_weight(group_id=1, model_id=1, weight=3)
-7. 上线使用:       客户端直接 POST /v1/chat/completions 指定 model=fast-group
+1. 搜索工具:      tool_search("provider")
+2. 查看参数:      tool_describe("create_provider")
+3. 创建 Provider: tool_call("create_provider", {name: "my-openai", provider_type: "openai_compat", api_key: "${MY_KEY}"})
+4. 创建 Model:    tool_call("create_model", {name: "gpt-4o", provider_id: 1})
+5. 创建 Group:    tool_call("create_group", {name: "fast-group", description: "快速响应组"})
+6. 添加模型:      tool_call("add_model_to_group", {group_id: 1, model_id: 1, weight: 5})
+7. 查看分组:      tool_call("get_group", {id: 1})
+8. 上线使用:      客户端直接 POST /v1/chat/completions 指定 model=fast-group
 ```
 
 ---
@@ -667,14 +698,16 @@ d:\src\botflow\
 │   │   └── google_provider.py
 │   ├── mcp\                        # MCP 服务
 │   │   ├── __init__.py
-│   │   ├── manager.py              # Provider/Group/Model CRUD 管理
+│   │   ├── registry.py               # ToolRegistry + SimpleBM25（元工具核心）
+│   │   ├── server.py                 # FastMCP 工厂（3 个元工具）
+│   │   ├── manager.py               # Provider/Group/Model CRUD 管理
 │   │   └── stats.py                # 统计查询
 │   ├── storage\                    # 数据库
 │       ├── __init__.py
 │       ├── db.py                   # SQLite 统一数据库操作
 │       ├── models.py               # Pydantic 数据模型
 │       └── cleanup.py              # 半年数据自动清理
-│   └── wiki\                       # MemWiki 模块
+│   └── wiki\                       # [Phase 2] MemWiki 模块（待实现）
 │       ├── __init__.py
 │       ├── agent.py                # Memory Agent 核心（LangChain create_react_agent）
 │       ├── types.py                # BotflowLLM（BaseChatModel 子类）
