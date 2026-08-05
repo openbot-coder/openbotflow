@@ -25,6 +25,8 @@ ENV/
 .coverage.*
 htmlcov/
 .pytest_cache/
+.codebuddy
+.codegraph
 
 # Database (runtime data, not source)
 data/
