@@ -30,6 +30,7 @@ from botflow.auth import verify_llm_key
 from botflow.common.exceptions import ProviderError
 from botflow.common.logger import get_logger, setup_logging
 from botflow.config import BotflowSettings
+from botflow.mcp.registry import ToolRegistry
 from botflow.mcp.server import create_mcp_server
 from botflow.protocol_adapter import (
     anthropic_to_internal,
@@ -183,12 +184,14 @@ async def lifespan(app: FastAPI):
     await _log_writer.start()
     log.info("Call log writer started (buffer=100, flush=5s)")
 
-    # Register MCP tools
+    # Register MCP internal tools into ToolRegistry
     from botflow.mcp.manager import register_manager_tools
     from botflow.mcp.stats import register_stats_tools
-    register_manager_tools(mcp_server, _get_db())
-    register_stats_tools(mcp_server, _get_db())
-    log.info(f"MCP tools registered: {list(mcp_server._tool_manager._tools.keys())}")
+    register_manager_tools(_registry, _get_db())
+    register_stats_tools(_registry, _get_db())
+    # W13: use public names() instead of private _tools.keys()
+    registered_names = _registry.names()
+    log.info(f"MCP internal tools registered ({len(registered_names)}): {registered_names}")
 
     # Warn if MCP key is not configured
     mcp_key = await _get_db().get_config("mcp_key") if _db else None
@@ -261,16 +264,10 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(10 * 60)  # 10 minutes
             try:
                 db = _get_db()
-                conn = await db._ensure_connection()
-                # Delete dedup entries older than 10 minutes
-                import sqlite3
-                cutoff = time.time() - 600
-                await conn.execute(
-                    "DELETE FROM config WHERE key LIKE 'dedup:%' AND updated_at < datetime(?, 'unixepoch')",
-                    (cutoff,),
-                )
-                await conn.commit()
-                log.debug("Cleaned up old deduplication entries")
+                # W14: use public API instead of private _ensure_connection
+                deleted = await db.cleanup_config_by_prefix("dedup:%", older_than_seconds=600)
+                if deleted:
+                    log.debug("Cleaned up {} old deduplication entries", deleted)
             except Exception as e:
                 log.debug("Dedup cleanup failed: {}", e)
 
@@ -336,7 +333,8 @@ app.add_middleware(
 # MCP Server (SSE transport)
 # ---------------------------------------------------------------------------
 
-mcp_server = create_mcp_server()
+_registry = ToolRegistry()
+mcp_server = create_mcp_server(_registry)
 app.mount("/mcp", mcp_server.streamable_http_app())
 
 
