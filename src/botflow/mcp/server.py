@@ -68,26 +68,65 @@ def create_mcp_server(registry: ToolRegistry) -> FastMCP:
     # ── tool_describe ──
 
     @mcp.tool()
-    async def tool_describe(tool_name: str) -> str:
-        """View detailed description and parameter schema of a tool.
+    async def tool_describe(tool_name: str | list[str]) -> str:
+        """View detailed description and parameter schema of one or more tools.
 
-        Use tool_search first to find the tool name, then use this
-        to understand its parameters before calling it.
+        Pass a single tool name, a comma-separated string, or a JSON array
+        (e.g. "create_provider,list_providers" or ["create_provider", "list_providers"])
+        to fetch multiple tool descriptions in a single call — no need to
+        call this tool repeatedly.
+
+        When a single tool is requested, the response contains the tool fields
+        directly; when multiple tools are requested, the response is
+        {"tools": [...], "errors": [...]}.
 
         Args:
-            tool_name: The tool name (from tool_search results)
+            tool_name: Tool name, comma-separated names, or a list of names
+                (from tool_search results)
         """
-        td = registry.get(tool_name)
-        if td is None:
+        if isinstance(tool_name, str):
+            names = [n.strip() for n in tool_name.split(",") if n.strip()]
+        else:
+            names = [n.strip() for n in tool_name if n and n.strip()]
+
+        if not names:
             return json.dumps({
-                "error": f"Unknown tool '{tool_name}'",
-                "hint": "Use tool_search to find available tools.",
+                "error": "tool_name must not be empty",
+                "hint": "Pass one or more tool names, e.g. 'create_provider' or 'create_provider,list_providers'.",
             }, ensure_ascii=False)
-        return json.dumps({
-            "name": td.name,
-            "description": td.description,
-            "parameters": td.parameters,
-        }, ensure_ascii=False)
+
+        # Single name → keep legacy response shape for backward compatibility
+        if len(names) == 1:
+            name = names[0]
+            td = registry.get(name)
+            if td is None:
+                return json.dumps({
+                    "error": f"Unknown tool '{name}'",
+                    "hint": "Use tool_search to find available tools.",
+                }, ensure_ascii=False)
+            return json.dumps({
+                "name": td.name,
+                "description": td.description,
+                "parameters": td.parameters,
+            }, ensure_ascii=False)
+
+        tools: list[dict[str, Any]] = []
+        errors: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            if name in seen:
+                continue
+            seen.add(name)
+            td = registry.get(name)
+            if td is None:
+                errors.append(f"Unknown tool '{name}'")
+            else:
+                tools.append({
+                    "name": td.name,
+                    "description": td.description,
+                    "parameters": td.parameters,
+                })
+        return json.dumps({"tools": tools, "errors": errors}, ensure_ascii=False)
 
     # ── tool_call ──
 

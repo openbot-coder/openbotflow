@@ -231,6 +231,53 @@ class TestToolDescribe:
         data = json.loads(_text(result))
         assert "error" in data
 
+    @pytest.mark.asyncio
+    async def test_describe_multiple_tools_as_list(self, mcp, registry, db):
+        register_manager_tools(registry, db)
+        result = await mcp.call_tool(
+            "tool_describe", {"tool_name": ["create_provider", "list_providers"]}
+        )
+        data = json.loads(_text(result))
+        assert [t["name"] for t in data["tools"]] == ["create_provider", "list_providers"]
+        assert all("description" in t and "parameters" in t for t in data["tools"])
+        assert data["errors"] == []
+
+    @pytest.mark.asyncio
+    async def test_describe_multiple_tools_comma_separated(self, mcp, registry, db):
+        register_manager_tools(registry, db)
+        result = await mcp.call_tool(
+            "tool_describe", {"tool_name": "create_provider,list_providers"}
+        )
+        data = json.loads(_text(result))
+        assert [t["name"] for t in data["tools"]] == ["create_provider", "list_providers"]
+
+    @pytest.mark.asyncio
+    async def test_describe_multiple_tools_partial_unknown(self, mcp, registry, db):
+        register_manager_tools(registry, db)
+        result = await mcp.call_tool(
+            "tool_describe", {"tool_name": ["create_provider", "nonexistent"]}
+        )
+        data = json.loads(_text(result))
+        assert [t["name"] for t in data["tools"]] == ["create_provider"]
+        assert "Unknown tool 'nonexistent'" in data["errors"]
+
+    @pytest.mark.asyncio
+    async def test_describe_multiple_tools_dedup(self, mcp, registry, db):
+        register_manager_tools(registry, db)
+        result = await mcp.call_tool(
+            "tool_describe", {"tool_name": ["create_provider", "create_provider"]}
+        )
+        data = json.loads(_text(result))
+        assert len(data["tools"]) == 1
+        assert data["tools"][0]["name"] == "create_provider"
+
+    @pytest.mark.asyncio
+    async def test_describe_empty_input(self, mcp, registry, db):
+        register_manager_tools(registry, db)
+        result = await mcp.call_tool("tool_describe", {"tool_name": ""})
+        data = json.loads(_text(result))
+        assert "error" in data
+
 
 # ---------------------------------------------------------------------------
 # Meta-tools: tool_call — Provider flow

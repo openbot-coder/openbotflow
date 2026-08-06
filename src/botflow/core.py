@@ -904,114 +904,128 @@ async def _stream_common(
     last_error: Exception | None = None
 
     try:
-        route_result = await router.route(
-            messages=internal["messages"],
-            temperature=internal.get("temperature"),
-            max_tokens=internal.get("max_tokens"),
-            stream=True,
-            **safe_extra,
-        )
-        routed_group_id = route_result.get("group_id", group_id)
-        start = time.monotonic()
-        usage_final = None
-        stream_timeout = 30  # 30 seconds timeout for first chunk
-
-        for ep in route_result["endpoints"]:
-            attempts = max(ep.max_retries, 1)
-            for attempt in range(attempts):
-                gen: AsyncGenerator[dict, None] | None = None
-                try:
-                    gen = ep.provider.chat_stream(
-                        messages=route_result["messages"],
-                        model=ep.detail.model_name,
-                        temperature=route_result.get("temperature"),
-                        max_tokens=route_result.get("max_tokens"),
-                        **route_result.get("kwargs", {}),
-                    )
-                    async with asyncio.timeout(stream_timeout):
-                        first_chunk = await gen.__anext__()
-                except asyncio.TimeoutError:
-                    last_error = ProviderError(f"Model {ep.detail.model_name} timed out waiting for first chunk")
-                    log.warning("{}", last_error)
-                    if gen:
-                        await gen.aclose()
-                    gen = None
-                    break
-                except StopAsyncIteration:
-                    last_error = ProviderError(f"Model {ep.detail.model_name} returned an empty stream")
-                    log.warning("{}", last_error)
-                    gen = None
-                    break
-                except Exception as e:
-                    last_error = e
-                    log.warning(
-                        "Model {} stream failed (attempt {}/{}): {}",
-                        ep.detail.model_name,
-                        attempt + 1,
-                        attempts,
-                        e,
-                    )
-                    if gen:
-                        await gen.aclose()
-                    if is_retryable_error(e) and attempt < attempts - 1:
-                        await exponential_backoff(attempt)
-                        continue
-                    break
-
-                if gen is None:
-                    break  # empty stream: move to next endpoint
-
-                # Stream started: commit to this model.
-                used_ep = ep
-                last_error = None
-                router.cooldown.record_success(routed_group_id, ep.model_id)
-
-                try:
-                    async for chunk in _chain_first(first_chunk, gen):
-                        # Check if client disconnected
-                        if request and await request.is_disconnected():
-                            log.info("Client disconnected, aborting stream for model {}", ep.detail.model_name)
-                            break
-
-                        # Override model with the original requested model name
-                        chunk["model"] = model_name
-                        try:
-                            lines, usage = serialize(chunk)
-                        except Exception:
-                            log.error("Serialize error for chunk: {}", chunk)
-                            raise
-                        if usage:
-                            usage_final = usage
-                        for line in lines:
-                            yield line
-                except Exception as e:
-                    log.error("Stream failed mid-way on model {}: {}", ep.detail.model_name, e)
-                    raise
-
-                yield done_signal
-
-                duration = int((time.monotonic() - start) * 1000)
-                await _log_call(
-                    group_id=group_id,
-                    model_id=used_ep.model_id,
-                    provider_id=used_ep.detail.provider_id,
-                    request_body=_request_summary(internal),
-                    response_body=None,
-                    status="success",
-                    duration_ms=duration,
-                    usage=usage_final,
-                )
-                return
-
-            # All attempts on this endpoint failed — cool it down, try next.
-            router.cooldown.record_failure(
-                routed_group_id,
-                ep.model_id,
-                ep.cooldown_threshold,
-                ep.cooldown_seconds,
+        stream_timeout = float(internal.get("stream_timeout", _config.stream_timeout if _config else 30.0))
+        active_router = router
+        fallback_attempted = False
+        while True:
+            route_result = await active_router.route(
+                messages=internal["messages"],
+                temperature=internal.get("temperature"),
+                max_tokens=internal.get("max_tokens"),
+                stream=True,
+                **safe_extra,
             )
+            routed_group_id = route_result.get("group_id", group_id)
+            start = time.monotonic()
+            usage_final = None
 
-        raise last_error if last_error is not None else ProviderError(f"No models available to stream for model {model_name}")
+            for ep in route_result["endpoints"]:
+                attempts = max(ep.max_retries, 1)
+                for attempt in range(attempts):
+                    gen: AsyncGenerator[dict, None] | None = None
+                    try:
+                        gen = ep.provider.chat_stream(
+                            messages=route_result["messages"],
+                            model=ep.detail.model_name,
+                            temperature=route_result.get("temperature"),
+                            max_tokens=route_result.get("max_tokens"),
+                            **route_result.get("kwargs", {}),
+                        )
+                        async with asyncio.timeout(stream_timeout):
+                            first_chunk = await gen.__anext__()
+                    except asyncio.TimeoutError:
+                        last_error = ProviderError(f"Model {ep.detail.model_name} timed out waiting for first chunk")
+                        log.warning("{}", last_error)
+                        if gen:
+                            await gen.aclose()
+                        gen = None
+                        break
+                    except StopAsyncIteration:
+                        last_error = ProviderError(f"Model {ep.detail.model_name} returned an empty stream")
+                        log.warning("{}", last_error)
+                        gen = None
+                        break
+                    except Exception as e:
+                        last_error = e
+                        log.warning(
+                            "Model {} stream failed (attempt {}/{}): {}",
+                            ep.detail.model_name,
+                            attempt + 1,
+                            attempts,
+                            e,
+                        )
+                        if gen:
+                            await gen.aclose()
+                        if is_retryable_error(e) and attempt < attempts - 1:
+                            await exponential_backoff(attempt)
+                            continue
+                        break
+
+                    if gen is None:
+                        break  # empty stream: move to next endpoint
+
+                    # Stream started: commit to this model.
+                    used_ep = ep
+                    last_error = None
+                    active_router.cooldown.record_success(routed_group_id, ep.model_id)
+
+                    try:
+                        async for chunk in _chain_first(first_chunk, gen):
+                            # Check if client disconnected
+                            if request and await request.is_disconnected():
+                                log.info("Client disconnected, aborting stream for model {}", ep.detail.model_name)
+                                break
+
+                            # Override model with the original requested model name
+                            chunk["model"] = model_name
+                            try:
+                                lines, usage = serialize(chunk)
+                            except Exception:
+                                log.error("Serialize error for chunk: {}", chunk)
+                                raise
+                            if usage:
+                                usage_final = usage
+                            for line in lines:
+                                yield line
+                    except Exception as e:
+                        log.error("Stream failed mid-way on model {}: {}", ep.detail.model_name, e)
+                        raise
+
+                    yield done_signal
+
+                    duration = int((time.monotonic() - start) * 1000)
+                    await _log_call(
+                        group_id=group_id,
+                        model_id=used_ep.model_id,
+                        provider_id=used_ep.detail.provider_id,
+                        request_body=_request_summary(internal),
+                        response_body=None,
+                        status="success",
+                        duration_ms=duration,
+                        usage=usage_final,
+                    )
+                    return
+
+                # All attempts on this endpoint failed — cool it down, try next.
+                active_router.cooldown.record_failure(
+                    routed_group_id,
+                    ep.model_id,
+                    ep.cooldown_threshold,
+                    ep.cooldown_seconds,
+                )
+
+            # All endpoints in this group failed — try the fallback group once.
+            if not fallback_attempted and active_router.fallback_group_id is not None:
+                log.warning(
+                    "Group {} exhausted for stream, falling back to group {}",
+                    routed_group_id,
+                    active_router.fallback_group_id,
+                )
+                fallback_attempted = True
+                active_router = GroupRouter(active_router.fallback_group_id, active_router.db, active_router.cooldown)
+                continue
+
+            raise last_error if last_error is not None else ProviderError(f"No models available to stream for model {model_name}")
 
     except Exception as e:
         log.opt(exception=True).error("Stream failed for model {}: {}", model_name, e)
