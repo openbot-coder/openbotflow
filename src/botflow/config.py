@@ -29,6 +29,9 @@ class BotflowSettings(BaseSettings):
     # CORS
     cors_origins: str = "*"
 
+    # Streaming: max seconds to wait for the first chunk before failing
+    stream_timeout: float = 30.0
+
     model_config = {"env_prefix": "BOTFLOW_", "env_file": ".env", "extra": "ignore"}
 
 

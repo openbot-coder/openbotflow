@@ -58,10 +58,12 @@ def _make_endpoint(model_id: int, provider: StubProvider, max_retries: int = 3) 
 
 
 class StubRouter:
-    def __init__(self, endpoints: list[ModelEndpoint], route_error: Exception | None = None) -> None:
+    def __init__(self, endpoints: list[ModelEndpoint], route_error: Exception | None = None, fallback_group_id: int | None = None) -> None:
         self.endpoints = endpoints
         self.route_error = route_error
+        self.fallback_group_id = fallback_group_id
         self.cooldown = CooldownManager()
+        self.db = None
 
     async def route(self, **kwargs):
         if self.route_error:
@@ -259,6 +261,86 @@ async def test_usage_chunk_recorded_in_success_log(monkeypatch, env):
     assert out == ["data: a\n\n", "data: [DONE]\n\n"]
     success_log = [entry for entry in env if entry["status"] == "success"][0]
     assert success_log["usage"] == {"prompt_tokens": 5}
+
+
+async def test_fallback_group_used_when_all_endpoints_fail(monkeypatch, env):
+    """组内全部模型失败 → 降级到 fallback group 重试（mimo 超时切 deepseek 的场景）。"""
+    ep1 = _make_endpoint(1, StubProvider([ProviderError("Model model-1 timed out waiting for first chunk")]))
+    ep2 = _make_endpoint(2, StubProvider([[{"content": "fallback-ok"}]]))
+    router = StubRouter([ep1], fallback_group_id=4)
+    _setup(monkeypatch, router, env)
+    monkeypatch.setattr(core, "exponential_backoff", AsyncMock())
+
+    # fallback group 的 router：endpoints 成功
+    async def fallback_route(**kwargs):
+        return {
+            "endpoints": [ep2],
+            "group_id": 4,
+            "messages": kwargs["messages"],
+            "temperature": kwargs.get("temperature"),
+            "max_tokens": kwargs.get("max_tokens"),
+            "kwargs": {},
+        }
+
+    fallback_router = StubRouter([ep2], fallback_group_id=None)
+    fallback_router.route = fallback_route
+    monkeypatch.setattr(core, "GroupRouter", lambda *a, **kw: fallback_router)
+
+    out = await _collect(core._stream_common({"model": "x", "messages": []}, _serialize))
+
+    assert out == ["data: fallback-ok\n\n", "data: [DONE]\n\n"]
+    success_log = [entry for entry in env if entry["status"] == "success"]
+    assert success_log[0]["model_id"] == ep2.model_id
+    assert not any(entry["status"] == "error" for entry in env)
+    # 主 group 的模型被计入失败
+    assert router.cooldown.get_failure_count(1, ep1.model_id) == 1
+
+
+async def test_fallback_group_failure_emits_error_sse(monkeypatch, env):
+    """主组与 fallback group 都失败 → 上报 SSE error。"""
+    ep1 = _make_endpoint(1, StubProvider([ProviderError("HTTP 400")]))
+    ep2 = _make_endpoint(2, StubProvider([ProviderError("HTTP 500")]))
+    router = StubRouter([ep1], fallback_group_id=4)
+    _setup(monkeypatch, router, env)
+    monkeypatch.setattr(core, "exponential_backoff", AsyncMock())
+
+    async def fallback_route(**kwargs):
+        return {
+            "endpoints": [ep2],
+            "group_id": 4,
+            "messages": kwargs["messages"],
+            "temperature": kwargs.get("temperature"),
+            "max_tokens": kwargs.get("max_tokens"),
+            "kwargs": {},
+        }
+
+    fallback_router = StubRouter([ep2], fallback_group_id=None)
+    fallback_router.route = fallback_route
+    monkeypatch.setattr(core, "GroupRouter", lambda *a, **kw: fallback_router)
+
+    out = await _collect(core._stream_common({"model": "x", "messages": []}, _serialize))
+
+    assert out[-1] == "data: [DONE]\n\n"
+    error_line = next(line for line in out if line.startswith("data: {") and '"error"' in line)
+    assert '"type": "server_error"' in error_line
+    error_log = [entry for entry in env if entry["status"] == "error"]
+    assert len(error_log) == 1
+    # 暴露 fallback group 最后一个模型的错误
+    assert "HTTP 500" in error_log[0]["error_message"]
+
+
+async def test_stream_timeout_from_request_overrides_default(monkeypatch, env):
+    """请求可自定义首 chunk 超时；超时后回退下一个模型。"""
+    ep1 = _make_endpoint(1, StubProvider([TimeoutError()]))  # 直接抛超时
+    ep2 = _make_endpoint(2, StubProvider([[{"content": "ok"}]]))
+    router = StubRouter([ep1, ep2])
+    _setup(monkeypatch, router, env)
+    monkeypatch.setattr(core, "exponential_backoff", AsyncMock())
+
+    out = await _collect(core._stream_common({"model": "x", "messages": [], "stream_timeout": 0.1}, _serialize))
+
+    assert out == ["data: ok\n\n", "data: [DONE]\n\n"]
+    assert router.cooldown.get_failure_count(1, ep1.model_id) == 1
 
 
 async def test_serialize_error_emits_error_sse_no_fallback(monkeypatch, env):
