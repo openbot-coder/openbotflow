@@ -112,8 +112,10 @@ botflow/
     ├── router.py          # 核心路由引擎
     ├── protocol_adapter.py# 协议适配层
     ├── auth.py            # 鉴权中间件
+    ├── admin_api.py       # REST 管理接口
+    ├── daily_summary.py   # 每日摘要定时任务
+    ├── rate_limit.py      # IP 级速率限制
     ├── common/            # 通用工具
     ├── providers/         # LLM 供应商适配
-    ├── mcp/               # MCP 服务
     └── storage/           # 数据库层
 ```
