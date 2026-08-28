@@ -202,7 +202,6 @@ class Database:
         await self._ensure_connection()
         assert self._conn is not None
         await self._conn.executescript(CREATE_TABLES_SQL)
-        await self._conn.executescript(CREATE_INDEXES_SQL)
 
         # Migrations: add columns that may be missing from older databases
         try:
@@ -222,6 +221,7 @@ class Database:
             except sqlite3.OperationalError:  # UNCOVERED: 旧库迁移路径，全新数据库已含审计列，无法单元测试触发
                 await self._conn.execute(f"ALTER TABLE call_logs ADD COLUMN {col}")  # UNCOVERED
 
+        await self._conn.executescript(CREATE_INDEXES_SQL)
         await self._conn.commit()
         global _active_db
         _active_db = self
