@@ -322,3 +322,64 @@ class TestGroupRouter:
 
         assert result["group_id"] == 4  # 结果是 fallback 组的
         assert [ep.model_id for ep in result["endpoints"]] == [2]
+
+
+# ---------------------------------------------------------------------------
+# api_format per-model SDK override tests
+# ---------------------------------------------------------------------------
+
+from botflow.router import (
+    _get_cached_provider,
+    _provider_cache,
+    PROVIDER_TYPE_MAP,
+)
+from botflow.providers.base import BaseProvider
+
+
+class TestApiFormatOverride:
+    """Verify that model-level api_format overrides the provider's provider_type."""
+
+    def setup_method(self):
+        _provider_cache.clear()
+
+    def test_empty_api_format_uses_provider_type(self):
+        """When api_format is empty, the provider's own type is used."""
+        p = _get_cached_provider(
+            provider_id=1, provider_type="openai",
+            api_key="k", base_url="http://x",
+        )
+        assert isinstance(p, PROVIDER_TYPE_MAP["openai"])
+
+    def test_api_format_overrides_provider_type(self):
+        """When api_format is 'anthropic', AnthropicProvider is used even though
+        provider_type is 'openai'."""
+        p = _get_cached_provider(
+            provider_id=1, provider_type="openai",
+            api_key="k", base_url="http://x",
+            api_format="anthropic",
+        )
+        assert isinstance(p, PROVIDER_TYPE_MAP["anthropic"])
+
+    def test_same_provider_different_formats_get_different_instances(self):
+        """Two models on the same provider with different api_format values
+        get separate cached provider instances."""
+        p1 = _get_cached_provider(
+            provider_id=1, provider_type="openai",
+            api_key="k", base_url="http://x",
+            api_format="deepseek",
+        )
+        p2 = _get_cached_provider(
+            provider_id=1, provider_type="openai",
+            api_key="k", base_url="http://x",
+            api_format="anthropic",
+        )
+        assert p1 is not p2
+        assert type(p1) is not type(p2)
+
+    def test_invalid_api_format_raises(self):
+        with pytest.raises(ValueError, match="Unsupported provider type"):
+            _get_cached_provider(
+                provider_id=1, provider_type="openai",
+                api_key="k", base_url="http://x",
+                api_format="nonexistent",
+            )

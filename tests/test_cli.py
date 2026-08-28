@@ -231,8 +231,8 @@ def test_cleanup_call_logs(cli_db):
     ))
     loop.run_until_complete(conn.commit())
 
-    from botflow.storage.cleanup import cleanup_call_logs
-    deleted = loop.run_until_complete(cleanup_call_logs(db, retention_days=180))
+    from botflow.storage.daily_summary import purge_old_call_logs
+    deleted = loop.run_until_complete(purge_old_call_logs(db, retention_days=180))
     assert deleted == 1
 
     logs = loop.run_until_complete(db.query_call_logs(limit=10))

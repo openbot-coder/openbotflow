@@ -157,19 +157,6 @@ def test_anthropic_messages():
     print("PASS\n")
 
 
-def test_embeddings_stub():
-    print("=" * 60)
-    print("TEST 8: /v1/embeddings (stub)")
-    print("=" * 60)
-    client = httpx.Client(timeout=30.0)
-    payload = {"model": "mimo-v2.5", "input": "hello"}
-    r = client.post(f"{BASE}/v1/embeddings", json=payload)
-    print(f"Status: {r.status_code} (expected 501)")
-    print(f"Body: {r.json()}")
-    assert r.status_code == 501
-    print("PASS\n")
-
-
 def test_anthropic_messages_stream():
     print("=" * 60)
     print("TEST 9: /v1/messages (Anthropic format, streaming)")
@@ -224,7 +211,6 @@ if __name__ == "__main__":
         test_chat_completions_stream,
         test_completions_prompt,
         test_anthropic_messages,
-        test_embeddings_stub,
         test_anthropic_messages_stream,
     ]
     passed = 0

@@ -15,7 +15,7 @@ from openai.types.chat import ChatCompletionChunk
 
 from botflow.common.exceptions import ProviderError
 from botflow.common.logger import get_logger
-from botflow.providers.base import BaseProvider
+from botflow.providers.base import BaseProvider, _make_http_client
 
 logger = get_logger("providers.openai")
 
@@ -70,6 +70,7 @@ class OpenAICompatProvider(BaseProvider):
                     azure_endpoint=self.base_url,
                     api_version=self.extra_config.get("api_version", "2024-02-01"),
                     timeout=self.extra_config.get("timeout", 120.0),
+                    http_client=_make_http_client(self.extra_config),
                 )
             return self._azure_client
         
@@ -78,6 +79,7 @@ class OpenAICompatProvider(BaseProvider):
                 api_key=self.api_key or "dummy",
                 base_url=self.base_url,
                 timeout=self.extra_config.get("timeout", 120.0),
+                http_client=_make_http_client(self.extra_config),
             )
         return self._client
 

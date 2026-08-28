@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from botflow.storage.cleanup import cleanup_call_logs
+from botflow.storage.daily_summary import purge_old_call_logs
 from botflow.storage.db import Database
 from botflow.storage.models import CallLog, Model, ModelGroup, Provider
 
@@ -264,14 +264,14 @@ class TestCleanup:
     async def test_cleanup_removes_old_logs(self, db):
         await db.create_call_log(CallLog(status="success"))
         # 0-day retention should delete everything
-        deleted = await cleanup_call_logs(db, retention_days=0)
+        deleted = await purge_old_call_logs(db, retention_days=0)
         assert deleted >= 1
 
     @pytest.mark.asyncio
     async def test_cleanup_preserves_recent_logs(self, db):
         await db.create_call_log(CallLog(status="success"))
         # 365-day retention should keep today's log
-        deleted = await cleanup_call_logs(db, retention_days=365)
+        deleted = await purge_old_call_logs(db, retention_days=365)
         assert deleted == 0
 
     @pytest.mark.asyncio
