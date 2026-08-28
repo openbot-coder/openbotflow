@@ -22,8 +22,9 @@ botflow 是一个轻量级 AI 中间件平台，提供三大核心能力：
 - **双协议兼容** - 同时支持 OpenAI 和 Anthropic API 格式
 - **分组路由** - 权重随机选择，支持跨 Provider 模型混合调度
 - **错误容错** - 自动重试、冷却机制、故障转移
-- **MCP 管理接口** - 通过 MCP 协议管理 Provider/Model/Group
-- **调用审计** - 完整的调用日志、统计分析、成本追踪
+- **REST 管理接口** - 通过 `/admin` HTTP API 管理 Provider/Model/Group，含管理 Key 鉴权
+- **多 API Key** - 支持多个客户端 Key，调用日志按 Key 隔离
+- **调用审计** - 完整的调用日志、统计分析、成本追踪；每日生成 LLM Wiki 摘要
 - **异步架构** - 基于 aiosqlite 的全异步数据库操作
 - **安全防护** - 时序攻击防护、CORS 控制、速率限制
 
@@ -61,10 +62,10 @@ uvicorn botflow.core:app --host 0.0.0.0 --port 8080
 ```bash
 # 通过 CLI 配置
 botflow set llm-key sk-your-api-key
-botflow set mcp-key your-mcp-key
+botflow set admin-key your-admin-key
 
-# 或通过 MCP 工具动态配置
-# create_provider, create_model, create_group 等
+# 或通过 REST 管理接口动态配置（见下文 /admin）
+# POST /admin/providers, POST /admin/models, POST /admin/groups ...
 ```
 
 ### 环境变量
@@ -103,209 +104,73 @@ curl -X POST http://localhost:8080/v1/messages \
   }'
 ```
 
-## MCP 工具
+## REST 管理接口
 
-botflow 通过 MCP (Model Context Protocol) 提供完整的 LLM Provider 管理能力。MCP 服务通过 **SSE (Server-Sent Events)** 传输，可被 Claude Desktop、Cursor 等 MCP 客户端调用。
+botflow 通过 `/admin` HTTP API 提供完整的 Provider/Model/Group/统计管理能力，所有接口需用 **管理 Key**（`BOTFLOW_ADMIN_KEY`）通过 `Authorization: Bearer <admin-key>` 鉴权。
 
-### MCP 端点
+### 配置管理 Key
+
+```bash
+botflow set admin-key your-admin-secret
+```
+
+### 端点一览
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/mcp/sse` | GET | SSE 连接端点，客户端订阅事件流 |
-| `/mcp/messages/{session_id}` | POST | 消息端点，客户端发送请求 |
-
-### 认证配置
-
-MCP 接口支持 API Key 认证。通过 CLI 设置 MCP Key：
-
-```bash
-botflow set mcp-key your-secret-key
-```
-
-调用时通过查询参数传递：
-
-```
-GET /mcp/sse?api_key=your-secret-key
-```
-
-如果未配置 MCP Key，则不需要认证（仅限开发环境使用）。
-
-### 可用工具列表
-
-#### Provider 管理
-
-| 工具 | 说明 |
-|------|------|
-| `create_provider` | 创建 LLM Provider |
-| `update_provider` | 更新 Provider 配置 |
-| `delete_provider` | 删除 Provider |
-| `get_provider` | 获取 Provider 详情 |
-| `list_providers` | 列出所有 Provider |
-
-#### Model 管理
-
-| 工具 | 说明 |
-|------|------|
-| `create_model` | 创建模型 |
-| `update_model` | 更新模型配置 |
-| `delete_model` | 删除模型 |
-| `list_models` | 列出所有模型 |
-
-#### Group 管理
-
-| 工具 | 说明 |
-|------|------|
-| `create_group` | 创建模型分组 |
-| `update_group` | 更新分组配置 |
-| `delete_group` | 删除分组 |
-| `get_group` | 获取分组详情 |
-| `list_groups` | 列出所有分组 |
-| `add_model_to_group` | 将模型添加到分组（支持权重配置） |
-
-#### 统计查询
-
-| 工具 | 说明 |
-|------|------|
-| `query_model_stats` | 查询模型统计 |
-| `query_group_stats` | 查询分组统计 |
-| `query_messages` | 查询调用日志 |
-| `query_cost_summary` | 查询成本汇总 |
+| `/admin/providers` | GET / POST | 列出 / 创建 Provider |
+| `/admin/providers/{id}` | GET / PATCH / DELETE | Provider 详情 / 更新 / 删除 |
+| `/admin/models` | GET / POST | 列出 / 创建模型 |
+| `/admin/models/{id}` | GET / PATCH / DELETE | 模型详情 / 更新 / 删除 |
+| `/admin/groups` | GET / POST | 列出 / 创建分组 |
+| `/admin/groups/{id}` | GET / PATCH / DELETE | 分组详情 / 更新 / 删除 |
+| `/admin/groups/{id}/models` | POST | 将模型加入分组（支持权重/冷却） |
+| `/admin/groups/{id}/models/{mid}` | DELETE / PATCH | 移出分组 / 调整权重 |
+| `/admin/groups/{id}/details` | GET | 分组内的模型明细 |
+| `/admin/stats/models` | GET | 模型统计（可按 `api_key_id` 过滤） |
+| `/admin/stats/groups` | GET | 分组统计 |
+| `/admin/stats/cost` | GET | 成本汇总（`days`、`api_key_id`） |
+| `/admin/logs` | GET | 调用日志查询（`api_key_id`、`status` 等过滤） |
+| `/admin/summaries/{day}` | GET | 某日 LLM Wiki 摘要 |
+| `/admin/apikeys` | GET / POST | 列出 / 创建客户端 Key |
+| `/admin/apikeys/{id}` | PATCH / DELETE | 启用/禁用 / 删除客户端 Key |
 
 ### 调用示例
 
-#### 1. 创建 Provider
+```bash
+# 创建 Provider
+curl -X POST http://localhost:8080/admin/providers \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"openai","type":"openai","base_url":"https://api.openai.com/v1","api_key":"sk-xxx"}'
 
-```python
-import asyncio
-from mcp import ClientSession
-from mcp.client.sse import sse_client
+# 创建模型并加入分组
+curl -X POST http://localhost:8080/admin/models \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -d '{"provider_id":1,"name":"gpt-4","type":"openai"}'
+curl -X POST http://localhost:8080/admin/groups/1/models \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -d '{"model_id":1,"weight":2}'
 
-async def main():
-    # 连接到 botflow MCP SSE 服务（带认证）
-    async with sse_client("http://localhost:8080/mcp/sse?api_key=your-secret-key") as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            
-            # 创建 OpenAI 兼容的 Provider
-            result = await session.call_tool("create_provider", {
-                "name": "openai",
-                "provider_type": "openai",
-                "api_key": "sk-your-api-key",
-                "base_url": "https://api.openai.com/v1",
-            })
-            print(result)
-
-asyncio.run(main())
+# 创建客户端 API Key（每个 Key 的日志独立隔离）
+curl -X POST http://localhost:8080/admin/apikeys \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -d '{"raw_key":"ck-xxxx","label":"team-a"}'
 ```
 
-#### 2. 创建模型并添加到分组
+### 客户端多 Key
 
-```python
-# 创建模型
-result = await session.call_tool("create_model", {
-    "name": "gpt-4",
-    "provider_id": 1,  # 刚创建的 Provider ID
-    "display_name": "GPT-4",
-    "max_retries": 3,
-    "cooldown_seconds": 60,
-})
+LLM 代理本身（`/v1/*`）使用**客户端 API Key** 鉴权（`Authorization: Bearer <client-key>`）。多个客户端 Key 存于数据库 `api_keys` 表，调用日志按 `api_key_id` 隔离。未配置任何 Key 时回退到单 `BOTFLOW_LLM_KEY`（兼容旧部署）。
 
-# 创建分组
-result = await session.call_tool("create_group", {
-    "name": "production",
-    "description": "生产环境分组",
-})
+### 每日摘要
 
-# 将模型添加到分组（权重 2.0）
-result = await session.call_tool("add_model_to_group", {
-    "group_id": 1,
-    "model_id": 1,
-    "weight": 2.0,
-})
-```
+服务内置 asyncio 后台任务，每天在 `daily_summary_hour`（默认 0 点）运行：
+1. 汇总前一天全部调用日志 → 用量/错误统计；
+2. 调用指定 `summary_group`（默认 `default`）生成 LLM Wiki 摘要，存 `daily_summaries`；
+3. 原始会话 gzip 压缩存入 `raw_sessions`，滚动保留 `raw_session_retention_days`（默认 7）天；
+4. 明细日志大字段在 `call_log_detail_days`（默认 1）天后清空，保留统计列。
 
-#### 3. 查询统计
-
-```python
-# 查询模型统计
-result = await session.call_tool("query_model_stats", {
-    "model_id": 1,
-})
-# 输出:
-# Model [1] gpt-4:
-#   Total calls: 150
-#   Success: 145
-#   Errors: 5
-#   Prompt tokens: 45,000
-#   Completion tokens: 12,000
-#   Total cost: $1.2500
-
-# 查询成本汇总
-result = await session.call_tool("query_cost_summary", {
-    "days": 30,
-})
-```
-
-### Claude Desktop 配置
-
-在 `~/.claude/claude_desktop_config.json` 中添加：
-
-**方式一：URL 参数认证**
-
-```json
-{
-  "mcpServers": {
-    "botflow": {
-      "type": "sse",
-      "url": "http://localhost:8080/mcp/sse?api_key=your-secret-key"
-    }
-  }
-}
-```
-
-**方式二：Header 认证**
-
-```json
-{
-  "mcpServers": {
-    "botflow": {
-      "type": "sse",
-      "url": "http://localhost:12307/mcp/sse",
-      "headers": {
-        "Authorization": "Bearer your-secret-key"
-      }
-    }
-  }
-}
-```
-
-**方式三：无认证（仅开发环境）**
-
-```json
-{
-  "mcpServers": {
-    "botflow": {
-      "type": "sse",
-      "url": "http://localhost:8080/mcp/sse"
-    }
-  }
-}
-```
-
-### Cursor / 其他 MCP 客户端配置
-
-对于支持 SSE 的 MCP 客户端，可使用以下格式：
-
-```json
-{
-  "mcpServers": {
-    "botflow": {
-      "type": "sse",
-      "url": "http://localhost:8080/mcp/sse?api_key=your-secret-key"
-    }
-  }
-}
-```
+也可手动触发：`botflow summary --day YYYY-MM-DD`。
 
 ## 安全特性
 
@@ -315,7 +180,7 @@ botflow 内置多项安全防护措施：
 - **CORS 控制**: 通过环境变量配置允许的来源，生产环境需明确指定可信域名
 - **速率限制**: 基于 IP 的速率限制（默认 100 次/分钟），防止暴力破解和 DoS 攻击
 - **SQL 注入防护**: 全程使用参数化查询，列名通过白名单验证
-- **敏感信息脱敏**: API Key 在日志和 MCP 输出中自动脱敏
+- **敏感信息脱敏**: API Key 在日志和 `/admin` 输出中自动脱敏（仅返回 hash 前缀）
 
 详细安全审计报告请参阅 `docs/security_audit/` 目录。
 
@@ -328,8 +193,8 @@ botflow/
 │   ├── router.py          # 路由引擎
 │   ├── protocol_adapter.py # 协议适配
 │   ├── providers/         # LLM Provider 适配
-│   ├── mcp/               # MCP 管理接口
-│   └── storage/           # 数据库层 (aiosqlite)
+│   ├── admin_api.py       # REST 管理接口
+│   └── storage/           # 数据库层 (aiosqlite) + 每日摘要
 ├── tests/                 # 测试
 ├── docs/                  # 文档
 │   ├── design.md          # 设计文档
@@ -363,7 +228,6 @@ uv run pytest -m integration
 - **LLM 客户端**: 官方 SDK（openai / anthropic / google-genai）
 - **配置管理**: pydantic-settings
 - **日志**: loguru
-- **MCP 协议**: mcp-python-sdk
 
 ## License
 

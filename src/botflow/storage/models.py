@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
@@ -18,8 +18,8 @@ class Provider(BaseModel):
     base_url: str = ""
     extra_config: dict[str, Any] = Field(default_factory=dict)
     is_enabled: bool = True
-    created_at: datetime = Field(default_factory=lambda: datetime.now())
-    updated_at: datetime = Field(default_factory=lambda: datetime.now())
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class Model(BaseModel):
@@ -29,14 +29,15 @@ class Model(BaseModel):
     name: str  # model name passed to provider, e.g. "gpt-4o"
     provider_id: int
     display_name: str = ""
+    api_format: str = ""  # override provider's SDK class per-model (openai/deepseek/anthropic/google/azure/ollama/vllm); empty = use provider_type
     max_retries: int = 3
     cooldown_seconds: int = 60
     cooldown_failure_threshold: int = 3
     extra_config: dict[str, Any] = Field(default_factory=dict)
     is_enabled: bool = True
     context_window: int = 0  # 0 means unknown/no truncation
-    created_at: datetime = Field(default_factory=lambda: datetime.now())
-    updated_at: datetime = Field(default_factory=lambda: datetime.now())
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class ModelGroup(BaseModel):
@@ -47,8 +48,8 @@ class ModelGroup(BaseModel):
     description: str = ""
     is_enabled: bool = True
     fallback_group_id: Optional[int] = None
-    created_at: datetime = Field(default_factory=lambda: datetime.now())
-    updated_at: datetime = Field(default_factory=lambda: datetime.now())
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class GroupModel(BaseModel):
@@ -59,7 +60,7 @@ class GroupModel(BaseModel):
     model_id: int
     weight: float = 1.0
     is_enabled: bool = True
-    created_at: datetime = Field(default_factory=lambda: datetime.now())
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class GroupModelWithDetails(BaseModel):
@@ -72,6 +73,7 @@ class GroupModelWithDetails(BaseModel):
     is_enabled: bool
     model_name: str
     display_name: str
+    api_format: str = ""  # per-model SDK override; empty = use provider_type
     provider_id: int
     provider_name: str
     provider_type: str
@@ -79,18 +81,24 @@ class GroupModelWithDetails(BaseModel):
     cooldown_seconds: int
     cooldown_failure_threshold: int
     context_window: int = 0
+    proxy: str = ""  # per-model proxy from model.extra_config["proxy"]
 
 
 class CallLog(BaseModel):
     """Audit log for an LLM API call."""
 
     id: int = 0
+    api_key_id: Optional[int] = None  # FK to api_keys; NULL when key system unused
     group_id: Optional[int] = None
     model_id: Optional[int] = None
     provider_id: Optional[int] = None
     request_body: Optional[str] = None
     response_body: Optional[str] = None
-    status: str = ""  # success, error, timeout, cancelled
+    status: str = ""  # success, error, timeout, cooldown, cancelled
+    error_type: Optional[str] = None  # e.g. ProviderError / TimeoutError / AllModelsCooldownError
+    error_message: Optional[str] = None
+    traceback: Optional[str] = None  # limited stack trace on failure
+    request_id: Optional[str] = None  # correlates retries/streams of one request
     duration_ms: Optional[int] = None
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
@@ -98,8 +106,36 @@ class CallLog(BaseModel):
     total_tokens: Optional[int] = None
     tool_calls: Optional[str] = None  # JSON string of tool calls
     cost: Optional[float] = None
-    error_message: Optional[str] = None
-    created_at: datetime = Field(default_factory=lambda: datetime.now())
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class ApiKey(BaseModel):
+    """Client API key. Calls authenticated by these keys are logged separately."""
+
+    id: int = 0
+    key_hash: str  # sha256 of the plaintext key (raw key is never stored)
+    label: str = ""
+    is_enabled: bool = True
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class DailySummary(BaseModel):
+    """Per-day LLM-generated wiki summary of all conversations."""
+
+    id: int = 0
+    day: str  # YYYY-MM-DD
+    summary_md: str = ""  # LLM wiki-formatted summary
+    stats_json: str = "{}"  # aggregated usage/error stats
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class RawSession(BaseModel):
+    """Compressed raw conversation sessions for a day (gzip blob)."""
+
+    id: int = 0
+    day: str  # YYYY-MM-DD
+    blob: bytes = b""  # gzip-compressed JSON of all call_logs for the day
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class ModelStats(BaseModel):

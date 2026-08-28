@@ -1,46 +1,49 @@
-"""FastAPI main service for botflow.
+"""FastAPI main service for botflow (LLM Proxy).
 
-Starts the HTTP API server and MCP service.
 Endpoints:
   - POST /v1/chat/completions  (OpenAI)
   - POST /v1/completions       (OpenAI, compatibility)
-  - POST /v1/embeddings         (OpenAI, compatibility)
   - GET  /v1/models             (OpenAI / Anthropic)
   - POST /v1/messages           (Anthropic)
-  - GET  /mcp/                  (MCP SSE transport)
-  - POST /mcp/                  (MCP messages endpoint)
+  - /admin/*                    (REST management API, admin-key guarded)
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import os
 import time
+import traceback as tb
+import uuid
 from collections import deque
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from botflow.auth import verify_llm_key
+from botflow.admin_api import admin_router
+from botflow.auth import ApiKey, resolve_api_key, verify_admin_key, verify_llm_key
 from botflow.common.exceptions import ProviderError
 from botflow.common.logger import get_logger, setup_logging
-from botflow.config import BotflowSettings
-from botflow.mcp.registry import ToolRegistry
-from botflow.mcp.server import create_mcp_server
+from botflow.config import BotflowSettings, get_config, set_config
 from botflow.protocol_adapter import (
     anthropic_to_internal,
     internal_chunk_to_anthropic_sse,
     internal_chunk_to_openai_sse,
+    internal_chunk_to_responses_sse,
     internal_to_anthropic,
     internal_to_openai,
+    internal_to_responses,
     models_to_anthropic,
     models_to_openai,
     openai_to_internal,
+    responses_to_internal,
 )
 from botflow.router import (
     CooldownManager,
@@ -48,12 +51,31 @@ from botflow.router import (
     exponential_backoff,
     is_retryable_error,
 )
+from botflow.storage.daily_summary import (
+    purge_old_call_logs,
+    purge_old_detail,
+    purge_old_raw_sessions,
+    run_daily_summary,
+)
+import httpx
+
 from botflow.storage.db import Database
-from botflow.storage.models import CallLog
-from botflow.storage.cleanup import cleanup_call_logs
+from botflow.storage.models import CallLog, Model
 from botflow.workspace import get_workspace_path, init_workspace
 
 log = get_logger("core")
+
+# Per-request context for call logging (API key id + request id).
+_request_ctx: contextvars.ContextVar[dict | None] = contextvars.ContextVar("request_ctx", default=None)
+
+
+def _set_request_ctx(api_key_id: int | None, request_id: str | None) -> contextvars.Token:
+    return _request_ctx.set({"api_key_id": api_key_id, "request_id": request_id})
+
+
+def _request_id(request: Request) -> str:
+    """Stable per-request id (from header or generated)."""
+    return request.headers.get("X-Request-Id") or uuid.uuid4().hex
 
 # Whitelist of extra kwargs that can be safely passed to LLM providers.
 # All three streaming/non-streaming handlers share this list.
@@ -117,7 +139,7 @@ class CallLogWriter:
         async with self._lock:
             self._buffer.append(log_entry)
             if len(self._buffer) >= self._max_buffer:
-                await self._flush()
+                await self._flush_unlocked()
 
     async def _flush_loop(self) -> None:
         """Background task to periodically flush the buffer."""
@@ -125,12 +147,11 @@ class CallLogWriter:
             await asyncio.sleep(self._flush_interval)
             await self._flush()
 
-    async def _flush(self) -> None:
-        """Flush buffered log entries to the database."""
+    async def _flush_unlocked(self) -> None:
+        """Flush buffered log entries to the database (caller must NOT hold _lock)."""
         async with self._lock:
             if not self._buffer:
                 return
-
             batch = self._buffer.copy()
             self._buffer.clear()
 
@@ -139,6 +160,10 @@ class CallLogWriter:
                 await self._db.create_call_log(entry)
         except Exception as e:
             log.error("Failed to flush {} call log entries: {}", len(batch), e)
+
+    async def _flush(self) -> None:
+        """Flush buffered log entries to the database (acquires lock)."""
+        await self._flush_unlocked()
 
 
 _log_writer: Optional[CallLogWriter] = None
@@ -149,9 +174,73 @@ def _get_db() -> Database:
     return _db
 
 
-async def _get_llm_key() -> str:
-    key = await _get_db().get_config("llm_key")
-    return key or ""
+# ---------------------------------------------------------------------------
+# Model sync from upstream providers
+# ---------------------------------------------------------------------------
+
+
+async def sync_models_from_provider(provider_id: int, db: Optional[Database] = None) -> dict[str, Any]:
+    """Fetch model list from a provider's /v1/models endpoint and upsert into DB.
+
+    Only adds models that don't already exist locally.
+    Returns a summary dict: {"added": N, "skipped": N, "errors": [...]}.
+    """
+    db = db or _get_db()
+    provider = await db.get_provider(provider_id)
+    if not provider:
+        return {"added": 0, "skipped": 0, "errors": [f"Provider {provider_id} not found"]}
+
+    base_url = provider.base_url.rstrip("/")
+    models_url = f"{base_url}/models"
+    headers = {"Authorization": f"Bearer {provider.api_key}"} if provider.api_key else {}
+
+    summary: dict[str, Any] = {"added": 0, "skipped": 0, "errors": []}
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.get(models_url, headers=headers)
+            resp.raise_for_status()
+        except Exception as e:
+            summary["errors"].append(str(e))
+            log.error("Failed to fetch models from {}: {}", models_url, e)
+            return summary
+
+        data = resp.json()
+        # Collect existing model names for this provider
+        existing_models = await db.list_models(provider_id=provider_id)
+        existing_names = {m.name for m in existing_models}
+
+        for item in data.get("data", []):
+            name = item.get("id", "")
+            if not name:
+                continue
+            if name in existing_names:
+                summary["skipped"] += 1
+                continue
+            model = Model(
+                name=name,
+                provider_id=provider_id,
+                display_name=name,
+            )
+            await db.create_model(model)
+            summary["added"] += 1
+            log.info("Synced new model: {} (provider {})", name, provider_id)
+
+    log.info("Model sync for provider {}: added={} skipped={} errors={}",
+             provider_id, summary["added"], summary["skipped"], len(summary["errors"]))
+    return summary
+
+
+async def sync_all_models() -> dict[str, Any]:
+    """Sync models from all enabled providers."""
+    db = _get_db()
+    providers = await db.list_providers(enabled_only=True)
+    combined: dict[str, Any] = {"added": 0, "skipped": 0, "errors": []}
+    for p in providers:
+        result = await sync_models_from_provider(p.id)
+        combined["added"] += result.get("added", 0)
+        combined["skipped"] += result.get("skipped", 0)
+        combined["errors"].extend(result.get("errors", []))
+    return combined
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +250,8 @@ async def _get_llm_key() -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # UNCOVERED: 运行时服务生命周期——启动后台日志写入器与每日维护任务循环，
+    # 只能在真实服务进程（uvicorn）中触发，无法在单元测试中安全执行。
     """Application lifespan: startup/shutdown."""
     global _db, _config, _log_writer
 
@@ -184,37 +275,21 @@ async def lifespan(app: FastAPI):
     await _log_writer.start()
     log.info("Call log writer started (buffer=100, flush=5s)")
 
-    # Register MCP internal tools into ToolRegistry
-    from botflow.mcp.manager import register_manager_tools
-    from botflow.mcp.stats import register_stats_tools
-    register_manager_tools(_registry, _get_db())
-    register_stats_tools(_registry, _get_db())
-    # W13: use public names() instead of private _tools.keys()
-    registered_names = _registry.names()
-    log.info(f"MCP internal tools registered ({len(registered_names)}): {registered_names}")
+    # Mount REST admin API (management of providers/models/groups/keys/stats).
+    app.include_router(admin_router)
 
-    # Warn if MCP key is not configured
-    mcp_key = await _get_db().get_config("mcp_key") if _db else None
-    if not mcp_key:
-        log.warning("No MCP key configured - MCP tools have no authentication! "
-                     "Use 'botflow set mcp-key <key>' to configure.")
-    else:
-        log.info("MCP authentication is enabled.")
-
-    # Log MCP endpoints info
-    log.info("MCP management service available at /mcp/")
-    log.info("MCP tools: provider CRUD, model CRUD, group CRUD, stats queries")
-
-    # Auto-configure keys from environment variables (for Docker deployment)
     db = _get_db()
+
+    # Auto-configure legacy LLM key from environment (single-key deployments).
     env_llm_key = os.environ.get("LLM_KEY", "")
-    env_mcp_key = os.environ.get("MCP_KEY", "")
-    if env_llm_key and not await db.get_config("llm_key"):
-        await db.set_config("llm_key", env_llm_key)
-        log.info("LLM key configured from environment variable.")
-    if env_mcp_key and not await db.get_config("mcp_key"):
-        await db.set_config("mcp_key", env_mcp_key)
-        log.info("MCP key configured from environment variable.")
+    if env_llm_key and not (get_config().llm_key or await db.list_api_keys()):
+        # Persist into the multi-key table so logs are attributed.
+        await db.create_api_key(env_llm_key, label="env:LLM_KEY")
+        log.info("Legacy LLM key from environment registered as API key.")
+
+    if not get_config().admin_key:
+        log.warning("No admin key configured (BOTFLOW_ADMIN_KEY). "
+                     "Set it to protect the /admin REST API.")
 
     # Restore cooldown states from database
     try:
@@ -231,18 +306,35 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("Failed to restore cooldown states: {}", e)
 
-    # Start background cleanup task (every 24 hours)
-    async def _periodic_cleanup():
+    # Daily maintenance job: runs once per day at config.daily_summary_hour.
+    # Aggregates the previous day into a wiki summary, compresses raw sessions,
+    # and purges old detailed log fields (rolling windows).
+    async def _daily_maintenance():
+        cfg = get_config()
+        now = datetime.now(timezone.utc)
+        first_run_hour = cfg.daily_summary_hour
+        # Sleep until the target hour today (or tomorrow if already past).
+        seconds_until = (first_run_hour - now.hour) * 3600 - now.minute * 60 - now.second
+        if seconds_until <= 0:
+            seconds_until += 24 * 3600
         while True:
-            await asyncio.sleep(24 * 60 * 60)
+            await asyncio.sleep(seconds_until)
+            seconds_until = 24 * 3600
             try:
-                deleted = await cleanup_call_logs(_get_db())
-                if deleted > 0:
-                    log.info("Periodic cleanup: deleted {} old call_log records", deleted)
+                db = _get_db()
+                await run_daily_summary(db)
+                purged_detail = await purge_old_detail(db)
+                purged_raw = await purge_old_raw_sessions(db)
+                deleted = await purge_old_call_logs(db)
+                if purged_detail or purged_raw or deleted:
+                    log.info(
+                        "Daily maintenance done: detail={} raw={} records={}",
+                        purged_detail, purged_raw, deleted,
+                    )
             except Exception as e:
-                log.error("Periodic cleanup failed: {}", e)
+                log.error("Daily maintenance failed: {}", e)
 
-    cleanup_task = asyncio.create_task(_periodic_cleanup())
+    daily_task = asyncio.create_task(_daily_maintenance())
 
     # Periodic cooldown state save (every 5 minutes)
     async def _periodic_cooldown_save():
@@ -273,8 +365,28 @@ async def lifespan(app: FastAPI):
 
     dedup_cleanup_task = asyncio.create_task(_periodic_dedup_cleanup())
 
-    # MCP session lifecycle is managed internally by FastMCP's app;
-    # the outer lifespan only manages botflow's own background tasks.
+    # Periodic model sync from upstream providers (configurable interval)
+    async def _periodic_model_sync():
+        interval = get_config().model_sync_interval
+        if interval <= 0:
+            return
+        # Initial sync after 30 seconds (let the server start first)
+        await asyncio.sleep(30)
+        while True:
+            try:
+                result = await sync_all_models()
+                if result.get("added", 0):
+                    log.info("Model sync: added={} skipped={} errors={}",
+                             result["added"], result["skipped"], len(result["errors"]))
+                elif result["errors"]:
+                    log.warning("Model sync errors: {}", result["errors"])
+            except Exception as e:
+                log.error("Model sync failed: {}", e)
+            await asyncio.sleep(interval * 60)
+
+    model_sync_task = asyncio.create_task(_periodic_model_sync())
+
+    # botflow's background tasks run until the app shuts down.
     yield
 
     # Shutdown: gracefully stop log writer
@@ -296,10 +408,17 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
-    # Shutdown: gracefully cancel cleanup task
-    cleanup_task.cancel()
+    # Shutdown: gracefully cancel daily maintenance task
+    daily_task.cancel()
     try:
-        await cleanup_task
+        await daily_task
+    except asyncio.CancelledError:
+        pass
+
+    # Shutdown: gracefully cancel model sync task
+    model_sync_task.cancel()
+    try:
+        await model_sync_task
     except asyncio.CancelledError:
         pass
 
@@ -315,31 +434,21 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="botflow",
     description="AI Middleware Platform",
-    version="0.1.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
 # CORS - 允许所有来源
 cors_origins = os.environ.get("BOTFLOW_CORS_ORIGINS", "*").split(",")
+# allow_credentials=True is incompatible with allow_origins=["*"] per CORS spec
+_use_credentials = cors_origins != ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
-    allow_credentials=True,
+    allow_credentials=_use_credentials,
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
     allow_headers=["Authorization", "Content-Type", "Accept"],
 )
-
-# ---------------------------------------------------------------------------
-# MCP Server (SSE transport)
-# ---------------------------------------------------------------------------
-
-_registry = ToolRegistry()
-mcp_server = create_mcp_server(_registry)
-# Expose MCP via SSE transport at /mcp/ (and /mcp/messages for POST).
-# FastMCP's sse_app(mount_path="/") routes internally to sse_path="/" and /messages,
-# so mounting under /mcp yields /mcp/ (SSE GET) and /mcp/messages (POST).
-app.mount("/mcp", mcp_server.sse_app(mount_path="/"))
-
 
 # ---------------------------------------------------------------------------
 # Middleware: Rate Limiting (per API key)
@@ -426,43 +535,10 @@ app.add_middleware(RateLimitMiddleware, max_requests=300, window_seconds=60, max
 
 
 class AuthMiddleware:
-    """Pure ASGI middleware for LLM key authentication."""
+    """Pure ASGI middleware for LLM client-key authentication.
 
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            return await self.app(scope, receive, send)
-
-        request = Request(scope, receive)
-
-        # Skip auth for health check and MCP endpoints (MCP has its own auth)
-        if request.url.path == "/health" or request.url.path.startswith("/mcp/"):
-            return await self.app(scope, receive, send)
-
-        llm_key = await _get_llm_key()
-        if llm_key:
-            error_response = verify_llm_key(request, llm_key)
-            if error_response:
-                return await error_response(scope, receive, send)
-
-        return await self.app(scope, receive, send)
-
-
-app.add_middleware(AuthMiddleware)
-
-
-# ---------------------------------------------------------------------------
-# Middleware: MCP-Key auth (for /mcp/ paths only)
-# ---------------------------------------------------------------------------
-
-
-class McpAuthMiddleware:
-    """Pure ASGI middleware for MCP key authentication.
-
-    Checks Bearer token against the MCP key stored in the database.
-    If no MCP key is configured, all requests are allowed through.
+    Resolves the Bearer token to an api_keys row (or legacy single key), stores
+    the id on request.state, and rejects invalid tokens with 401.
     """
 
     def __init__(self, app):
@@ -474,30 +550,40 @@ class McpAuthMiddleware:
 
         request = Request(scope, receive)
 
-        # Only enforce auth on /mcp/ paths
-        if not request.url.path.startswith("/mcp/"):
+        # Health check is public.
+        if request.url.path == "/health":
             return await self.app(scope, receive, send)
 
-        mcp_key = await _get_db().get_config("mcp_key")
-        if not mcp_key:
+        # Admin REST API has its own dependency-based guard; skip middleware here
+        # (admin_key is checked per-route).
+        if request.url.path.startswith("/admin/"):
             return await self.app(scope, receive, send)
 
-        import hmac as _hmac
         auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            response = JSONResponse(status_code=401, content={"error": "Missing or invalid Authorization header"})
+        token = None
+        if auth_header.startswith("Bearer "):
+            token = auth_header.removeprefix("Bearer ").strip()
+        elif auth_header:
+            token = auth_header.strip()
+
+        if not token:
+            response = JSONResponse(
+                status_code=401,
+                content={"error": "Missing API key. Provide Authorization: Bearer <key>."},
+            )
             return await response(scope, receive, send)
 
-        provided_key = auth_header.removeprefix("Bearer ").strip()
-        if not _hmac.compare_digest(provided_key, mcp_key):
-            log.warning("Invalid MCP key attempt from {}", request.client.host if request.client else "unknown")
-            response = JSONResponse(status_code=401, content={"error": "Invalid MCP key"})
+        db = _get_db()
+        api_key = await resolve_api_key(db, token)
+        if api_key is None:
+            response = JSONResponse(status_code=401, content={"error": "Invalid or disabled API key."})
             return await response(scope, receive, send)
 
+        request.state.api_key_id = api_key.id
         return await self.app(scope, receive, send)
 
 
-app.add_middleware(McpAuthMiddleware)
+app.add_middleware(AuthMiddleware)
 
 
 # ---------------------------------------------------------------------------
@@ -544,38 +630,47 @@ async def _log_call(
     duration_ms: int | None,
     usage: dict[str, Any] | None,
     error_message: str | None = None,
+    *,
+    api_key_id: int | None = None,
+    error_type: str | None = None,
+    traceback_text: str | None = None,
+    request_id: str | None = None,
 ) -> None:
-    """Write a call log entry asynchronously (buffered)."""
+    """Write a call log entry asynchronously (buffered).
+
+    失败调用会保留完整 request_body 与 traceback，便于排查。
+    成功调用仅保留截断后的 response_body（节省空间）。
+    """
     global _log_writer
+    ctx = _request_ctx.get() or {}
+    if api_key_id is None:
+        api_key_id = ctx.get("api_key_id")
+    if request_id is None:
+        request_id = ctx.get("request_id")
     log_entry = CallLog(
+        api_key_id=api_key_id,
         group_id=group_id,
         model_id=model_id,
         provider_id=provider_id,
         request_body=request_body,
         response_body=response_body,
         status=status,
+        error_type=error_type,
+        error_message=error_message,
+        traceback=traceback_text,
+        request_id=request_id,
         duration_ms=duration_ms,
         prompt_tokens=usage.get("prompt_tokens") if usage else None,
         completion_tokens=usage.get("completion_tokens") if usage else None,
         cache_tokens=usage.get("cache_tokens") if usage else None,
         total_tokens=usage.get("total_tokens") if usage else None,
-        cost=_estimate_cost(usage) if usage else None,
-        error_message=error_message,
+        cost=None,  # Cost tracking not yet implemented (pricing tables needed)
     )
     if _log_writer:
         await _log_writer.log(log_entry)
     else:
         # Fallback: direct write if writer not initialized
         await _get_db().create_call_log(log_entry)
-
-
-def _estimate_cost(usage: dict[str, Any]) -> float:
-    """Estimate cost based on token usage.
-
-    Currently returns 0 (cost tracking not implemented).
-    For accurate cost tracking, implement per-model pricing tables.
-    """
-    return 0.0
 
 
 def _extract_model_route_info(response: dict, internal_params: dict) -> tuple[int | None, int | None, int | None]:
@@ -586,11 +681,15 @@ def _extract_model_route_info(response: dict, internal_params: dict) -> tuple[in
     return group_id, model_id, provider_id
 
 
-def _generate_request_id(body: dict) -> str:
-    """Generate a deterministic request ID for deduplication."""
+def _generate_request_id(body: dict, api_key_id: int | None = None) -> str:
+    """Generate a deterministic request ID for deduplication.
+
+    The api_key_id is included in the hash so that identical payloads from
+    different tenants never share a dedup cache entry (cross-tenant leak).
+    """
     import hashlib
-    # Create a hash based on request content
-    content = json.dumps(body, sort_keys=True, default=str)
+    # Create a hash based on request content + tenant
+    content = json.dumps({"body": body, "api_key_id": api_key_id}, sort_keys=True, default=str)
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 
@@ -629,12 +728,14 @@ async def _cache_request_result(request_id: str, result: dict, ttl_seconds: int 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    _set_request_ctx(getattr(request.state, "api_key_id", None), _request_id(request))
     body = await request.json()
     internal = openai_to_internal(body)
     stream = internal["stream"]
 
     # Request deduplication for non-streaming requests
-    request_id = body.get("request_id") or _generate_request_id(body)
+    _api_key_id = (_request_ctx.get() or {}).get("api_key_id")
+    request_id = body.get("request_id") or _generate_request_id(body, _api_key_id)
     if not stream:
         cached_result = await _check_request_deduplication(request_id)
         if cached_result:
@@ -659,6 +760,7 @@ async def chat_completions(request: Request):
 
 @app.post("/v1/completions")
 async def completions(request: Request):
+    _set_request_ctx(getattr(request.state, "api_key_id", None), _request_id(request))
     body = await request.json()
 
     # Legacy completions API uses "prompt" instead of "messages"
@@ -690,6 +792,7 @@ async def completions(request: Request):
 
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
+    _set_request_ctx(getattr(request.state, "api_key_id", None), _request_id(request))
     body = await request.json()
     internal = anthropic_to_internal(body)
     stream = internal["stream"]
@@ -702,6 +805,28 @@ async def anthropic_messages(request: Request):
         )
 
     return await _handle_chat_non_stream(internal, request, internal_to_anthropic)
+
+
+# ---------------------------------------------------------------------------
+# Endpoint: OpenAI Responses API  /v1/responses
+# ---------------------------------------------------------------------------
+
+
+@app.post("/v1/responses")
+async def responses_create(request: Request):
+    _set_request_ctx(getattr(request.state, "api_key_id", None), _request_id(request))
+    body = await request.json()
+    internal = responses_to_internal(body)
+    stream = internal["stream"]
+
+    if stream:
+        return StreamingResponse(
+            _stream_responses(internal, request),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
+
+    return await _handle_chat_non_stream(internal, request, internal_to_responses)
 
 
 # ---------------------------------------------------------------------------
@@ -740,36 +865,31 @@ async def health():
     return {"status": "ok", "service": "botflow"}
 
 
-@app.post("/v1/embeddings")
-async def embeddings(request: Request):
-    """Stub endpoint for OpenAI-compatible embeddings."""
-    body = await request.json()
-    model = body.get("model", "")
-    input_text = body.get("input", [])
-    if isinstance(input_text, str):
-        input_text = [input_text]
-
-    log.warning("/v1/embeddings called but not fully implemented (model={})", model)
-    return JSONResponse(
-        status_code=501,
-        content={
-            "error": {
-                "message": "Embeddings endpoint is not yet implemented. "
-                           "It will be available in a future Phase 2 release.",
-                "type": "not_implemented",
-            }
-        },
-    )
-
-
 # ---------------------------------------------------------------------------
 # Non-streaming handler
 # ---------------------------------------------------------------------------
 
 
-def _request_summary(internal: dict) -> str | None:
-    """No longer storing request body — return None to save ~136KB per row."""
-    return None
+def _request_summary(internal: dict, full: bool = False) -> str | None:
+    """Serialize the request for audit logging.
+
+    Normal calls keep a truncated summary (space saving); failed calls pass
+    full=True to retain the entire payload for debugging.
+    """
+    try:
+        text = json.dumps(internal, ensure_ascii=False)
+    except Exception:
+        return None
+    if full or len(text) <= 2000:
+        return text
+    return text[:2000] + "…[truncated]"
+
+
+def _limit_traceback(text: str, limit: int = 4000) -> str | None:
+    """Keep at most `limit` chars of a traceback for audit logging."""
+    if not text:
+        return None
+    return text if len(text) <= limit else text[:limit] + "\n…[truncated]"
 
 
 async def _get_extra_route_params(internal: dict, stream: bool = False) -> tuple[int, GroupRouter, dict]:
@@ -829,12 +949,14 @@ async def _handle_chat_non_stream(
             group_id=group_id,
             model_id=None,
             provider_id=None,
-            request_body=_request_summary(internal),
+            request_body=_request_summary(internal, full=True),
             response_body=None,
             status="error",
             duration_ms=duration,
             usage=None,
             error_message=str(e),
+            error_type=type(e).__name__,
+            traceback_text=_limit_traceback(tb.format_exc()),
         )
 
         raise HTTPException(status_code=502, detail=str(e))
@@ -883,6 +1005,8 @@ async def _stream_common(
     done_signal: str = "data: [DONE]\n\n",
     request: Request | None = None,
 ) -> AsyncGenerator[str, None]:
+    # UNCOVERED: 异步流式响应生成器——逐块路由/序列化/记录真实 provider 网络流，
+    # 需真实 LLM 流式连接与客户端断开检测，无法在单元测试中可靠覆盖。
     """Shared streaming logic: route, iterate, serialize, log.
 
     Tries candidate endpoints in weighted order; if a stream fails before its
@@ -990,6 +1114,11 @@ async def _stream_common(
                     except Exception as e:
                         log.error("Stream failed mid-way on model {}: {}", ep.detail.model_name, e)
                         raise
+                    finally:
+                        # Always close provider generator to avoid connection leak
+                        if gen is not None:
+                            await gen.aclose()
+                            gen = None
 
                     yield done_signal
 
@@ -1033,12 +1162,14 @@ async def _stream_common(
             group_id=group_id,
             model_id=used_ep.model_id if used_ep else None,
             provider_id=used_ep.detail.provider_id if used_ep else None,
-            request_body=_request_summary(internal),
+            request_body=_request_summary(internal, full=True),
             response_body=None,
             status="error",
             duration_ms=None,
             usage=None,
             error_message=str(e),
+            error_type=type(e).__name__,
+            traceback_text=_limit_traceback(tb.format_exc()),
         )
         error_data = {"error": {"message": str(e), "type": "server_error"}}
         yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
@@ -1063,6 +1194,53 @@ async def _stream_anthropic(
         yield line
 
 
+def _responses_serialize_raw(chunk: dict, response_id: str, created_at: int) -> list[str]:
+    """Serialize a raw provider chunk to Responses API SSE lines."""
+    choices = chunk.get("choices") or []
+    choice = choices[0] if choices and choices[0] is not None else {}
+    delta = choice.get("delta") or {}
+    finish_reason = choice.get("finish_reason")
+
+    is_first = bool(delta.get("role"))
+    is_last = bool(finish_reason)
+
+    events = internal_chunk_to_responses_sse(
+        chunk, is_first=is_first, is_last=is_last,
+        response_id=response_id, created_at=created_at,
+    )
+
+    lines: list[str] = []
+    for evt in events:
+        lines.append(f"event: {evt['type']}\n")
+        lines.append(f"data: {json.dumps(evt, ensure_ascii=False)}\n\n")
+    return lines
+
+
+async def _stream_responses(
+    internal: dict,
+    request: Request,
+) -> AsyncGenerator[str, None]:
+    """Stream response in OpenAI Responses API SSE format."""
+    import secrets as _secrets
+
+    response_id = "resp_" + _secrets.token_hex(8)
+    created_at = int(time.time())
+
+    async def _responses_serialize_wrap(chunk: dict) -> tuple[list[str], dict | None]:
+        """Adapter: convert raw chunk to Responses SSE lines."""
+        # Responses API doesn't send [DONE] — just stop.
+        lines: list[str] = []
+        for line in _responses_serialize_raw(chunk, response_id, created_at):
+            lines.append(line)
+        return lines, chunk.get("usage")
+
+    async for line in _stream_common(
+        internal, _responses_serialize_wrap, done_signal="", request=request,
+    ):
+        if line:
+            yield line
+
+
 # ---------------------------------------------------------------------------
 # Service starter
 # ---------------------------------------------------------------------------
@@ -1084,6 +1262,11 @@ async def create_app(
     global _db, _config
 
     _config = config
+    set_config(config)
+
+    # 同步 workspace 到 config：DB/日志用 workspace 参数，远程 MCP 配置
+    # (mcp.json) 与日志目录依赖 _config.workspace，必须保持与 CLI 参数一致
+    config.workspace = str(workspace)
 
     # Initialize database
     db_path = workspace / "data" / "botflow.db"

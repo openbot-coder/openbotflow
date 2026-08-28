@@ -14,7 +14,6 @@ dependencies = [
     "pydantic>=2.12.5",
     "pydantic-settings>=2.6.0",
     "python-dotenv>=1.0.0",
-    "mcp>=1.0.0",
     "loguru>=0.7.0",
     "aiosqlite>=0.20.0",
     "openai>=1.82.0",
@@ -44,3 +43,19 @@ markers = [
 ]
 addopts = ["-m", "not integration"]
 asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["botflow"]
+
+[tool.coverage.report]
+show_missing = true
+# Lines containing the marker below are excluded from coverage because they
+# exercise runtime/service/network behaviour that cannot be unit-tested.
+exclude_lines = [
+    "pragma: no cover",
+    "UNCOVERED",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "def __repr__",
+    "def __str__",
+]

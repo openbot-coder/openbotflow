@@ -440,6 +440,7 @@ CREATE TABLE models (
     name            TEXT NOT NULL,         -- 模型名称: gpt-4o / claude-3-opus
     provider_id     INTEGER NOT NULL,      -- 所属供应商
     display_name    TEXT,                  -- 显示名称
+    api_format      TEXT DEFAULT '',       -- 模型级 SDK 覆盖 (openai/deepseek/anthropic/google/...); 空 = 用 provider_type
     context_window  INTEGER DEFAULT 0,    -- 上下文窗口大小（tokens）
     max_retries           INTEGER DEFAULT 3,     -- 最大重试次数
     cooldown_seconds       INTEGER DEFAULT 60,  -- 冷却时间（秒）
@@ -601,8 +602,8 @@ tool_call("create_provider", {name: "my-openai", ...})  → {"id": 1, ...}
 
 | 工具 | 参数 | 返回 | 说明 |
 |------|------|------|------|
-| `create_model` | `name`, `provider_id`, `display_name?`, `max_retries?`, `cooldown_seconds?`, `cooldown_failure_threshold?` | `{id, name, provider_id}` | 新增模型 |
-| `update_model` | `id`, `name?`, `max_retries?`, `cooldown_seconds?`, `cooldown_failure_threshold?`, `is_enabled?` | `{id, updated}` | 更新模型配置 |
+| `create_model` | `name`, `provider_id`, `display_name?`, `api_format?`, `max_retries?`, `cooldown_seconds?`, `cooldown_failure_threshold?` | `{id, name, provider_id}` | 新增模型 |
+| `update_model` | `id`, `name?`, `api_format?`, `max_retries?`, `cooldown_seconds?`, `cooldown_failure_threshold?`, `is_enabled?` | `{id, updated}` | 更新模型配置 |
 | `delete_model` | `id` | `{deleted}` | 删除模型 |
 | `list_models` | - | `{models: [{id, name, provider, is_enabled}]}` | 列出所有可用模型 |
 

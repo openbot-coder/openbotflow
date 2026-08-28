@@ -34,6 +34,14 @@ data/
 
 # Logs
 logs/
+*.log
+
+# Temp/debug files
+_*.py
+_*.log
+_*.txt
+_*.json
+prod_core.py
 
 # Environment variables
 .env

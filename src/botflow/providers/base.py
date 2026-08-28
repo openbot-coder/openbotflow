@@ -6,6 +6,22 @@ from abc import ABC, abstractmethod
 from typing import Any, AsyncGenerator
 
 
+def _make_http_client(extra_config: dict[str, Any] | None) -> Any:
+    """Create an ``httpx.AsyncClient`` with optional proxy.
+
+    Returns ``None`` when no proxy is configured, letting the SDK use its
+    default connection pool.
+    """
+    proxy = (extra_config or {}).get("proxy", "")
+    if not proxy:
+        return None
+    try:
+        import httpx
+        return httpx.AsyncClient(proxy=proxy, timeout=extra_config.get("timeout", 120.0))
+    except ImportError:
+        return None
+
+
 class BaseProvider(ABC):
     """Abstract base class for all LLM providers.
 

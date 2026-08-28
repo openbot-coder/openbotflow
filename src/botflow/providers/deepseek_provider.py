@@ -24,7 +24,7 @@ from openai import AsyncOpenAI
 
 from botflow.common.exceptions import ProviderError
 from botflow.common.logger import get_logger
-from botflow.providers.base import BaseProvider
+from botflow.providers.base import BaseProvider, _make_http_client
 
 logger = get_logger("providers.deepseek")
 
@@ -96,6 +96,7 @@ class DeepSeekProvider(BaseProvider):
             api_key=api_key,
             base_url=self.base_url,
             timeout=self.extra_config.get("timeout", 120.0),
+            http_client=_make_http_client(self.extra_config),
         )
 
     # ------------------------------------------------------------------

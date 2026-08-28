@@ -149,8 +149,8 @@ PROVIDER_TYPE_MAP: dict[str, type[BaseProvider]] = {
     "google": GoogleProvider,
 }
 
-# Cache: provider_id -> (BaseProvider, create_time)
-_provider_cache: dict[int, tuple[BaseProvider, float]] = {}
+# Cache: (provider_id, resolved_type) -> (BaseProvider, create_time)
+_provider_cache: dict[tuple[int, str], tuple[BaseProvider, float]] = {}
 _PROVIDER_CACHE_TTL = 300  # 5 minutes
 
 # Cache: group_id -> (list[ModelEndpoint], create_time)
@@ -158,20 +158,40 @@ _endpoint_cache: dict[int, tuple[list["ModelEndpoint"], float]] = {}
 _ENDPOINT_CACHE_TTL = 60  # 1 minute
 
 
-def _get_cached_provider(provider_id: int, provider_type: str, api_key: str, base_url: str, extra_config: dict[str, Any] | None = None) -> BaseProvider:
-    """Get or create a cached provider instance."""
+def _get_cached_provider(provider_id: int, provider_type: str, api_key: str, base_url: str,
+                         extra_config: dict[str, Any] | None = None,
+                         api_format: str = "",
+                         proxy: str = "") -> BaseProvider:
+    """Get or create a cached provider instance.
+
+    ``api_format`` allows per-model SDK override: when non-empty it replaces
+    ``provider_type`` for the provider class lookup while the connection
+    details (base_url, api_key, extra_config) still come from the provider.
+    This enables relay/aggregator scenarios where one provider connection
+    serves multiple vendor SDKs.
+
+    ``proxy`` is per-model: when non-empty, it overrides any proxy in
+    extra_config and the cache key includes it so models with different
+    proxies get separate provider instances.
+    """
+    resolved_type = api_format if api_format else provider_type
+    cache_key = (provider_id, resolved_type, proxy)
     now = time.time()
-    cached = _provider_cache.get(provider_id)
+    cached = _provider_cache.get(cache_key)
     if cached:
         instance, create_time = cached
         if now - create_time < _PROVIDER_CACHE_TTL:
             return instance
+    # Merge proxy into extra_config if provided
+    merged_config = dict(extra_config) if extra_config else {}
+    if proxy:
+        merged_config["proxy"] = proxy
     # Create new instance
-    cls = PROVIDER_TYPE_MAP.get(provider_type)
+    cls = PROVIDER_TYPE_MAP.get(resolved_type)
     if cls is None:
-        raise ValueError(f"Unsupported provider type: {provider_type}")
-    instance = cls(api_key=api_key, base_url=base_url, extra_config=extra_config)
-    _provider_cache[provider_id] = (instance, now)
+        raise ValueError(f"Unsupported provider type: {resolved_type}")
+    instance = cls(api_key=api_key, base_url=base_url, extra_config=merged_config)
+    _provider_cache[cache_key] = (instance, now)
     return instance
 
 
@@ -234,17 +254,24 @@ RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 def is_retryable_error(error: Exception) -> bool:
-    """Determine if an error is worth retrying."""
+    """Determine if an error is worth retrying.
+
+    1. Prefer structured ``status_code`` attribute (httpx/openai errors).
+    2. Fall back to regex on ``str(error)`` for ProviderError / plain Exception.
+    """
+    # Structured attribute check (httpx.Response, openai, etc.)
+    status = getattr(error, "status_code", None)
+    if isinstance(status, int) and status in RETRYABLE_STATUS_CODES:
+        return True
+
+    # String-based fallback for ProviderError / plain exceptions
+    msg = str(error)
     import re
-    if isinstance(error, ProviderError):
-        msg = str(error)
-        match = re.search(r"HTTP\s+(\d{3})\b", msg)
-        if match:
-            status_code = int(match.group(1))
-            if status_code in RETRYABLE_STATUS_CODES:
-                return True
-        if "timeout" in msg.lower() or "timed out" in msg.lower():
-            return True
+    match = re.search(r"HTTP\s+(\d{3})\b", msg)
+    if match and int(match.group(1)) in RETRYABLE_STATUS_CODES:
+        return True
+    if "timeout" in msg.lower() or "timed out" in msg.lower():
+        return True
     return False
 
 
@@ -320,6 +347,8 @@ class GroupRouter:
                 api_key=provider.api_key,
                 base_url=provider.base_url,
                 extra_config=provider.extra_config,
+                api_format=m.api_format,
+                proxy=m.proxy,
             )
             endpoints.append(ModelEndpoint(m, provider_instance))
         

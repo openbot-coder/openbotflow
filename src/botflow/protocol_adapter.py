@@ -71,6 +71,8 @@ def internal_to_openai(internal: dict[str, Any]) -> dict[str, Any]:
             message["tool_calls"] = msg["tool_calls"]
         if msg.get("function_call"):
             message["function_call"] = msg["function_call"]
+        if msg.get("reasoning_content") is not None:
+            message["reasoning_content"] = msg["reasoning_content"]
         choices.append({
             "index": c.get("index", 0),
             "message": message,
@@ -97,10 +99,13 @@ def internal_to_anthropic(internal: dict[str, Any]) -> dict[str, Any]:
     msg = choice.get("message") or {}
     content_text = msg.get("content") or ""
     tool_calls = msg.get("tool_calls") or []
+    reasoning = msg.get("reasoning_content")
 
     usage = internal.get("usage", {})
 
     content: list[dict[str, Any]] = []
+    if reasoning:
+        content.append({"type": "thinking", "thinking": reasoning})
     if content_text:
         content.append({"type": "text", "text": content_text})
     for tc in tool_calls:
@@ -206,6 +211,16 @@ def internal_chunk_to_anthropic_sse(chunk: dict[str, Any]) -> list[dict[str, Any
         })
 
     # Content block delta (text)
+    reasoning = delta.get("reasoning_content")
+    if reasoning:
+        events.append({
+            "type": "content_block_delta",
+            "index": choice.get("index", 0),
+            "delta": {
+                "type": "thinking_delta",
+                "thinking": reasoning,
+            },
+        })
     if content:
         events.append({
             "type": "content_block_delta",
@@ -320,3 +335,284 @@ def _anthropic_stop_reason(finish_reason: str) -> str:
         "tool_calls": "tool_use",
     }
     return mapping.get(finish_reason, "end_turn")
+
+
+# ---------------------------------------------------------------------------
+# OpenAI Responses API  (POST /v1/responses)
+# ---------------------------------------------------------------------------
+
+def responses_to_internal(body: dict[str, Any]) -> dict[str, Any]:
+    """Convert an OpenAI Responses API request to internal parameters.
+
+    ``input`` is either a plain string or a list of content items.
+    ``instructions`` becomes the system prompt.
+    """
+    # --- build messages from input + instructions ---
+    instructions = body.get("instructions", "")
+    raw_input = body.get("input", "")
+
+    if isinstance(raw_input, str):
+        # Simple string → single user message
+        messages: list[dict[str, Any]] = []
+        if instructions:
+            messages.append({"role": "system", "content": instructions})
+        if raw_input:
+            messages.append({"role": "user", "content": raw_input})
+    elif isinstance(raw_input, list):
+        # Array of content items – convert to messages
+        messages = _responses_input_to_messages(raw_input, instructions)
+    else:
+        messages = []
+
+    return {
+        "messages": messages,
+        "model": body.get("model", ""),
+        "temperature": body.get("temperature"),
+        "max_tokens": body.get("max_output_tokens") or body.get("max_tokens"),
+        "stream": body.get("stream", False),
+        "extra": {
+            k: v for k, v in body.items()
+            if k not in (
+                "input", "instructions", "model", "temperature",
+                "max_output_tokens", "max_tokens", "stream",
+            )
+        },
+    }
+
+
+def _responses_input_to_messages(
+    items: list[dict[str, Any]], instructions: str,
+) -> list[dict[str, Any]]:
+    """Convert Responses API ``input`` array to OpenAI-style messages."""
+    messages: list[dict[str, Any]] = []
+    if instructions:
+        messages.append({"role": "system", "content": instructions})
+
+    for item in items:
+        role = item.get("role", "user")
+        content = item.get("content", "")
+
+        if isinstance(content, str):
+            messages.append({"role": role, "content": content})
+        elif isinstance(content, list):
+            # Flatten content parts to a single string (image_url parts ignored
+            # for now as they need special handling at provider level).
+            parts = []
+            for part in content:
+                if part.get("type") == "input_text":
+                    parts.append(part.get("text", ""))
+                elif part.get("type") == "text":
+                    parts.append(part.get("text", ""))
+                elif part.get("type") == "input_image":
+                    pass  # TODO: image support
+            messages.append({"role": role, "content": " ".join(parts) if parts else ""})
+        else:
+            messages.append({"role": role, "content": str(content)})
+
+    return messages
+
+
+def internal_to_responses(internal: dict[str, Any]) -> dict[str, Any]:
+    """Convert a unified internal response to OpenAI Responses API format."""
+    choices = internal.get("choices") or []
+    choice = choices[0] if choices and choices[0] is not None else {}
+    msg = choice.get("message") or {}
+    content_text = msg.get("content") or ""
+    tool_calls = msg.get("tool_calls") or []
+    reasoning = msg.get("reasoning_content")
+
+    usage = internal.get("usage", {})
+    finish_reason = choice.get("finish_reason") or "stop"
+
+    # --- build output array ---
+    output: list[dict[str, Any]] = []
+    output_text = ""
+
+    if reasoning:
+        output.append({
+            "id": "out_" + _now_hex(),
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": reasoning}],
+            "status": "completed",
+        })
+
+    if content_text:
+        text_id = "out_" + _now_hex()
+        output.append({
+            "id": text_id,
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{
+                "type": "output_text",
+                "text": content_text,
+                "annotations": [],
+            }],
+        })
+        output_text = content_text
+
+    for tc in tool_calls:
+        tc_id = "out_" + _now_hex()
+        tc_func = tc.get("function", {})
+        output.append({
+            "id": tc_id,
+            "type": "function_call",
+            "call_id": tc.get("id", "call_" + _now_hex()),
+            "name": tc_func.get("name", ""),
+            "arguments": tc_func.get("arguments", "{}"),
+            "status": "completed",
+        })
+
+    # --- status mapping ---
+    status = "completed"
+    if finish_reason == "length":
+        status = "incomplete"
+
+    return {
+        "id": internal.get("id", "resp_" + _now_hex()),
+        "object": "response",
+        "created_at": _now_timestamp(),
+        "status": status,
+        "error": None,
+        "incomplete_details": None if status == "completed" else {
+            "reason": "max_output_tokens",
+        },
+        "model": internal.get("model", ""),
+        "output": output,
+        "output_text": output_text,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        },
+        "temperature": None,
+        "tools": [],
+    }
+
+
+def internal_chunk_to_responses_sse(
+    chunk: dict[str, Any],
+    *,
+    is_first: bool = False,
+    is_last: bool = False,
+    response_id: str = "",
+    created_at: int = 0,
+) -> list[dict[str, Any]]:
+    """Convert an internal stream chunk to Responses API SSE events.
+
+    Returns a list of SSE event dicts for the Responses streaming protocol.
+    """
+    events: list[dict[str, Any]] = []
+    choices = chunk.get("choices") or []
+    if not choices or choices[0] is None:
+        return events
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return events
+
+    delta = choice.get("delta") or {}
+    content = delta.get("content") or ""
+    finish_reason = choice.get("finish_reason")
+    model = chunk.get("model", "")
+
+    # --- response.created (first chunk only) ---
+    if is_first:
+        events.append({
+            "type": "response.created",
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "created_at": created_at,
+                "status": "in_progress",
+                "model": model,
+                "output": [],
+                "usage": None,
+            },
+        })
+        events.append({
+            "type": "response.in_progress",
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "status": "in_progress",
+                "output": [],
+            },
+        })
+
+    # --- output_text.delta ---
+    if content:
+        events.append({
+            "type": "response.output_text.delta",
+            "item_id": delta.get("_item_id", "out_" + _now_hex()),
+            "output_index": 0,
+            "content_index": 0,
+            "delta": content,
+        })
+
+    # --- reasoning_content delta ---
+    reasoning = delta.get("reasoning_content")
+    if reasoning:
+        events.append({
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": delta.get("_reasoning_item_id", "out_" + _now_hex()),
+            "output_index": 0,
+            "content_index": 0,
+            "delta": reasoning,
+        })
+
+    # --- tool_calls ---
+    tool_calls = delta.get("tool_calls")
+    if tool_calls:
+        for tc in tool_calls:
+            tc_func = tc.get("function", {})
+            if tc_func.get("name"):
+                events.append({
+                    "type": "response.function_call_arguments.start",
+                    "item_id": "out_" + _now_hex(),
+                    "output_index": 0,
+                    "name": tc_func["name"],
+                })
+            if tc_func.get("arguments"):
+                events.append({
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": 0,
+                    "arguments_delta": tc_func["arguments"],
+                })
+
+    # --- finish ---
+    if is_last or finish_reason:
+        reason = "stop"
+        if finish_reason == "length":
+            reason = "max_output_tokens"
+        usage = chunk.get("usage", {})
+        events.append({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "out_" + _now_hex(),
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "text": "",
+                    "annotations": [],
+                }],
+            },
+        })
+        events.append({
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "status": "completed",
+                "output": [],
+                "usage": {
+                    "input_tokens": usage.get("prompt_tokens", 0),
+                    "output_tokens": usage.get("completion_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                },
+            },
+        })
+
+    return events
