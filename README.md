@@ -19,14 +19,19 @@ botflow 是一个轻量级 AI 中间件平台，提供三大核心能力：
 
 ## 核心特性
 
-- **双协议兼容** - 同时支持 OpenAI 和 Anthropic API 格式
-- **分组路由** - 权重随机选择，支持跨 Provider 模型混合调度
+- **四种 API 格式** - OpenAI Chat Completions / Responses、Anthropic Messages、Google Gemini、DeepSeek 全兼容
+- **per-model SDK 覆盖** - `api_format` 字段实现单 Provider 聚合多厂商模型（中转站场景）
+- **分组路由** - 权重随机选择，支持跨 Provider 模型混合调度，失败自动降级到 fallback group
 - **错误容错** - 自动重试、冷却机制、故障转移
+- **Context Window Truncation** - 按最小上下文窗口截断超长消息（BM25 相关性排序）
+- **Per-model Proxy** - `extra_config["proxy"]` 指定独立 HTTP 代理
 - **REST 管理接口** - 通过 `/admin` HTTP API 管理 Provider/Model/Group，含管理 Key 鉴权
-- **多 API Key** - 支持多个客户端 Key，调用日志按 Key 隔离
+- **多 API Key** - 支持多个客户端 Key（sha256 哈希存储），调用日志按 Key 隔离
 - **调用审计** - 完整的调用日志、统计分析、成本追踪；每日生成 LLM Wiki 摘要
+- **Model Sync** - 从上游 `/v1/models` 自动发现并添加新模型，定时同步
+- **速率限制** - IP 级速率限制，防止暴力破解和 DoS 攻击
 - **异步架构** - 基于 aiosqlite 的全异步数据库操作
-- **安全防护** - 时序攻击防护、CORS 控制、速率限制
+- **安全防护** - 时序攻击防护、CORS 控制、SQL 注入防护
 
 ## 快速开始
 
@@ -90,6 +95,19 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 
 # List Models
 curl http://localhost:8080/v1/models
+```
+
+### OpenAI Responses API
+
+```bash
+# Responses（支持流式）
+curl -X POST http://localhost:8080/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <client-key>" \
+  -d '{
+    "input": "Hello!",
+    "model": "gpt-4o"
+  }'
 ```
 
 ### Anthropic 兼容
@@ -189,12 +207,15 @@ botflow 内置多项安全防护措施：
 ```
 botflow/
 ├── src/botflow/           # 源码
-│   ├── core.py            # FastAPI 主服务
+│   ├── core.py            # FastAPI 主服务 + 路由/流式/每日维护
 │   ├── router.py          # 路由引擎
-│   ├── protocol_adapter.py # 协议适配
-│   ├── providers/         # LLM Provider 适配
+│   ├── protocol_adapter.py# 协议适配（4 种 API 格式）
+│   ├── auth.py            # 鉴权中间件
 │   ├── admin_api.py       # REST 管理接口
-│   └── storage/           # 数据库层 (aiosqlite) + 每日摘要
+│   ├── daily_summary.py   # 每日摘要定时任务
+│   ├── rate_limit.py      # IP 级速率限制
+│   ├── providers/         # LLM Provider 适配
+│   └── storage/           # 数据库层 (aiosqlite)
 ├── tests/                 # 测试
 ├── docs/                  # 文档
 │   ├── design.md          # 设计文档
