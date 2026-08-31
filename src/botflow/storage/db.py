@@ -589,6 +589,28 @@ class Database:
             fallback_group_id=row["fallback_group_id"],
         )
 
+    async def find_groups_by_model_name(self, model_name: str, enabled_only: bool = True) -> list[ModelGroup]:
+        """Find all groups that contain a model with the given name.
+
+        Searches the ``models`` table by name, then joins ``group_models``
+        to return the owning groups.  Used for model-name-based routing.
+        """
+        conn = await self._ensure_connection()
+        sql = """
+            SELECT DISTINCT mg.*
+            FROM model_groups mg
+            JOIN group_models gm ON gm.group_id = mg.id
+            JOIN models m ON m.id = gm.model_id
+            WHERE m.name = ?
+        """
+        params: list[Any] = [model_name]
+        if enabled_only:
+            sql += " AND mg.is_enabled = 1 AND gm.is_enabled = 1 AND m.is_enabled = 1"
+        sql += " ORDER BY mg.name"
+        cursor = await conn.execute(sql, params)
+        rows = await cursor.fetchall()
+        return [self._row_to_group(r) for r in rows]
+
     # ------------------------------------------------------------------
     # Group-Model Association
     # ------------------------------------------------------------------
@@ -664,6 +686,7 @@ class Database:
             cooldown_failure_threshold=row["cooldown_failure_threshold"],
             context_window=row["context_window"] or 0,
             proxy=model_extra.get("proxy", ""),
+            extra_config=model_extra,
         )
 
     # ------------------------------------------------------------------

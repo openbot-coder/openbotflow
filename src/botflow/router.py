@@ -425,6 +425,7 @@ class GroupRouter:
             if context_window > 0:
                 messages = truncate_to_context_window(messages, context_window, max_tokens)
 
+            kwargs = self._apply_model_extra_config(kwargs, matching_ep.detail.extra_config)
             result = await self._attempt_call(matching_ep, messages, temperature, max_tokens, **kwargs)
             if result is not None:
                 result["_routing"] = {
@@ -483,6 +484,9 @@ class GroupRouter:
         if context_windows:
             messages = truncate_to_context_window(messages, min(context_windows), max_tokens)
 
+        # Apply extra_config stripping (reasoning_mode, strip_params) using the first endpoint's model config.
+        kwargs = self._apply_model_extra_config(kwargs, endpoints_ordered[0].detail.extra_config if endpoints_ordered else None)
+
         return {
             "endpoints": endpoints_ordered,
             "group_id": self.group_id,
@@ -491,6 +495,34 @@ class GroupRouter:
             "max_tokens": max_tokens,
             "kwargs": kwargs,
         }
+
+    @staticmethod
+    def _apply_model_extra_config(kwargs: dict[str, Any], model_extra_config: dict[str, Any] | None) -> dict[str, Any]:
+        """Strip model-unsupported kwargs based on extra_config.
+
+        Supported extra_config keys:
+          - ``strip_params``: list[str] — list of parameter names to always remove.
+          - ``reasoning_mode``: "off" — shorthand that adds reasoning_effort/reasoning_content to strip list.
+        """
+        cfg = model_extra_config or {}
+        strip_keys: set[str] = set()
+
+        # Collect explicit strip_params from config
+        explicit_strip = cfg.get("strip_params")
+        if isinstance(explicit_strip, list):
+            strip_keys.update(explicit_strip)
+
+        # reasoning_mode="off" is shorthand for stripping reasoning params
+        if cfg.get("reasoning_mode") == "off":
+            strip_keys.update({"reasoning_effort", "reasoning_content"})
+
+        # Per-request override: reasoning_mode="off" in kwargs also strips
+        if kwargs.get("reasoning_mode") == "off":
+            strip_keys.update({"reasoning_effort", "reasoning_content"})
+
+        if strip_keys:
+            kwargs = {k: v for k, v in kwargs.items() if k not in strip_keys}
+        return kwargs
 
     async def _attempt_call(
         self,

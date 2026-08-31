@@ -84,7 +84,8 @@ SAFE_EXTRA_KEYS = frozenset({
     "logit_bias", "logprobs", "max_completion_tokens", "max_tokens",
     "metadata", "modalities", "moderation", "n", "parallel_tool_calls",
     "prediction", "presence_penalty", "prompt_cache_key",
-    "prompt_cache_retention", "reasoning_effort", "reasoning_content", "response_format",
+    "prompt_cache_retention", "reasoning_effort", "reasoning_content",
+    "reasoning_mode", "response_format",
     "safety_identifier", "seed", "service_tier", "stop", "store",
     "stream_options", "temperature", "tool_choice", "tools",
     "top_logprobs", "top_p", "user", "verbosity", "web_search_options",
@@ -280,12 +281,16 @@ async def lifespan(app: FastAPI):
 
     db = _get_db()
 
-    # Auto-configure legacy LLM key from environment (single-key deployments).
-    env_llm_key = os.environ.get("LLM_KEY", "")
-    if env_llm_key and not (get_config().llm_key or await db.list_api_keys()):
-        # Persist into the multi-key table so logs are attributed.
-        await db.create_api_key(env_llm_key, label="env:LLM_KEY")
-        log.info("Legacy LLM key from environment registered as API key.")
+    # Auto-configure legacy LLM key into the multi-key table (for log attribution).
+    existing = await db.list_api_keys()
+    if not existing:
+        # Try DB config first (``botflow set llm-key``), then env var fallback.
+        db_llm_key = await db.get_config("llm_key")
+        if not db_llm_key:
+            db_llm_key = os.environ.get("LLM_KEY", "")
+        if db_llm_key:
+            await db.create_api_key(db_llm_key, label="legacy:llm_key")
+            log.info("Legacy LLM key registered as API key for log attribution.")
 
     if not get_config().admin_key:
         log.warning("No admin key configured (BOTFLOW_ADMIN_KEY). "
@@ -601,19 +606,29 @@ async def _get_router(group_id: int) -> GroupRouter:
 async def _get_group_id(request_body: dict) -> int:
     """Determine the group ID from the model name in the request.
 
-    The model field specifies which model group to route through.
+    Resolution order:
+      1. Exact group name match (``model`` == group.name)
+      2. Model name match (``model`` == model.name → first owning group)
+      3. First enabled group as default
+
     Defaults to group 1 if not found.
     """
     model_name = request_body.get("model", "")
     db = _get_db()
-    groups = await db.list_groups(enabled_only=True)
 
-    # Try exact name match
+    # 1) Exact group name match
+    groups = await db.list_groups(enabled_only=True)
     for g in groups:
         if g.name == model_name:
             return g.id
 
-    # Try first enabled group as default
+    # 2) Model name match — find groups that contain this model
+    if model_name:
+        model_groups = await db.find_groups_by_model_name(model_name, enabled_only=True)
+        if model_groups:
+            return model_groups[0].id
+
+    # 3) First enabled group as default
     if groups:
         return groups[0].id
 

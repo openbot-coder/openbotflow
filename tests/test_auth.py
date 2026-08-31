@@ -59,11 +59,13 @@ class TestResolveApiKey:
     async def test_no_keys_legacy_match(self, db, monkeypatch):
         set_config(BotflowSettings(llm_key="legacy-key"))
         try:
+            await db.set_config("llm_key", "legacy-key")
             ak = await resolve_api_key(db, "legacy-key")
             assert ak.id == 0 and ak.label == "legacy"
             assert await resolve_api_key(db, "wrong") is None
         finally:
             set_config(None)
+            await db.set_config("llm_key", "")
 
     async def test_no_keys_no_legacy(self, db, monkeypatch):
         set_config(BotflowSettings(llm_key=""))
@@ -92,6 +94,7 @@ class TestVerifyLLMKey:
     async def test_valid_stashes_state(self, db, monkeypatch):
         set_config(BotflowSettings(llm_key="legacy-key"))
         try:
+            await db.set_config("llm_key", "legacy-key")
             class Req:
                 def __init__(self):
                     self.state = type("S", (), {})()
@@ -100,10 +103,12 @@ class TestVerifyLLMKey:
             assert ak.id == 0 and req.state.api_key_id == 0 and req.state.api_key is ak
         finally:
             set_config(None)
+            await db.set_config("llm_key", "")
 
     async def test_credentials_object_preferred(self, db, monkeypatch):
         set_config(BotflowSettings(llm_key="legacy-key"))
         try:
+            await db.set_config("llm_key", "legacy-key")
             class Req:
                 def __init__(self):
                     self.state = type("S", (), {})()
@@ -113,12 +118,14 @@ class TestVerifyLLMKey:
             assert ak.id == 0
         finally:
             set_config(None)
+            await db.set_config("llm_key", "")
 
     async def test_uses_module_get_db_when_db_none(self, db, monkeypatch):
         # Cover the `if db is None: db = get_db()` branch by not passing db.
         monkeypatch.setattr("botflow.auth.get_db", lambda: db)
         set_config(BotflowSettings(llm_key="legacy-key"))
         try:
+            await db.set_config("llm_key", "legacy-key")
             class Req:
                 def __init__(self):
                     self.state = type("S", (), {})()
@@ -127,6 +134,7 @@ class TestVerifyLLMKey:
             assert ak.id == 0
         finally:
             set_config(None)
+            await db.set_config("llm_key", "")
 
 
 class TestVerifyAdminKey:

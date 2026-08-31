@@ -168,6 +168,11 @@ def cmd_set(args):
     async def _set():
         async with db:
             await db.set_config(args.key, args.value)
+            # Auto-register llm_key in the api_keys table for immediate auth use.
+            if args.key == "llm_key" and args.value:
+                existing = await db.list_api_keys()
+                if not existing:
+                    await db.create_api_key(args.value, label="legacy:llm_key")
             print(f"Config set: {args.key} = {args.value}")
 
     asyncio.run(_set())

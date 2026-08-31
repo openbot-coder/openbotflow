@@ -137,8 +137,28 @@ def internal_to_anthropic(internal: dict[str, Any]) -> dict[str, Any]:
 
 
 def internal_chunk_to_openai_sse(chunk: dict[str, Any]) -> dict[str, Any]:
-    """Convert an internal stream chunk to OpenAI SSE format."""
+    """Convert an internal stream chunk to OpenAI SSE format.
+
+    Handles the special *usage-only* final chunk that providers send when
+    ``stream_options.include_usage`` is true: this chunk has ``choices: []``
+    and carries only the ``usage`` field.  In that case we emit an empty
+    choices array so the client sees a clean usage payload without a
+    phantom zeroth choice.
+    """
     choices = chunk.get("choices", [])
+    usage = chunk.get("usage")
+
+    # Usage-only final chunk (choices is empty) — forward usage without choices
+    if not choices and usage:
+        return {
+            "id": chunk.get("id", ""),
+            "object": "chat.completion.chunk",
+            "created": _now_timestamp(),
+            "model": chunk.get("model", ""),
+            "choices": [],
+            "usage": usage,
+        }
+
     choice = choices[0] if choices else {}
     delta = choice.get("delta", {})
 
@@ -170,7 +190,6 @@ def internal_chunk_to_openai_sse(chunk: dict[str, Any]) -> dict[str, Any]:
     }
 
     # Include usage on the final chunk
-    usage = chunk.get("usage")
     if usage:
         sse_chunk["usage"] = usage
 

@@ -32,8 +32,9 @@ async def resolve_api_key(db: Database, token: str) -> ApiKey | None:
     Resolution order:
       1. If any client API keys are registered in the DB, the token must match
          one of them (by sha256 hash) and be enabled.
-      2. Otherwise fall back to the legacy single BOTFLOW_LLM_KEY from config,
-         preserving backward compatibility for single-key deployments.
+      2. Otherwise fall back to the legacy single key stored in the DB config
+         table (key="llm_key"), preserving backward compatibility for deployments
+         that used ``botflow set llm-key`` instead of the multi-key apikey commands.
     """
     configured = await db.list_api_keys()
     if configured:
@@ -42,10 +43,9 @@ async def resolve_api_key(db: Database, token: str) -> ApiKey | None:
             if row.is_enabled and row.key_hash == key_hash:
                 return row
         return None
-    # Legacy single-key mode.
-    legacy = get_config().llm_key
+    # Legacy single-key mode — read from DB config table (set via ``botflow set llm-key``).
+    legacy = await db.get_config("llm_key")
     if legacy and secrets.compare_digest(token, legacy):
-        # Synthesize a pseudo ApiKey so callers always get an id (0 = legacy).
         return ApiKey(id=0, key_hash=db.hash_key(token), label="legacy", is_enabled=True)
     return None
 
