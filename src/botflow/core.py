@@ -606,33 +606,20 @@ async def _get_router(group_id: int) -> GroupRouter:
 async def _get_group_id(request_body: dict) -> int:
     """Determine the group ID from the model name in the request.
 
-    Resolution order:
-      1. Exact group name match (``model`` == group.name)
-      2. Model name match (``model`` == model.name → first owning group)
-      3. First enabled group as default
-
-    Defaults to group 1 if not found.
+    Only exact group name match is accepted. Direct LLM model names
+    (e.g. "mimo-v2.5", "gpt-4o") are rejected — callers must use a
+    group name (e.g. "fast", "smart") instead.
     """
     model_name = request_body.get("model", "")
     db = _get_db()
 
-    # 1) Exact group name match
+    # Exact group name match
     groups = await db.list_groups(enabled_only=True)
     for g in groups:
         if g.name == model_name:
             return g.id
 
-    # 2) Model name match — find groups that contain this model
-    if model_name:
-        model_groups = await db.find_groups_by_model_name(model_name, enabled_only=True)
-        if model_groups:
-            return model_groups[0].id
-
-    # 3) First enabled group as default
-    if groups:
-        return groups[0].id
-
-    raise HTTPException(status_code=400, detail=f"No enabled group found for model '{model_name}'")
+    raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found. Use a group name (e.g. 'fast', 'smart') instead.")
 
 
 async def _log_call(
