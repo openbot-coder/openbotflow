@@ -838,21 +838,28 @@ async def responses_create(request: Request):
 
 @app.get("/v1/models")
 async def list_models(request: Request):
-    """List available models. Supports both OpenAI and Anthropic clients."""
+    """List available models (groups).
+
+    Only user-facing groups are returned. Raw backend provider models synced
+    from upstream ``/v1/models`` endpoints are filtered out, since callers must
+    address a group name (e.g. ``fast``, ``smart``) rather than an individual
+    backend model. Each entry also lists the backend models it routes to.
+    """
     accept = request.headers.get("accept", "")
     db = _get_db()
-    models = await db.list_models(enabled_only=True)
-    providers_list = await db.list_providers(enabled_only=True)
+    groups = await db.list_groups(enabled_only=True)
 
     model_list = []
-    for m in models:
-        provider = next((p for p in providers_list if p.id == m.provider_id), None)
+    for g in groups:
+        member_models = await db.get_group_models(g.id, enabled_only=True)
+        model_names = sorted({gm.model_name for gm in member_models})
         model_list.append({
-            "id": m.name,
-            "name": m.name,
-            "display_name": m.display_name or m.name,
-            "provider_type": provider.provider_type if provider else "unknown",
-            "created_at": m.created_at.isoformat() if m.created_at else "",
+            "id": g.name,
+            "name": g.name,
+            "display_name": g.description or g.name,
+            "provider_type": "botflow-group",
+            "created_at": "",
+            "models": model_names,
         })
 
     # Return Anthropic format if client is Anthropic
