@@ -425,7 +425,6 @@ class GroupRouter:
             if context_window > 0:
                 messages = truncate_to_context_window(messages, context_window, max_tokens)
 
-            kwargs = self._apply_model_extra_config(kwargs, matching_ep.detail.extra_config)
             result = await self._attempt_call(matching_ep, messages, temperature, max_tokens, **kwargs)
             if result is not None:
                 result["_routing"] = {
@@ -484,8 +483,7 @@ class GroupRouter:
         if context_windows:
             messages = truncate_to_context_window(messages, min(context_windows), max_tokens)
 
-        # Apply extra_config stripping (reasoning_mode, strip_params) using the first endpoint's model config.
-        kwargs = self._apply_model_extra_config(kwargs, endpoints_ordered[0].detail.extra_config if endpoints_ordered else None)
+        # extra_config filtering is now done per-endpoint inside _attempt_call
 
         return {
             "endpoints": endpoints_ordered,
@@ -536,6 +534,9 @@ class GroupRouter:
 
         Returns the response dict on success, or None on failure (for fallback).
         """
+        # Apply per-endpoint extra_config filtering (strip_params, reasoning_mode)
+        kwargs = self._apply_model_extra_config(kwargs, ep.detail.extra_config)
+        
         last_error: Exception | None = None
 
         for attempt in range(ep.max_retries):

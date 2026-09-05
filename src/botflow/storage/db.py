@@ -13,7 +13,6 @@ Tables:
 
 from __future__ import annotations
 
-import gzip
 import hashlib
 import json
 import sqlite3
@@ -23,8 +22,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 import aiosqlite
-from loguru import logger
-
 from botflow.storage.models import (
     ApiKey,
     CallLog,
@@ -36,7 +33,6 @@ from botflow.storage.models import (
     ModelGroup,
     ModelStats,
     Provider,
-    RawSession,
 )
 
 CREATE_TABLES_SQL = """
@@ -610,6 +606,47 @@ class Database:
         cursor = await conn.execute(sql, params)
         rows = await cursor.fetchall()
         return [self._row_to_group(r) for r in rows]
+
+    async def list_groups_with_models(self, enabled_only: bool = True) -> list[dict[str, Any]]:
+        """Batch-fetch all groups with their member model names in one query.
+
+        Returns a list of dicts, each containing the group's ModelGroup
+        fields plus a ``model_names`` list of unique model names.  This avoids
+        the N+1 pattern of calling ``list_groups`` + ``get_group_models`` per
+        group (used by the ``/v1/models`` endpoint).
+        """
+        conn = await self._ensure_connection()
+        sql = """
+            SELECT
+                mg.id, mg.name, mg.description, mg.is_enabled,
+                m.name AS model_name
+            FROM model_groups mg
+            JOIN group_models gm ON gm.group_id = mg.id
+            JOIN models m ON m.id = gm.model_id
+            JOIN providers p ON p.id = m.provider_id
+        """
+        params: list[Any] = []
+        if enabled_only:
+            sql += " WHERE mg.is_enabled = 1 AND gm.is_enabled = 1 AND m.is_enabled = 1 AND p.is_enabled = 1"
+        sql += " ORDER BY mg.name, m.name"
+        cursor = await conn.execute(sql, params)
+        rows = await cursor.fetchall()
+
+        # Group results by group id
+        groups_map: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            gid = row["id"]
+            if gid not in groups_map:
+                groups_map[gid] = {
+                    "id": gid,
+                    "name": row["name"],
+                    "description": row["description"],
+                    "is_enabled": bool(row["is_enabled"]),
+                    "model_names": [],
+                }
+            groups_map[gid]["model_names"].append(row["model_name"])
+
+        return list(groups_map.values())
 
     # ------------------------------------------------------------------
     # Group-Model Association

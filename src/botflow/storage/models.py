@@ -82,7 +82,7 @@ class GroupModelWithDetails(BaseModel):
     cooldown_failure_threshold: int
     context_window: int = 0
     proxy: str = ""  # per-model proxy from model.extra_config["proxy"]
-    extra_config: dict = {}  # full model.extra_config dict
+    extra_config: dict[str, Any] = Field(default_factory=dict)  # full model.extra_config dict
 
 
 class CallLog(BaseModel):

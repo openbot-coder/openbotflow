@@ -85,7 +85,7 @@ SAFE_EXTRA_KEYS = frozenset({
     "metadata", "modalities", "moderation", "n", "parallel_tool_calls",
     "prediction", "presence_penalty", "prompt_cache_key",
     "prompt_cache_retention", "reasoning_effort", "reasoning_content",
-    "reasoning_mode", "response_format",
+    "response_format",
     "safety_identifier", "seed", "service_tier", "stop", "store",
     "stream_options", "temperature", "tool_choice", "tools",
     "top_logprobs", "top_p", "user", "verbosity", "web_search_options",
@@ -280,6 +280,14 @@ async def lifespan(app: FastAPI):
     app.include_router(admin_router)
 
     db = _get_db()
+
+    # Sync env LLM_KEY to DB config if not already set (single source of truth).
+    env_llm_key = os.environ.get("LLM_KEY", "")
+    if env_llm_key:
+        db_llm_key = await db.get_config("llm_key")
+        if not db_llm_key:
+            await db.set_config("llm_key", env_llm_key)
+            log.info("Synced LLM_KEY from environment to DB config.")
 
     # Auto-configure legacy LLM key into the multi-key table (for log attribution).
     existing = await db.list_api_keys()
@@ -606,20 +614,37 @@ async def _get_router(group_id: int) -> GroupRouter:
 async def _get_group_id(request_body: dict) -> int:
     """Determine the group ID from the model name in the request.
 
-    Only exact group name match is accepted. Direct LLM model names
-    (e.g. "mimo-v2.5", "gpt-4o") are rejected — callers must use a
-    group name (e.g. "fast", "smart") instead.
+    Resolution order (backward-compatible):
+    1. Exact group name match.
+    2. Look up groups containing a model with the given name.
+    3. Fallback to the first enabled group (legacy behaviour) with a
+       deprecation warning — never returns 404.
     """
     model_name = request_body.get("model", "")
     db = _get_db()
 
-    # Exact group name match
+    # 1) Exact group name match
     groups = await db.list_groups(enabled_only=True)
     for g in groups:
         if g.name == model_name:
             return g.id
 
-    raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found. Use a group name (e.g. 'fast', 'smart') instead.")
+    # 2) Try to find a group that contains this model
+    matched = await db.find_groups_by_model_name(model_name, enabled_only=True)
+    if matched:
+        log.debug("Model '{}' resolved to group '{}' via find_groups_by_model_name", model_name, matched[0].name)
+        return matched[0].id
+
+    # 3) Fallback to first enabled group (legacy behaviour)
+    if groups:
+        log.warning(
+            "DEPRECATION: Model '{}' does not match any group name or member model. "
+            "Falling back to group '{}'. Please use a group name directly.",
+            model_name, groups[0].name,
+        )
+        return groups[0].id
+
+    raise HTTPException(status_code=404, detail="No enabled groups configured. Create a group via the admin API.")
 
 
 async def _log_call(

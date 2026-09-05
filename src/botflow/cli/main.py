@@ -173,6 +173,9 @@ def cmd_set(args):
                 existing = await db.list_api_keys()
                 if not existing:
                     await db.create_api_key(args.value, label="legacy:llm_key")
+                    print(f"Config set: {args.key} = {args.value}")
+                    print(f"  → Auto-registered as API key (label: legacy:llm_key) for backward compatibility.")
+                    return
             print(f"Config set: {args.key} = {args.value}")
 
     asyncio.run(_set())
