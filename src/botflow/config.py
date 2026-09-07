@@ -34,6 +34,18 @@ class BotflowSettings(BaseSettings):
     # Streaming: max seconds to wait for the first chunk before failed
     stream_timeout: float = 30.0
 
+    # Upstream concurrency limit per provider.
+    #
+    # When > 0, each provider gets an asyncio.Semaphore of this size; concurrent
+    # chat/chat_stream calls against the same provider are queued once the limit
+    # is reached. This prevents a burst of requests from overwhelming a single
+    # upstream, which can otherwise cause all in-flight requests to timeout
+    # simultaneously (the "thundering herd" that produces "timed out waiting for
+    # first chunk" spikes seen on upstream providers).
+    #
+    # 0 disables the semaphore (unlimited concurrency, the historical default).
+    upstream_semaphore_size: int = 0
+
     # ── Call-log retention ──
     # Detailed call_logs are kept for this many days, then big fields are purged
     # but the stats columns are retained.

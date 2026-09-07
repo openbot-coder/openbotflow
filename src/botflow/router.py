@@ -6,6 +6,7 @@ import asyncio
 import random
 import time
 from dataclasses import dataclass
+from contextlib import nullcontext
 from typing import Any
 
 
@@ -25,6 +26,35 @@ from botflow.storage.db import Database
 from botflow.storage.models import GroupModelWithDetails
 
 log = get_logger("router")
+
+# ---------------------------------------------------------------------------
+# Per-provider concurrency semaphore (shared across all groups)
+# ---------------------------------------------------------------------------
+
+_provider_semaphores: dict[int, asyncio.Semaphore | None] = {}
+
+
+def _ensure_provider_semaphore(provider_id: int, size: int) -> asyncio.Semaphore | None:
+    """Return the cached semaphore for ``provider_id``, creating it if needed.
+
+    If ``size <= 0`` the provider is considered unlimited-concurrency and the
+    function returns ``None`` (callers should skip the ``async with``).
+    """
+    entry = _provider_semaphores.get(provider_id)
+    if entry is not None:
+        return entry
+    if size <= 0:
+        _provider_semaphores[provider_id] = None
+        return None
+    sem = asyncio.Semaphore(size)
+    _provider_semaphores[provider_id] = sem
+    return sem
+
+
+def _noop_asynccontext() -> Any:
+    """Context manager that does nothing — used when no semaphore is configured."""
+    return nullcontext()
+
 
 # ---------------------------------------------------------------------------
 # Cooldown state
@@ -536,12 +566,19 @@ class GroupRouter:
         """
         # Apply per-endpoint extra_config filtering (strip_params, reasoning_mode)
         kwargs = self._apply_model_extra_config(kwargs, ep.detail.extra_config)
-        
+
         last_error: Exception | None = None
+
+        # Acquire the provider-level concurrency semaphore (if configured).
+        # This is shared across all groups, so a burst against any group limits
+        # concurrent in-flight requests to the same upstream provider.
+        sem = _ensure_provider_semaphore(ep.detail.provider_id,
+                                         get_config().upstream_semaphore_size)
 
         for attempt in range(ep.max_retries):
             try:
-                result = await ep.provider.chat(
+                async with sem if sem is not None else _noop_asynccontext():
+                    result = await ep.provider.chat(
                     messages=messages,
                     model=ep.detail.model_name,
                     temperature=temperature,
