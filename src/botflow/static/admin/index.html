@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="CklgwajnadnUT24SKDQ1h6">
+<head data-page-node-id="PPxYGbe3NlZ8p9BXFrzEM6">
+<meta charset="utf-8" data-page-node-id="LPR3B4YgKIPvmRAMziVNWq">
+<meta name="viewport" content="width=device-width,initial-scale=1" data-page-node-id="haWcq9fNucpv5OGvFbecYE">
+<title>Botflow Admin</title>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0f172a;--sidebar:#1e293b;--main:#f1f5f9;--card:#fff;--border:#e2e8f0;--accent:#3b82f6;--accent-hover:#2563eb;--text:#1e293b;--text2:#64748b;--green:#22c55e;--red:#ef4444;--yellow:#f59e0b;--radius:8px;--shadow:0 1px 3px rgba(0,0,0,.1)}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--main);color:var(--text);height:100vh;overflow:hidden}
+/* Login */
+.login-wrap{display:flex;align-items:center;justify-content:center;height:100vh;background:linear-gradient(135deg,#0f172a 0%,#1e3a5f 100%)}
+.login-box{background:#fff;border-radius:12px;padding:48px 40px;width:380px;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+.login-box h1{font-size:24px;margin-bottom:8px;color:var(--text)}
+.login-box p{color:var(--text2);margin-bottom:24px;font-size:14px}
+/* Layout */
+.app-layout{display:flex;height:100vh}
+.sidebar{width:220px;background:var(--sidebar);color:#cbd5e1;display:flex;flex-direction:column;flex-shrink:0}
+.sidebar .logo{padding:20px 16px;font-size:18px;font-weight:700;color:#fff;border-bottom:1px solid rgba(255,255,255,.1)}
+.sidebar nav{flex:1;padding:12px 0}
+.sidebar nav a{display:flex;align-items:center;gap:10px;padding:10px 16px;color:#94a3b8;text-decoration:none;font-size:14px;transition:all .15s}
+.sidebar nav a:hover{background:rgba(255,255,255,.05);color:#fff}
+.sidebar nav a.active{background:rgba(59,130,246,.15);color:var(--accent);border-right:3px solid var(--accent)}
+.sidebar .footer{padding:12px 16px;border-top:1px solid rgba(255,255,255,.1);font-size:12px;color:#64748b}
+.main-content{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.topbar{height:56px;background:#fff;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 24px;flex-shrink:0}
+.topbar h2{font-size:16px;font-weight:600}
+.content{flex:1;overflow-y:auto;padding:24px}
+/* Cards & Tables */
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px;margin-bottom:24px}
+.stat-card{background:var(--card);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow)}
+.stat-card .label{font-size:13px;color:var(--text2);margin-bottom:4px}
+.stat-card .value{font-size:28px;font-weight:700}
+.card{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:16px}
+.card-header{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.card-header h3{font-size:15px;font-weight:600}
+.card-body{padding:20px}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;padding:10px 12px;font-size:12px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;border-bottom:2px solid var(--border)}
+td{padding:10px 12px;border-bottom:1px solid var(--border);font-size:14px;vertical-align:middle}
+tr:hover td{background:#f8fafc}
+/* Buttons */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:6px;border:none;font-size:13px;font-weight:500;cursor:pointer;transition:all .15s}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:var(--accent-hover)}
+.btn-danger{background:var(--red);color:#fff}.btn-danger:hover{background:#dc2626}
+.btn-ghost{background:transparent;color:var(--text2);border:1px solid var(--border)}.btn-ghost:hover{background:#f1f5f9}
+.btn-sm{padding:5px 10px;font-size:12px}
+/* Forms */
+.form-group{margin-bottom:16px}
+.form-group label{display:block;font-size:13px;font-weight:500;margin-bottom:4px;color:var(--text2)}
+.form-group input,.form-group select,.form-group textarea{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:6px;font-size:14px;outline:none;transition:border .15s}
+.form-group input:focus,.form-group select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(59,130,246,.1)}
+/* Badges */
+.badge{display:inline-block;padding:2px 8px;border-radius:9999px;font-size:11px;font-weight:600}
+.badge-green{background:#dcfce7;color:#166534}
+.badge-red{background:#fee2e2;color:#991b1b}
+.badge-yellow{background:#fef9c3;color:#854d0e}
+.badge-blue{background:#dbeafe;color:#1e40af}
+.badge-gray{background:#f1f5f9;color:#475569}
+/* Modal */
+.modal-mask{position:fixed;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;z-index:1000}
+.modal{background:#fff;border-radius:12px;width:500px;max-height:80vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+.modal-header{padding:20px 24px 0;font-size:18px;font-weight:600}
+.modal-body{padding:20px 24px}
+.modal-footer{padding:12px 24px 20px;display:flex;justify-content:flex-end;gap:8px}
+/* Toast */
+.toast-wrap{position:fixed;top:20px;right:20px;z-index:2000;display:flex;flex-direction:column;gap:8px}
+.toast{padding:12px 20px;border-radius:8px;color:#fff;font-size:14px;font-weight:500;animation:slideIn .3s}
+.toast-success{background:#22c55e}
+.toast-error{background:#ef4444}
+@keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:none;opacity:1}}
+/* Misc */
+.empty{text-align:center;padding:40px;color:var(--text2);font-size:14px}
+.loading{text-align:center;padding:40px;color:var(--text2)}
+.actions{display:flex;gap:6px}
+.code{font-family:'Fira Code',monospace;font-size:13px;background:#f1f5f9;padding:2px 6px;border-radius:4px}
+</style>
+</head>
+<body data-page-node-id="Iuh1icuGa7WN1xXl2Tq4qG">
+<div id="app" data-page-node-id="muykegCZEfWmQa5xhks3ol">
+  <!-- Toast notifications -->
+  <div class="toast-wrap" data-page-node-id="LY3WRECBVgoYSmi9A3Bir8">
+    <div v-for="(t,i) in toasts" :key="i" class="toast" :class="'toast-'+t.type" data-page-node-id="h55cCGCSFNgL8b17wte3s7">{{t.msg}}</div>
+  </div>
+
+  <!-- LOGIN PAGE -->
+  <div v-if="!authenticated" class="login-wrap" data-page-node-id="nfO1aANQ8GMmigpljJ2oBk">
+    <div class="login-box" data-page-node-id="KP6MziwV7ECMvKx3a8OjpG">
+      <h1 data-page-node-id="UxH4bmum5BrW9vetAEygTu">Botflow Admin</h1>
+      <p data-page-node-id="Srw4jv8By314h3q4WSqF9B">LLM 网关管理面板</p>
+      <div class="form-group" data-page-node-id="yacHVttRdmzXBmXrBSoED0">
+        <label data-page-node-id="KI5DzOhrGsEQM4Dybv3gMG">Admin Key</label>
+        <input v-model="loginKey" type="password" placeholder="输入管理员密钥" @keyup.enter="doLogin" data-page-node-id="mkLpiEQWjLzUKcK2yR6iIS">
+      </div>
+      <p v-if="loginError" style="color:#ef4444;font-size:13px;margin-bottom:12px" data-page-node-id="IdbetHvH4vNAFNDrjihHBi">{{loginError}}</p>
+      <button class="btn btn-primary" style="width:100%" @click="doLogin" :disabled="loginLoading" data-page-node-id="Ie95uPCBp8pOY7t4VIC8NV">
+        {{loginLoading ? '验证中...' : '登录'}}
+      </button>
+    </div>
+  </div>
+
+  <!-- MAIN APP -->
+  <div v-else class="app-layout" data-page-node-id="SG0sipggWr39m4GlcCkC7H">
+    <!-- Sidebar -->
+    <div class="sidebar" data-page-node-id="06nAhYTzp0HRKeXcE8hoGp">
+      <div class="logo" data-page-node-id="Ms2Mxywc1fRPQMppcSGTGv">Botflow</div>
+      <nav data-page-node-id="jfeaDlGispvy2mz9HV5BuF">
+        <a v-for="p in pages" :key="p.id" :class="{active:page===p.id}" @click="switchPage(p.id)" data-page-node-id="3EHdYAgHccvtDD1eCqW1WN">
+          <span v-html="p.icon" data-page-node-id="IxXsWnp027kxOeKs0a4TEu"></span>{{p.label}}
+        </a>
+      </nav>
+      <div class="footer" data-page-node-id="i695sV01xoJGk42fAs7OAg">
+        <a style="color:#94a3b8;cursor:pointer;text-decoration:none" @click="doLogout" data-page-node-id="RYe0eWSnTaaELFrlagW9k2">退出登录</a>
+      </div>
+    </div>
+
+    <!-- Content area -->
+    <div class="main-content" data-page-node-id="0d2JctDpElTFLTw2MoYEFM">
+      <div class="topbar" data-page-node-id="whg7964Pf2eh8gjmv6MBGg">
+        <h2 data-page-node-id="OZTpI9muaUa40VDWIYPE6g">{{currentPageLabel}}</h2>
+        <span style="font-size:13px;color:var(--text2)" data-page-node-id="lfydVJoFq7w8KANNR50lTx">Botflow v1.1.0</span>
+      </div>
+      <div class="content">
+
+        <!-- ===== DASHBOARD ===== -->
+        <div v-if="page==='dashboard'">
+          <div class="cards">
+            <div class="stat-card"><div class="label">供应商</div><div class="value">{{providers.length}}</div></div>
+            <div class="stat-card"><div class="label">模型</div><div class="value">{{models.length}}</div></div>
+            <div class="stat-card"><div class="label">分组</div><div class="value">{{groups.length}}</div></div>
+            <div class="stat-card"><div class="label">API Keys</div><div class="value">{{apikeys.length}}</div></div>
+          </div>
+          <div class="card">
+            <div class="card-header"><h3>模型调用统计 (Top 10)</h3></div>
+            <div class="card-body">
+              <table v-if="stats.length">
+                <thead><tr><th>模型</th><th>调用次数</th><th>成功</th><th>失败</th><th>花费</th></tr></thead>
+                <tbody><tr v-for="s in stats" :key="s.model_id">
+                  <td><span class="code">{{s.model_name}}</span></td>
+                  <td>{{s.total_calls}}</td>
+                  <td><span class="badge badge-green">{{s.success_calls}}</span></td>
+                  <td><span class="badge badge-red">{{s.error_calls}}</span></td>
+                  <td>¥{{(s.total_cost||0).toFixed(4)}}</td>
+                </tr></tbody>
+              </table>
+              <div v-else class="empty">暂无调用统计数据</div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header"><h3>路由策略</h3></div>
+            <div class="card-body">
+              <span v-for="s in strategies" :key="s" class="badge badge-blue" style="margin-right:6px">{{s}}</span>
+              <span v-if="!strategies.length" class="empty">无注册策略</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- ===== PROVIDERS ===== -->
+        <div v-if="page==='providers'">
+          <div style="margin-bottom:16px;text-align:right">
+            <button class="btn btn-primary" @click="openModal('新建供应商',{name:'',base_url:'',api_key:'',type:'openai'})">+ 新建供应商</button>
+          </div>
+          <div class="card">
+            <div class="card-body" style="padding:0">
+              <table v-if="providers.length">
+                <thead><tr><th>ID</th><th>名称</th><th>类型</th><th>Base URL</th><th>状态</th><th>操作</th></tr></thead>
+                <tbody><tr v-for="p in providers" :key="p.id">
+                  <td>{{p.id}}</td>
+                  <td><strong>{{p.name}}</strong></td>
+                  <td><span class="badge badge-blue">{{p.provider_type}}</span></td>
+                  <td><span class="code">{{p.base_url}}</span></td>
+                  <td><span :class="p.is_enabled?'badge badge-green':'badge badge-red'">{{p.is_enabled?'启用':'禁用'}}</span></td>
+                  <td class="actions">
+                    <button class="btn btn-ghost btn-sm" @click="openModal('编辑供应商',{...p}, 'edit')">编辑</button>
+                    <button class="btn btn-danger btn-sm" @click="deleteProvider(p.id)">删除</button>
+                  </td>
+                </tr></tbody>
+              </table>
+              <div v-else class="empty">暂无供应商，点击上方按钮新建</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ===== MODELS ===== -->
+        <div v-if="page==='models'">
+          <div style="margin-bottom:16px;text-align:right">
+            <button class="btn btn-primary" @click="openModal('新建模型',{provider_id:providers[0]?.id||1,name:'',context_window:0})">+ 新建模型</button>
+          </div>
+          <div class="card">
+            <div class="card-body" style="padding:0">
+              <table v-if="models.length">
+                <thead><tr><th>ID</th><th>名称</th><th>供应商</th><th>上下文窗口</th><th>重试</th><th>冷却</th><th>状态</th><th>操作</th></tr></thead>
+                <tbody><tr v-for="m in models" :key="m.id">
+                  <td>{{m.id}}</td>
+                  <td><strong>{{m.name}}</strong></td>
+                  <td><span class="badge badge-gray">{{providerName(m.provider_id)}}</span></td>
+                  <td>{{m.context_window||'-'}}</td>
+                  <td>{{m.max_retries}}</td>
+                  <td>{{m.cooldown_seconds}}s</td>
+                  <td><span :class="m.is_enabled?'badge badge-green':'badge badge-red'">{{m.is_enabled?'启用':'禁用'}}</span></td>
+                  <td class="actions">
+                    <button class="btn btn-ghost btn-sm" @click="openModal('编辑模型',{...m, provider_id:m.provider_id}, 'edit')">编辑</button>
+                    <button class="btn btn-ghost btn-sm" @click="toggleModel(m)">{{m.is_enabled?'禁用':'启用'}}</button>
+                    <button class="btn btn-danger btn-sm" @click="deleteModel(m.id)">删除</button>
+                  </td>
+                </tr></tbody>
+              </table>
+              <div v-else class="empty">暂无模型</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ===== GROUPS ===== -->
+        <div v-if="page==='groups'">
+          <div style="margin-bottom:16px;text-align:right">
+            <button class="btn btn-primary" @click="openModal('新建分组',{name:'',description:'',type:'random_weights'})">+ 新建分组</button>
+          </div>
+          <div v-for="g in groups" :key="g.id" class="card" style="margin-bottom:16px">
+            <div class="card-header">
+              <div>
+                <h3 style="display:inline">{{g.name}}</h3>
+                <span class="badge badge-blue" style="margin-left:8px">{{g.type}}</span>
+                <span v-if="g.fallback_group_id" class="badge badge-yellow" style="margin-left:4px">fallback→{{g.fallback_group_id}}</span>
+              </div>
+              <div class="actions">
+                <button class="btn btn-ghost btn-sm" @click="openModal('编辑分组',{...g, type:g.type}, 'edit')">编辑</button>
+                <button class="btn btn-danger btn-sm" @click="deleteGroup(g.id)">删除</button>
+              </div>
+            </div>
+            <div class="card-body" style="padding:0">
+              <p v-if="g.description" style="padding:0 20px 8px;color:var(--text2);font-size:13px">{{g.description}}</p>
+              <table>
+                <thead><tr><th>模型</th><th>供应商</th><th>权重</th><th>操作</th></tr></thead>
+                <tbody>
+                  <tr v-for="(gm,i) in groupModels(g.id)" :key="i">
+                    <td><span class="code">{{gm.model_name}}</span></td>
+                    <td>{{gm.provider_name}}</td>
+                    <td>{{gm.weight}}</td>
+                    <td><button class="btn btn-danger btn-sm" @click="removeModelFromGroup(g.id,gm.model_id)">移除</button></td>
+                  </tr>
+                  <tr v-if="!groupModels(g.id).length">
+                    <td colspan="4" class="empty" style="border:none">暂无模型，从下方添加</td>
+                  </tr>
+                </tbody>
+              </table>
+              <div style="padding:12px 20px;border-top:1px solid var(--border)">
+                <select v-model="newModelForGroup[g.id]" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;margin-right:8px">
+                  <option value="">选择模型...</option>
+                  <option v-for="m in models" :key="m.id" :value="m.id">{{m.name}}</option>
+                </select>
+                <button class="btn btn-ghost btn-sm" @click="doAddModelToGroup(g.id)" :disabled="!newModelForGroup[g.id]">添加</button>
+              </div>
+            </div>
+          </div>
+          <div v-if="!groups.length" class="empty">暂无分组</div>
+        </div>
+
+        <!-- ===== API KEYS ===== -->
+        <div v-if="page==='apikeys'">
+          <div style="margin-bottom:16px;text-align:right">
+            <button class="btn btn-primary" @click="openModal('新建 API Key',{raw_key:'',label:''})">+ 新建 Key</button>
+          </div>
+          <div class="card">
+            <div class="card-body" style="padding:0">
+              <table v-if="apikeys.length">
+                <thead><tr><th>ID</th><th>Key Hash</th><th>标签</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
+                <tbody><tr v-for="k in apikeys" :key="k.id">
+                  <td>{{k.id}}</td>
+                  <td><span class="code">{{k.key_hash_prefix}}</span></td>
+                  <td>{{k.label||'-'}}</td>
+                  <td><span :class="k.is_enabled?'badge badge-green':'badge badge-red'">{{k.is_enabled?'启用':'禁用'}}</span></td>
+                  <td style="font-size:12px;color:var(--text2)">{{fmtTime(k.created_at)}}</td>
+                  <td class="actions">
+                    <button class="btn btn-ghost btn-sm" @click="toggleApiKey(k)">{{k.is_enabled?'禁用':'启用'}}</button>
+                    <button class="btn btn-danger btn-sm" @click="deleteApiKey(k.id)">删除</button>
+                  </td>
+                </tr></tbody>
+              </table>
+              <div v-else class="empty">暂无 API Key</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ===== LOGS ===== -->
+        <div v-if="page==='logs'">
+          <div class="card" style="margin-bottom:16px">
+            <div class="card-body" style="display:flex;gap:12px;align-items:end;flex-wrap:wrap">
+              <div class="form-group" style="margin:0;flex:1;min-width:120px">
+                <label>分组</label>
+                <select v-model="logFilters.group_id" @change="loadLogs(logFilters)">
+                  <option value="">全部</option>
+                  <option v-for="g in groups" :key="g.id" :value="g.id">{{g.name}}</option>
+                </select>
+              </div>
+              <div class="form-group" style="margin:0;flex:1;min-width:120px">
+                <label>状态</label>
+                <select v-model="logFilters.status" @change="loadLogs(logFilters)">
+                  <option value="">全部</option>
+                  <option value="success">成功</option>
+                  <option value="error">失败</option>
+                </select>
+              </div>
+              <button class="btn btn-ghost" @click="loadLogs(logFilters)">刷新</button>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-body" style="padding:0">
+              <table v-if="logs.length">
+                <thead><tr><th>时间</th><th>分组</th><th>模型</th><th>状态</th><th>耗时</th><th>Tokens</th><th>错误</th></tr></thead>
+                <tbody><tr v-for="l in logs" :key="l.id">
+                  <td style="font-size:12px;white-space:nowrap">{{fmtTime(l.created_at)}}</td>
+                  <td>{{groupIdToName(l.group_id)}}</td>
+                  <td><span class="code">{{modelIdToName(l.model_id)}}</span></td>
+                  <td><span :class="l.status==='success'?'badge badge-green':'badge badge-red'">{{l.status}}</span></td>
+                  <td>{{l.duration_ms?l.duration_ms+'ms':'-'}}</td>
+                  <td style="font-size:12px">{{l.total_tokens||'-'}}</td>
+                  <td style="font-size:12px;color:var(--red);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{l.error_message||''}}</td>
+                </tr></tbody>
+              </table>
+              <div v-else class="empty">暂无调用日志</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ===== DAILY SUMMARY ===== -->
+        <div v-if="page==='summary'">
+          <div class="card" style="margin-bottom:16px">
+            <div class="card-body" style="display:flex;gap:12px;align-items:end">
+              <div class="form-group" style="margin:0;flex:0 0 200px">
+                <label>日期</label>
+                <input type="date" v-model="summaryDate">
+              </div>
+              <button class="btn btn-primary" @click="loadSummary(summaryDate)">查询日报</button>
+            </div>
+          </div>
+          <div v-if="summaries.length" class="card">
+            <div class="card-header"><h3>{{summaries[0].day}} 日报</h3></div>
+            <div class="card-body" style="font-size:14px;line-height:1.8;white-space:pre-wrap">{{summaries[0].summary_md}}</div>
+          </div>
+          <div v-else class="card"><div class="card-body empty">选择日期查询日报</div></div>
+        </div>
+
+      </div>
+
+      <!-- ===== MODAL ===== -->
+      <div v-if="modal.show" class="modal-mask" @click.self="closeModal">
+        <div class="modal">
+          <div class="modal-header">{{modal.title}}</div>
+          <div class="modal-body">
+            <!-- Provider form -->
+            <template v-if="modal.form.base_url!==undefined && modal.form.raw_key===undefined">
+              <div class="form-group"><label>名称</label><input v-model="modal.form.name"></div>
+              <div class="form-group"><label>类型</label><select v-model="modal.form.type"><option>openai</option><option>anthropic</option></select></div>
+              <div class="form-group"><label>Base URL</label><input v-model="modal.form.base_url" placeholder="https://api.example.com/v1/"></div>
+              <div class="form-group"><label>API Key</label><input v-model="modal.form.api_key" type="password"></div>
+            </template>
+            <!-- Model form -->
+            <template v-else-if="modal.form.context_window!==undefined && modal.form.raw_key===undefined && modal.form.fallback_group_id===undefined">
+              <div class="form-group"><label>供应商</label>
+                <select v-model="modal.form.provider_id" :disabled="modal.mode==='edit'">
+                  <option v-for="p in providers" :key="p.id" :value="p.id">{{p.name}}</option>
+                </select>
+              </div>
+              <div class="form-group"><label>名称</label><input v-model="modal.form.name"></div>
+              <div class="form-group"><label>上下文窗口</label><input type="number" v-model.number="modal.form.context_window"></div>
+            </template>
+            <!-- Group form -->
+            <template v-else-if="modal.form.fallback_group_id!==undefined">
+              <div class="form-group"><label>名称</label><input v-model="modal.form.name"></div>
+              <div class="form-group"><label>描述</label><input v-model="modal.form.description"></div>
+              <div class="form-group"><label>策略</label>
+                <select v-model="modal.form.type">
+                  <option v-for="s in strategies" :key="s" :value="s">{{s}}</option>
+                </select>
+              </div>
+            </template>
+            <!-- API Key form -->
+            <template v-else-if="modal.form.raw_key!==undefined || modal.form.key_hash_prefix!==undefined">
+              <template v-if="modal.mode==='create'">
+                <div class="form-group"><label>API Key</label><input v-model="modal.form.raw_key" placeholder="sk-..."></div>
+                <div class="form-group"><label>标签</label><input v-model="modal.form.label" placeholder="可选"></div>
+              </template>
+              <template v-else>
+                <div class="form-group"><label>启用状态</label>
+                  <select v-model="modal.form.is_enabled"><option :value="true">启用</option><option :value="false">禁用</option></select>
+                </div>
+              </template>
+            </template>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-ghost" @click="closeModal">取消</button>
+            <button class="btn btn-primary" @click="submitModal">确定</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===== CONFIRM DIALOG (in-page; native confirm() is unreliable in
+           embedded/iframe/preview browsers where dialogs are suppressed) ===== -->
+      <div v-if="confirmState.show" class="modal-mask" @click.self="confirmCancel">
+        <div class="modal" style="width:400px">
+          <div class="modal-header">确认操作</div>
+          <div class="modal-body">
+            <p style="margin:0;font-size:14px;line-height:1.6">{{confirmState.message}}</p>
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-ghost" @click="confirmCancel">取消</button>
+            <button class="btn btn-danger" @click="confirmOk">确定删除</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const {createApp,ref,reactive,computed,onMounted,watch,nextTick} = Vue;
+
+createApp({
+  setup(){
+    // Auth
+    const loginKey = ref(localStorage.getItem('bf_admin_key')||'');
+    const authenticated = ref(!!localStorage.getItem('bf_admin_key'));
+    const loginError = ref('');
+    const loginLoading = ref(false);
+    const adminKey = ref(loginKey.value);
+
+    // API
+    async function api(path, opts={}){
+      const headers = {'Authorization':'Bearer '+adminKey.value,'Content-Type':'application/json',...(opts.headers||{})};
+      const r = await fetch('/admin'+path, {...opts, headers});
+      if(!r.ok){
+        // FastAPI `detail` may be a string, an object ({success,error}) or a
+        // validation array — stringify so the toast is never "[object Object]".
+        const body = await r.json().catch(()=>({}));
+        const d = body.detail;
+        let msg = r.statusText || ('HTTP '+r.status);
+        if(typeof d === 'string') msg = d;
+        else if(d && typeof d === 'object') msg = d.error || d.message || JSON.stringify(d);
+        throw new Error(msg);
+      }
+      return r.json();
+    }
+
+    // Toasts
+    const toasts = ref([]);
+    function toast(msg, type='success'){
+      toasts.value.push({msg,type});
+      setTimeout(()=>toasts.value.shift(), 3000);
+    }
+
+    // Navigation
+    const pages = [
+      {id:'dashboard',label:'概览',icon:'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>'},
+      {id:'providers',label:'供应商',icon:'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>'},
+      {id:'models',label:'模型',icon:'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>'},
+      {id:'groups',label:'分组',icon:'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>'},
+      {id:'apikeys',label:'API Keys',icon:'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>'},
+      {id:'logs',label:'调用日志',icon:'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>'},
+      {id:'summary',label:'日报',icon:'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>'},
+    ];
+    const page = ref('dashboard');
+    const currentPageLabel = computed(()=>pages.find(p=>p.id===page.value)?.label||'');
+
+    // Data
+    const providers = ref([]);
+    const models = ref([]);
+    const groups = ref([]);
+    const apikeys = ref([]);
+    const logs = ref([]);
+    const stats = ref({});
+    const strategies = ref([]);
+    const summaries = ref([]);
+
+    // Loading states
+    const loading = reactive({});
+
+    // Modal
+    const modal = reactive({show:false, title:'', form:{}, mode:'create'});
+    function openModal(title, form, mode='create'){
+      Object.assign(modal, {show:true, title, form:{...form}, mode});
+    }
+    function closeModal(){ modal.show = false; }
+
+    // Confirm dialog (replaces native confirm(), which silently returns false
+    // when the browser suppresses dialogs — e.g. embedded/iframe previews).
+    const confirmState = reactive({show:false, message:'', onOk:null});
+    function askConfirm(message, onOk){
+      Object.assign(confirmState, {show:true, message, onOk});
+    }
+    function confirmOk(){
+      const fn = confirmState.onOk;
+      confirmState.show = false; confirmState.onOk = null;
+      if(fn) fn();
+    }
+    function confirmCancel(){ confirmState.show = false; confirmState.onOk = null; }
+
+    // Login
+    async function doLogin(){
+      loginLoading.value = true;
+      loginError.value = '';
+      try{
+        adminKey.value = loginKey.value;
+        await api('/stats/models?limit=1');
+        localStorage.setItem('bf_admin_key', loginKey.value);
+        authenticated.value = true;
+        await loadAll();
+      }catch(e){
+        loginError.value = '密钥验证失败: '+e.message;
+        adminKey.value = '';
+      }finally{ loginLoading.value = false; }
+    }
+    function doLogout(){
+      localStorage.removeItem('bf_admin_key');
+      authenticated.value = false;
+      adminKey.value = '';
+    }
+
+    // Data loading
+    // Data loading — allSettled so one failing endpoint cannot leave every
+    // list stale (a stale provider list after DELETE looks like "delete did
+    // nothing" and makes the user click again → 404).
+    async function loadAll(){
+      const results = await Promise.allSettled([
+        api('/providers'),
+        api('/models'),
+        api('/groups'),
+        api('/apikeys'),
+        api('/stats/models?limit=10'),
+        api('/strategies'),
+      ]);
+      const [p,m,g,k,s,st] = results;
+      if(p.status==='fulfilled') providers.value = p.value.providers||[];
+      if(m.status==='fulfilled') models.value = m.value.models||[];
+      if(g.status==='fulfilled') groups.value = g.value.groups||[];
+      if(k.status==='fulfilled') apikeys.value = k.value.api_keys||[];
+      if(s.status==='fulfilled') stats.value = s.value.model_stats||[];
+      if(st.status==='fulfilled') strategies.value = st.value.strategies||[];
+      const failed = results.find(r=>r.status==='rejected');
+      if(failed) toast('部分数据加载失败: '+failed.reason.message, 'error');
+    }
+
+    async function loadLogs(filters={}){
+      loading.logs = true;
+      try{
+        const qs = new URLSearchParams();
+        if(filters.group_id) qs.set('group_id', filters.group_id);
+        if(filters.model_id) qs.set('model_id', filters.model_id);
+        if(filters.status) qs.set('status', filters.status);
+        qs.set('limit', '50');
+        const r = await api('/logs?'+qs);
+        logs.value = r.logs||[];
+      }catch(e){ toast('加载日志失败', 'error'); }
+      loading.logs = false;
+    }
+
+    async function loadSummary(date){
+      loading.summary = true;
+      try{
+        const r = await api('/summaries/'+date);
+        summaries.value = r.summary ? [r.summary] : [];
+      }catch(e){ summaries.value = []; toast('无该日期的日报', 'error'); }
+      loading.summary = false;
+    }
+
+    // CRUD helpers
+    async function apiPost(path, body){ return api(path, {method:'POST', body:JSON.stringify(body)}); }
+    async function apiPatch(path, body){ return api(path, {method:'PATCH', body:JSON.stringify(body)}); }
+    async function apiDelete(path){ return api(path, {method:'DELETE'}); }
+
+    // CRUD: Providers
+    async function saveProvider(){
+      try{
+        const f = modal.form;
+        if(modal.mode==='create') await apiPost('/providers', {req:{name:f.name, base_url:f.base_url, api_key:f.api_key, type:f.type||'openai'}});
+        else await apiPatch('/providers/'+f.id, {name:f.name, base_url:f.base_url, api_key:f.api_key, type:f.type});
+        toast(modal.mode==='create'?'供应商已创建':'供应商已更新');
+        closeModal(); await loadAll();
+      }catch(e){ toast(e.message, 'error'); }
+    }
+    function deleteProvider(id){
+      askConfirm('确定删除该供应商？关联的模型也会被删除。', async ()=>{
+        try{ await apiDelete('/providers/'+id); toast('已删除'); await loadAll(); }
+        catch(e){ toast(e.message, 'error'); }
+      });
+    }
+
+    // CRUD: Models
+    async function saveModel(){
+      try{
+        const f = modal.form;
+        if(modal.mode==='create') await apiPost('/models', {req:{provider_id:+f.provider_id, name:f.name, context_window:+f.context_window||0}});
+        else await apiPatch('/models/'+f.id, {name:f.name, is_enabled:f.is_enabled!==false});
+        toast(modal.mode==='create'?'模型已创建':'模型已更新');
+        closeModal(); await loadAll();
+      }catch(e){ toast(e.message, 'error'); }
+    }
+    function deleteModel(id){
+      askConfirm('确定删除该模型？', async ()=>{
+        try{ await apiDelete('/models/'+id); toast('已删除'); await loadAll(); }
+        catch(e){ toast(e.message, 'error'); }
+      });
+    }
+    async function toggleModel(m){
+      try{ await apiPatch('/models/'+m.id, {is_enabled:!m.is_enabled}); toast('已更新'); await loadAll(); }
+      catch(e){ toast(e.message, 'error'); }
+    }
+
+    // CRUD: Groups
+    async function saveGroup(){
+      try{
+        const f = modal.form;
+        if(modal.mode==='create') await apiPost('/groups', {req:{name:f.name, description:f.description, type:f.type||'random_weights'}});
+        else await apiPatch('/groups/'+f.id, {name:f.name, description:f.description, type:f.type, is_enabled:f.is_enabled!==false});
+        toast(modal.mode==='create'?'分组已创建':'分组已更新');
+        closeModal(); await loadAll();
+      }catch(e){ toast(e.message, 'error'); }
+    }
+    function deleteGroup(id){
+      askConfirm('确定删除该分组？', async ()=>{
+        try{ await apiDelete('/groups/'+id); toast('已删除'); await loadAll(); }
+        catch(e){ toast(e.message, 'error'); }
+      });
+    }
+    async function addModelToGroup(gid, mid, weight=1){
+      try{ await apiPost(`/groups/${gid}/models?model_id=${mid}&weight=${weight}`); toast('已添加模型到分组'); await loadAll(); }
+      catch(e){ toast(e.message, 'error'); }
+    }
+    async function removeModelFromGroup(gid, mid){
+      try{ await apiDelete(`/groups/${gid}/models/${mid}`); toast('已移除'); await loadAll(); await loadGroupDetails(gid); }
+      catch(e){ toast(e.message, 'error'); }
+    }
+
+    // CRUD: API Keys
+    async function saveApiKey(){
+      try{
+        const f = modal.form;
+        if(modal.mode==='create') await apiPost('/apikeys', {req:{raw_key:f.raw_key, label:f.label}});
+        else await apiPatch('/apikeys/'+f.id, {is_enabled:f.is_enabled!==false});
+        toast(modal.mode==='create'?'Key 已创建':'Key 已更新');
+        closeModal(); await loadAll();
+      }catch(e){ toast(e.message, 'error'); }
+    }
+    function deleteApiKey(id){
+      askConfirm('确定删除该 API Key？', async ()=>{
+        try{ await apiDelete('/apikeys/'+id); toast('已删除'); await loadAll(); }
+        catch(e){ toast(e.message, 'error'); }
+      });
+    }
+
+    // ===== Helpers used by templates =====
+    const logFilters = reactive({group_id:'', status:''});
+    const summaryDate = ref(new Date().toISOString().slice(0,10));
+    const newModelForGroup = reactive({});
+    const groupDetailsCache = reactive({});
+
+    function providerName(pid){
+      const p = providers.value.find(x=>x.id===pid);
+      return p ? p.name : 'unknown';
+    }
+    function groupIdToName(gid){
+      const g = groups.value.find(x=>x.id===gid);
+      return g ? g.name : (gid||'-');
+    }
+    function modelIdToName(mid){
+      const m = models.value.find(x=>x.id===mid);
+      return m ? m.name : (mid||'-');
+    }
+    function fmtTime(t){
+      if(!t) return '-';
+      try{ return new Date(t).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'}); }
+      catch(e){ return t; }
+    }
+    function groupModels(gid){
+      return groupDetailsCache[gid] || [];
+    }
+
+    async function loadGroupDetails(gid){
+      try{
+        const r = await api('/groups/'+gid+'/details');
+        groupDetailsCache[gid] = r.models||[];
+      }catch(e){ groupDetailsCache[gid] = []; }
+    }
+    async function doAddModelToGroup(gid){
+      const mid = newModelForGroup[gid];
+      if(!mid) return;
+      await addModelToGroup(gid, mid);
+      newModelForGroup[gid] = '';
+      await loadGroupDetails(gid);
+    }
+
+    async function toggleApiKey(k){
+      try{ await apiPatch('/apikeys/'+k.id, {is_enabled:!k.is_enabled}); toast('已更新'); await loadAll(); }
+      catch(e){ toast(e.message, 'error'); }
+    }
+
+    function submitModal(){
+      const f = modal.form;
+      // Detect entity type by form shape
+      if(f.raw_key !== undefined || f.key_hash_prefix !== undefined) saveApiKey();
+      else if(f.fallback_group_id !== undefined) saveGroup();
+      else if(f.base_url !== undefined) saveProvider();
+      else saveModel();
+    }
+
+    // Page switch
+    async function switchPage(p){
+      page.value = p;
+      if(p==='logs') loadLogs(logFilters);
+      if(p==='dashboard'||p==='providers'||p==='models') await loadAll();
+      if(p==='groups'){
+        await loadAll();
+        for(const g of groups.value) await loadGroupDetails(g.id);
+      }
+    }
+
+    // Init: load data + group details
+    onMounted(async ()=>{
+      if(authenticated.value){
+        await loadAll();
+        for(const g of groups.value) await loadGroupDetails(g.id);
+      }
+    });
+
+    return {
+      loginKey, authenticated, loginError, loginLoading, adminKey,
+      pages, page, currentPageLabel, toasts, modal,
+      providers, models, groups, apikeys, logs, stats, strategies, summaries,
+      loading, logFilters, summaryDate, newModelForGroup,
+      doLogin, doLogout, switchPage, toast,
+      openModal, closeModal, submitModal,
+      confirmState, confirmOk, confirmCancel,
+      saveProvider, deleteProvider,
+      saveModel, deleteModel, toggleModel,
+      saveGroup, deleteGroup, addModelToGroup, removeModelFromGroup, doAddModelToGroup,
+      saveApiKey, deleteApiKey, toggleApiKey,
+      loadLogs, loadSummary,
+      providerName, groupIdToName, modelIdToName, fmtTime, groupModels,
+    };
+  }
+}).mount('#app');
+</script>
+</body>
+</html>

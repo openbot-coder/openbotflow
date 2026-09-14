@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import time
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from botflow.admin_dashboard import mount_admin_ui
 from botflow.admin_api import admin_router
 from botflow.config import BotflowSettings, set_config
 from botflow.storage import db as dbmod
@@ -41,9 +44,9 @@ class TestAuth:
 
 class TestProviders:
     def test_crud(self, client):
-        p = client.post("/admin/providers", params={"name": "openai", "type": "openai",
+        p = client.post("/admin/providers", json={"req": {"name": "openai", "type": "openai",
                                                     "base_url": "https://api.openai.com/v1",
-                                                    "api_key": "sk-x"}, headers=AUTH)
+                                                    "api_key": "sk-x"}}, headers=AUTH)
         assert p.status_code == 200 and p.json()["success"] is True
         pid = p.json()["provider_id"]
         assert client.get("/admin/providers", headers=AUTH).json()["providers"]
@@ -56,7 +59,7 @@ class TestProviders:
         assert client.get(f"/admin/providers/{pid}", headers=AUTH).status_code == 404
 
     def test_create_without_type(self, client):
-        p = client.post("/admin/providers", params={"name": "x", "base_url": "https://x"}, headers=AUTH)
+        p = client.post("/admin/providers", json={"req": {"name": "x", "base_url": "https://x"}}, headers=AUTH)
         assert p.status_code == 200 and p.json()["success"] is True
 
     def test_update_missing(self, client):
@@ -67,9 +70,12 @@ class TestProviders:
 
 
 class TestModels:
+    def _create_provider(self, client):
+        return client.post("/admin/providers", json={"req": {"name": "openai", "base_url": "https://x"}}, headers=AUTH).json()["provider_id"]
+
     def test_crud(self, client):
-        pid = client.post("/admin/providers", params={"name": "openai", "base_url": "https://x"}, headers=AUTH).json()["provider_id"]
-        m = client.post("/admin/models", params={"provider_id": pid, "name": "gpt-4", "type": "openai"}, headers=AUTH)
+        pid = self._create_provider(client)
+        m = client.post("/admin/models", json={"req": {"provider_id": pid, "name": "gpt-4", "type": "openai"}}, headers=AUTH)
         assert m.status_code == 200 and m.json()["success"] is True
         mid = m.json()["model_id"]
         assert client.get("/admin/models", headers=AUTH).json()["models"]
@@ -81,15 +87,15 @@ class TestModels:
         assert client.get(f"/admin/models/{mid}", headers=AUTH).status_code == 404
 
     def test_create_without_type(self, client):
-        pid = client.post("/admin/providers", params={"name": "openai", "base_url": "https://x"}, headers=AUTH).json()["provider_id"]
-        m = client.post("/admin/models", params={"provider_id": pid, "name": "m"}, headers=AUTH)
+        pid = self._create_provider(client)
+        m = client.post("/admin/models", json={"req": {"provider_id": pid, "name": "m"}}, headers=AUTH)
         assert m.status_code == 200
 
     def test_update_missing(self, client):
         assert client.patch("/admin/models/9999", params={"display_name": "x"}, headers=AUTH).status_code == 404
 
     def test_create_with_missing_provider(self, client):
-        m = client.post("/admin/models", params={"provider_id": 9999, "name": "ghost"}, headers=AUTH)
+        m = client.post("/admin/models", json={"req": {"provider_id": 9999, "name": "ghost"}}, headers=AUTH)
         assert m.status_code == 404
 
     def test_delete_missing(self, client):
@@ -98,7 +104,7 @@ class TestModels:
 
 class TestGroups:
     def test_crud(self, client):
-        g = client.post("/admin/groups", params={"name": "prod", "description": "d"}, headers=AUTH)
+        g = client.post("/admin/groups", json={"req": {"name": "prod", "description": "d"}}, headers=AUTH)
         assert g.status_code == 200 and g.json()["success"] is True
         gid = g.json()["group_id"]
         assert client.get("/admin/groups", headers=AUTH).json()["groups"]
@@ -116,9 +122,9 @@ class TestGroups:
 
 class TestGroupModels:
     def test_full(self, client):
-        pid = client.post("/admin/providers", params={"name": "openai", "base_url": "https://x"}, headers=AUTH).json()["provider_id"]
-        mid = client.post("/admin/models", params={"provider_id": pid, "name": "gpt-4"}, headers=AUTH).json()["model_id"]
-        gid = client.post("/admin/groups", params={"name": "prod"}, headers=AUTH).json()["group_id"]
+        pid = client.post("/admin/providers", json={"req": {"name": "openai", "base_url": "https://x"}}, headers=AUTH).json()["provider_id"]
+        mid = client.post("/admin/models", json={"req": {"provider_id": pid, "name": "gpt-4"}}, headers=AUTH).json()["model_id"]
+        gid = client.post("/admin/groups", json={"req": {"name": "prod"}}, headers=AUTH).json()["group_id"]
         a = client.post(f"/admin/groups/{gid}/models", params={"model_id": mid, "weight": 3}, headers=AUTH)
         assert a.status_code == 200 and a.json()["success"] is True
         det = client.get(f"/admin/groups/{gid}/details", headers=AUTH)
@@ -131,7 +137,7 @@ class TestGroupModels:
 
     def test_404_branches(self, client):
         assert client.post("/admin/groups/9999/models", params={"model_id": 1}, headers=AUTH).status_code == 404
-        gid = client.post("/admin/groups", params={"name": "g"}, headers=AUTH).json()["group_id"]
+        gid = client.post("/admin/groups", json={"req": {"name": "g"}}, headers=AUTH).json()["group_id"]
         assert client.post(f"/admin/groups/{gid}/models", params={"model_id": 9999}, headers=AUTH).status_code == 404
         assert client.get("/admin/groups/9999/details", headers=AUTH).status_code == 404
         assert client.patch(f"/admin/groups/{gid}/models/9999", params={"weight": 1}, headers=AUTH).status_code == 200
@@ -140,15 +146,15 @@ class TestGroupModels:
 
 class TestStats:
     def test_models(self, client):
-        pid = client.post("/admin/providers", params={"name": "openai", "base_url": "https://x"}, headers=AUTH).json()["provider_id"]
-        mid = client.post("/admin/models", params={"provider_id": pid, "name": "gpt-4"}, headers=AUTH).json()["model_id"]
+        pid = client.post("/admin/providers", json={"req": {"name": "openai", "base_url": "https://x"}}, headers=AUTH).json()["provider_id"]
+        mid = client.post("/admin/models", json={"req": {"provider_id": pid, "name": "gpt-4"}}, headers=AUTH).json()["model_id"]
         r = client.get("/admin/stats/models", headers=AUTH)
         assert r.status_code == 200 and r.json()["success"] is True
         r2 = client.get("/admin/stats/models", params={"api_key_id": 1}, headers=AUTH)
         assert r2.status_code == 200
 
     def test_groups(self, client):
-        gid = client.post("/admin/groups", params={"name": "empty"}, headers=AUTH).json()["group_id"]
+        gid = client.post("/admin/groups", json={"req": {"name": "empty"}}, headers=AUTH).json()["group_id"]
         r = client.get("/admin/stats/groups", headers=AUTH)
         assert r.status_code == 200 and r.json()["success"] is True
         r2 = client.get("/admin/stats/groups", params={"api_key_id": 1}, headers=AUTH)
@@ -185,7 +191,7 @@ class TestSummaries:
 class TestApiKeys:
     def test_crud_and_redaction(self, client):
         assert client.get("/admin/apikeys", headers=AUTH).json()["api_keys"] == []
-        c = client.post("/admin/apikeys", params={"raw_key": "secret-key", "label": "team-a"}, headers=AUTH)
+        c = client.post("/admin/apikeys", json={"req": {"raw_key": "secret-key", "label": "team-a"}}, headers=AUTH)
         assert c.status_code == 200
         body = c.json()
         assert body["success"] is True and "key_hash_prefix" in body
@@ -203,3 +209,59 @@ class TestApiKeys:
     def test_not_found(self, client):
         assert client.patch("/admin/apikeys/9999", params={"is_enabled": False}, headers=AUTH).status_code == 404
         assert client.delete("/admin/apikeys/9999", headers=AUTH).status_code == 404
+
+
+class TestAdminDashboard:
+    """The admin SPA must be served no-store and must not gate deletes on the
+    native ``confirm()`` — that silently returns False in embedded/iframe
+    previews, making the delete button look dead ("点删除没反应")."""
+
+    def test_served_with_no_store(self, tmp_path, monkeypatch):
+        import botflow.admin_dashboard as ad
+
+        f = tmp_path / "index.html"
+        f.write_text("<html><body>spa</body></html>", encoding="utf-8")
+        monkeypatch.setattr(ad, "_HTML_PATH", f)
+
+        app = FastAPI()
+        mount_admin_ui(app)
+        with TestClient(app) as c:
+            r = c.get("/admin/")
+
+        assert r.status_code == 200
+        assert "no-store" in r.headers["cache-control"]
+        assert r.text == "<html><body>spa</body></html>"
+
+    def test_rereads_html_when_file_changes(self, tmp_path, monkeypatch):
+        import botflow.admin_dashboard as ad
+
+        f = tmp_path / "index.html"
+        f.write_text("v1", encoding="utf-8")
+        monkeypatch.setattr(ad, "_HTML_PATH", f)
+
+        app = FastAPI()
+        mount_admin_ui(app)
+        with TestClient(app) as c:
+            assert c.get("/admin/").text == "v1"
+            f.write_text("v2", encoding="utf-8")
+            os.utime(f, (time.time() + 10, time.time() + 10))
+            assert c.get("/admin/").text == "v2"
+
+    def test_missing_asset_registers_nothing(self, tmp_path, monkeypatch):
+        import botflow.admin_dashboard as ad
+
+        monkeypatch.setattr(ad, "_HTML_PATH", tmp_path / "absent.html")
+        app = FastAPI()
+        mount_admin_ui(app)
+        with TestClient(app) as c:
+            assert c.get("/admin/").status_code == 404
+
+    def test_shipped_spa_uses_inpage_confirm(self):
+        """Regression guard: delete handlers must not depend on native confirm()."""
+        import botflow.admin_dashboard as ad
+
+        html = ad._HTML_PATH.read_text(encoding="utf-8")
+        assert "askConfirm" in html
+        assert "confirmState" in html
+        assert "!confirm(" not in html  # no `if(!confirm(...)) return;` dead-button gate
+        assert "Promise.allSettled" in html  # one failing endpoint can't freeze every list

@@ -7,7 +7,11 @@ from pathlib import Path
 from botflow.config import BotflowSettings, load_config, set_config, get_config
 
 
-def test_defaults():
+def test_defaults(tmp_path, monkeypatch):
+    # .env is gitignored and may legitimately exist in the repo root (local
+    # secrets). Run from an empty dir so this test asserts the shipped
+    # defaults rather than whatever the developer's .env happens to hold.
+    monkeypatch.chdir(tmp_path)
     s = BotflowSettings()
     assert s.host == "0.0.0.0"
     assert s.port == 8080
