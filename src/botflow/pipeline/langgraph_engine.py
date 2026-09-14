@@ -159,8 +159,10 @@ async def _load_and_select(state: RouteState) -> dict:
     Delegates entirely to ``STRATEGY_REGISTRY[group.type].select_endpoints()``
     which handles load → filter → select → truncate internally.
 
-    If ``state["error"]`` is already set (e.g. from ``_resolve_group``),
-    short-circuit so the graph routes to ``finalize_error``.
+    If ``state["fatal_error"]`` is already set (e.g. cycle/depth from
+    ``_resolve_group``), short-circuit — ``_route_after_resolve`` will
+    route to ``finalize_error`` before this node runs, but this guard
+    handles edge cases.
     """
     if state.get("fatal_error"):
         return {}  # pass-through so _route_after_call routes to error
@@ -295,7 +297,9 @@ def _route_after_call(state: RouteState) -> Literal["success", "fallback", "erro
     """After try_call or resolve_group, decide next step.
 
     ``fatal_error`` (cycle, depth, config) → straight to ``error``.
-    ``error`` (endpoint failure) → try fallback if available.
+    ``error`` (endpoint failure) → always attempt fallback;
+    ``_resolve_group`` handles cycle detection, depth limits,
+    and missing fallback groups (stores them in ``fatal_error``).
     """
     # Fatal error (cycle, depth, config) — no fallback possible
     if state.get("fatal_error"):
@@ -304,12 +308,10 @@ def _route_after_call(state: RouteState) -> Literal["success", "fallback", "erro
     if state.get("result") is not None:
         return "success"
 
-    # Recoverable error (endpoint failed) — try fallback
-    fallback_gid = state.get("fallback_group_id")
-    visited = state.get("visited_groups", [])
-    if fallback_gid and fallback_gid not in visited:
-        return "fallback"
-    return "error"
+    # Endpoint failed — always attempt fallback; _resolve_group handles
+    # cycle detection (fallback_gid in visited), depth limits (>3),
+    # missing fallback group (gid=None), and not-found (group=None).
+    return "fallback"
 
 
 # ---------------------------------------------------------------------------
