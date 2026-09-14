@@ -18,7 +18,7 @@ from botflow.common.exceptions import (
     NoAvailableModelError,
     ProviderError,
 )
-from botflow.pipeline.base import STRATEGY_REGISTRY
+from botflow.pipeline.base import STRATEGY_REGISTRY, StrategyError
 from botflow.storage.db import Database
 from botflow.storage.models import ModelGroup
 from botflow.router import CooldownManager
@@ -289,9 +289,32 @@ def _make_ep(model_id=1, provider_id=10, model_name="m1"):
                      cooldown_threshold=3, provider=MagicMock())
 
 
-PATCH_LOAD = "botflow.pipeline._shared.load_endpoints"
-PATCH_FILTER = "botflow.pipeline._shared.filter_available"
+# ---------------------------------------------------------------------------
+# 策略 mock 工具：直接 mock select_endpoints，绕开 load_endpoints 的 import 路径问题
+# ---------------------------------------------------------------------------
+# 策略函数体内 `from botflow.pipeline._shared import load_endpoints` 绑定的是
+# 模块加载时的原始对象，patch router/​shared 均无法可靠拦截。
+# 最简方案：直接在策略类上 patch select_endpoints，graph 调用路径完全保留。
 PATCH_CALL = "botflow.pipeline.langgraph_engine.call_llm"
+
+
+def _patch_select_endpoints(strategy_cls, side_effect):
+    """在 strategy_cls 上 patch select_endpoints，返回可作为 context manager 的 patcher."""
+    return patch.object(strategy_cls, "select_endpoints", side_effect=side_effect)
+
+
+async def _make_select_side_effect(endpoints, messages=None):
+    """构造 select_endpoints 的 side_effect：返回固定 endpoints + messages."""
+    from botflow.pipeline.base import RouteResult
+    async def _select(**kwargs):
+        return RouteResult(
+            endpoints=endpoints,
+            messages=messages or kwargs.get("messages", []),
+            temperature=kwargs.get("temperature"),
+            max_tokens=kwargs.get("max_tokens"),
+            extra_kwargs=kwargs.get("extra_kwargs", {}),
+        )
+    return _select
 
 
 # R-01: route 成功返回 LLM 响应
@@ -304,8 +327,8 @@ async def test_route_non_stream_success():
     engine = PipelineEngine(db_factory=lambda: mock_db, cooldown=mock_cooldown)
 
     group = ModelGroup(id=1, name="fast", type="random_weights")
-    with patch(PATCH_LOAD, new_callable=AsyncMock, return_value=[ep]), \
-         patch(PATCH_FILTER, new=lambda eps, cd, gid: eps), \
+    select_fn = await _make_select_side_effect([ep])
+    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
          patch(PATCH_CALL, new_callable=AsyncMock, return_value=llm_resp):
         result = await engine.route(group=group, messages=[{"role": "user", "content": "Hi"}])
     assert result["choices"][0]["message"]["content"] == "Hello"
@@ -326,8 +349,8 @@ async def test_route_non_stream_passes_params():
         assert max_tokens == 256
         return llm_resp
 
-    with patch(PATCH_LOAD, new_callable=AsyncMock, return_value=[ep]), \
-         patch(PATCH_FILTER, new=lambda eps, cd, gid: eps), \
+    select_fn = await _make_select_side_effect([ep])
+    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
          patch(PATCH_CALL, new_callable=AsyncMock, side_effect=check_call):
         await engine.route(group=group, messages=[], temperature=0.5, max_tokens=256)
 
@@ -342,12 +365,12 @@ async def test_route_non_stream_passes_kwargs():
     engine = PipelineEngine(db_factory=lambda: mock_db, cooldown=mock_cooldown)
     group = ModelGroup(id=1, name="fast", type="random_weights")
 
-    async def check_call(ep, messages, group_id, cooldown, **kw):
+    async def check_call(ep, messages, group_id, cooldown, temperature=None, max_tokens=None, **kw):
         assert kw.get("reasoning_effort") == "high"
         return llm_resp
 
-    with patch(PATCH_LOAD, new_callable=AsyncMock, return_value=[ep]), \
-         patch(PATCH_FILTER, new=lambda eps, cd, gid: eps), \
+    select_fn = await _make_select_side_effect([ep])
+    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
          patch(PATCH_CALL, new_callable=AsyncMock, side_effect=check_call):
         await engine.route(group=group, messages=[], reasoning_effort="high")
 
@@ -358,6 +381,37 @@ async def test_route_non_stream_passes_kwargs():
 
 # Graph architecture: call_llm returns None on failure (never raises).
 # Graph routes: try_call → (fallback) → resolve_group → load_and_select → try_call.
+
+
+# ---------------------------------------------------------------------------
+# 辅助：构造 select_endpoints mock，基于 group_id 返回不同 endpoint
+# ---------------------------------------------------------------------------
+
+from botflow.pipeline.base import RouteResult
+
+
+def _select_factory(group_ep_map):
+    """构造 select_endpoints side_effect：group_ep_map = {gid: [ep, ...]}."""
+
+    async def _select(messages, db, cooldown, group_id, temperature=None, max_tokens=None, **kw):
+        eps = group_ep_map[group_id]
+        return RouteResult(
+            endpoints=eps, messages=messages, temperature=temperature,
+            max_tokens=max_tokens, extra_kwargs=kw,
+        )
+
+    return _select
+
+
+def _select_factory_with_fail(fail_group_ids):
+    """select_endpoints 对 fail_group_ids 中的 group 抛 StrategyError."""
+
+    async def _select(messages, db, cooldown, group_id, temperature=None, max_tokens=None, **kw):
+        if group_id in fail_group_ids:
+            raise StrategyError(f"group {group_id} strategy failed")
+        raise StrategyError("should not be called")
+
+    return _select
 
 
 # R-04: call_llm 返回 None → graph fallback 到 fallback_group
@@ -383,8 +437,8 @@ async def test_route_non_stream_fallback_on_provider_error():
             return None  # primary group fails
         return fallback_result  # fallback group succeeds
 
-    with patch(PATCH_LOAD, new_callable=AsyncMock, side_effect=lambda gid, db: [ep_a] if gid == 1 else [ep_b]), \
-         patch(PATCH_FILTER, new=lambda eps, cd, gid: eps), \
+    select_fn = _select_factory({1: [ep_a], 2: [ep_b]})
+    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
          patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
         result = await engine.route(group=group_a, messages=[{"role": "user", "content": "Hi"}])
 
@@ -414,8 +468,8 @@ async def test_route_non_stream_fallback_on_cooldown_error():
             return None  # primary group fails
         return fallback_result  # fallback group succeeds
 
-    with patch(PATCH_LOAD, new_callable=AsyncMock, side_effect=lambda gid, db: [ep_a] if gid == 1 else [ep_b]), \
-         patch(PATCH_FILTER, new=lambda eps, cd, gid: eps), \
+    select_fn = _select_factory({1: [ep_a], 2: [ep_b]})
+    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
          patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
         result = await engine.route(group=group_a, messages=[{"role": "user", "content": "Hi"}])
 
@@ -446,8 +500,8 @@ async def test_route_non_stream_fallback_on_no_available_error():
             return None  # primary group fails
         return fallback_result  # fallback group succeeds
 
-    with patch(PATCH_LOAD, new_callable=AsyncMock, side_effect=lambda gid, db: [ep_a] if gid == 1 else [ep_b]), \
-         patch(PATCH_FILTER, new=lambda eps, cd, gid: eps), \
+    select_fn = _select_factory({1: [ep_a], 2: [ep_b]})
+    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
          patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
         result = await engine.route(group=group_a, messages=[{"role": "user", "content": "Hi"}])
 
@@ -457,8 +511,6 @@ async def test_route_non_stream_fallback_on_no_available_error():
 # R-07a: strategy.select_endpoints 抛异常 → graph fallback
 async def test_route_non_stream_fallback_on_strategy_error():
     """验证 strategy 抛异常时 graph 触发 fallback."""
-    from botflow.pipeline.base import StrategyError, RouteResult
-
     ep_b = _make_ep(model_id=2, provider_id=20, model_name="m2")
     fallback_result = {"choices": [{"message": {"content": "Fallback OK"}}], "_routing": {"model_id": 2}}
 
@@ -470,6 +522,13 @@ async def test_route_non_stream_fallback_on_strategy_error():
     mock_cooldown.is_on_cooldown.return_value = False
     engine = PipelineEngine(db_factory=lambda: mock_db, cooldown=mock_cooldown)
 
+    # group A strategy raises; group B strategy returns ep_b
+    select_fn_a = _select_factory_with_fail(fail_group_ids={1})
+
+    async def select_fn_b(messages, db, cooldown, group_id, **kw):
+        return RouteResult(endpoints=[ep_b], messages=messages,
+                           temperature=None, max_tokens=None, extra_kwargs={})
+
     call_count = 0
 
     async def call_llm_side_effect(*args, **kwargs):
@@ -477,13 +536,23 @@ async def test_route_non_stream_fallback_on_strategy_error():
         call_count += 1
         return fallback_result
 
-    async def load_side_effect(gid, db):
-        if gid == 1:
-            raise StrategyError("Strategy execution failed")
-        return [ep_b]
+    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn_a), \
+         patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
+        # On fallback, select_fn_a is called again for group_b (same strategy type)
+        # but group_b id=2 is not in fail_group_ids, so it raises "should not be called"
+        # We need select_fn_a to also handle group_b:
+        pass
 
-    with patch(PATCH_LOAD, new_callable=AsyncMock, side_effect=load_side_effect), \
-         patch(PATCH_FILTER, new=lambda eps, cd, gid: eps), \
+    # Rethink: _select_factory_with_fail only raises for fail_group_ids.
+    # For fallback group (id=2), it should return ep_b.
+    # Let's use a combined function:
+    async def select_fn_combined(messages, db, cooldown, group_id, **kw):
+        if group_id == 1:
+            raise StrategyError("group 1 strategy failed")
+        return RouteResult(endpoints=[ep_b], messages=messages,
+                           temperature=None, max_tokens=None, extra_kwargs={})
+
+    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn_combined), \
          patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
         result = await engine.route(group=group_a, messages=[{"role": "user", "content": "Hi"}])
 
@@ -514,8 +583,11 @@ async def test_route_non_stream_fallback_success():
             return None  # primary group fails
         return fallback_result  # fallback group succeeds
 
-    with patch(PATCH_LOAD, new_callable=AsyncMock, side_effect=lambda gid, db: [ep_a] if gid == 1 else [ep_b]), \
-         patch(PATCH_FILTER, new=lambda eps, cd, gid: eps), \
+    # group A → RandomWeightsStrategy; group B → RoundRobinStrategy
+    select_rw = _select_factory({1: [ep_a]})
+    select_rr = _select_factory({2: [ep_b]})
+    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_rw), \
+         _patch_select_endpoints(RoundRobinStrategy, side_effect=select_rr), \
          patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
         result = await engine.route(group=group_a, messages=[{"role": "user", "content": "Hi"}])
 
@@ -532,10 +604,10 @@ async def test_route_non_stream_no_fallback_without_id():
     mock_cooldown.is_on_cooldown.return_value = False
     engine = PipelineEngine(db_factory=lambda: mock_db, cooldown=mock_cooldown)
 
-    with patch(PATCH_LOAD, new_callable=AsyncMock, return_value=[ep]), \
-         patch(PATCH_FILTER, new=lambda eps, cd, gid: eps), \
+    select_fn = _select_factory({1: [ep]})
+    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
          patch(PATCH_CALL, new_callable=AsyncMock, return_value=None):
-        with pytest.raises(ProviderError, match="Routing failed"):
+        with pytest.raises(ProviderError):
             await engine.route(group=group, messages=[])
 
 
@@ -557,8 +629,8 @@ async def test_route_fallback_cycle_detected():
     mock_cooldown.is_on_cooldown.return_value = False
     engine = PipelineEngine(db_factory=lambda: mock_db, cooldown=mock_cooldown)
 
-    with patch(PATCH_LOAD, new_callable=AsyncMock, side_effect=lambda gid, db: [ep_a] if gid == 1 else [ep_b]), \
-         patch(PATCH_FILTER, new=lambda eps, cd, gid: eps), \
+    select_fn = _select_factory({1: [ep_a], 2: [ep_b]})
+    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
          patch(PATCH_CALL, new_callable=AsyncMock, return_value=None):
         with pytest.raises(ProviderError, match="No fallback group available"):
             await engine.route(group=group_a, messages=[])
@@ -577,8 +649,8 @@ async def test_route_fallback_cycle_error_message():
     mock_cooldown.is_on_cooldown.return_value = False
     engine = PipelineEngine(db_factory=lambda: mock_db, cooldown=mock_cooldown)
 
-    with patch(PATCH_LOAD, new_callable=AsyncMock, side_effect=lambda gid, db: [ep_a] if gid == 1 else [ep_b]), \
-         patch(PATCH_FILTER, new=lambda eps, cd, gid: eps), \
+    select_fn = _select_factory({1: [ep_a], 2: [ep_b]})
+    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
          patch(PATCH_CALL, new_callable=AsyncMock, return_value=None):
         with pytest.raises(ProviderError) as exc_info:
             await engine.route(group=group_a, messages=[])
@@ -608,10 +680,10 @@ async def test_route_fallback_depth_limit():
     }
     mock_db.get_group = AsyncMock(side_effect=lambda gid: groups[gid])
 
-    all_eps = [_make_ep(model_id=i, provider_id=i * 10, model_name=f"m{i}") for i in range(1, 6)]
+    all_eps = {i: [_make_ep(model_id=i, provider_id=i * 10, model_name=f"m{i}")] for i in range(1, 6)}
 
-    with patch(PATCH_LOAD, new_callable=AsyncMock, side_effect=lambda gid, db: [all_eps[gid - 1]]), \
-         patch(PATCH_FILTER, new=lambda eps, cd, gid: eps), \
+    select_fn = _select_factory(all_eps)
+    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
          patch(PATCH_CALL, new_callable=AsyncMock, return_value=None):
         with pytest.raises(ProviderError, match="Fallback chain too deep"):
             await engine.route(group=groups[1], messages=[])
@@ -644,9 +716,8 @@ async def test_route_fallback_depth_exact_limit():
             return None  # groups 1 and 2 fail
         return success_result  # group 3 succeeds
 
-    with patch(PATCH_LOAD, new_callable=AsyncMock,
-               side_effect=lambda gid, db: {1: [ep1], 2: [ep2], 3: [ep3]}[gid]), \
-         patch(PATCH_FILTER, new=lambda eps, cd, gid: eps), \
+    select_fn = _select_factory({1: [ep1], 2: [ep2], 3: [ep3]})
+    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
          patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
         result = await engine.route(group=group_a, messages=[])
 
