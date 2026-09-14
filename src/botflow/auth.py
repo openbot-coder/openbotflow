@@ -6,13 +6,21 @@ import secrets
 from typing import Optional
 
 from fastapi import Depends, Header, HTTPException, Request, status
-from fastapi.security import HTTPBearer
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from botflow.config import get_config
 from botflow.storage.db import Database, get_db
 from botflow.storage.models import ApiKey
 
 # Security scheme reused by Swagger UI for both LLM and admin auth.
+#
+# It MUST be consumed through ``Depends(security)`` / ``Security(security)``.
+# Writing ``credentials: HTTPAuthorizationCredentials = None`` instead makes
+# FastAPI classify the plain default as a *request body* field (any Pydantic
+# model is a body param), which silently swallows the JSON body of every write
+# endpoint: a lone body param binds the whole body, so PATCHes either 422'd
+# ("body.credentials / body.scheme missing") or returned 200 while ignoring the
+# payload entirely. See tests/test_admin_api.py::TestWriteEndpointsUseJsonBody.
 security = HTTPBearer(auto_error=False)
 
 
@@ -53,14 +61,17 @@ async def resolve_api_key(db: Database, token: str) -> ApiKey | None:
 async def verify_llm_key(
     request: Request,
     authorization: Optional[str] = Header(default=None),
-    credentials: Optional[HTTPAuthorizationCredentials] = None,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     db: Database = None,  # injected by FastAPI (deprecated positional fallback below)
 ) -> ApiKey:
     """LLM Proxy auth: any valid client API key (or legacy single key)."""
     if db is None:
         db = get_db()
     token = _extract_token(authorization)
-    if credentials and credentials.credentials:
+    # ``credentials`` is filled by FastAPI from the Authorization header; the
+    # isinstance guard keeps direct (unit-test) invocation working, where the
+    # default is the Depends() marker rather than a parsed credentials object.
+    if isinstance(credentials, HTTPAuthorizationCredentials) and credentials.credentials:
         token = credentials.credentials
     if not token:
         raise HTTPException(
@@ -82,7 +93,7 @@ async def verify_llm_key(
 async def verify_admin_key(
     request: Request,
     authorization: Optional[str] = Header(default=None),
-    credentials: Optional[HTTPAuthorizationCredentials] = None,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> None:
     """Admin REST API auth: must match BOTFLOW_ADMIN_KEY."""
     admin_key = get_config().admin_key
@@ -92,7 +103,7 @@ async def verify_admin_key(
             detail="Server admin key is not configured (BOTFLOW_ADMIN_KEY).",
         )
     token = _extract_token(authorization)
-    if credentials and credentials.credentials:
+    if isinstance(credentials, HTTPAuthorizationCredentials) and credentials.credentials:
         token = credentials.credentials
     if not token or not secrets.compare_digest(token, admin_key):
         raise HTTPException(

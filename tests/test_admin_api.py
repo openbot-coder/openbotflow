@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 
@@ -51,7 +52,7 @@ class TestProviders:
         pid = p.json()["provider_id"]
         assert client.get("/admin/providers", headers=AUTH).json()["providers"]
         assert client.get(f"/admin/providers/{pid}", headers=AUTH).json()["success"] is True
-        u = client.patch(f"/admin/providers/{pid}", params={"base_url": "https://new"}, headers=AUTH)
+        u = client.patch(f"/admin/providers/{pid}", json={"base_url": "https://new"}, headers=AUTH)
         assert u.status_code == 200 and u.json()["provider_id"] == pid
         assert client.get(f"/admin/providers/{pid}", headers=AUTH).json()["provider"]["base_url"] == "https://new"
         assert client.get(f"/admin/providers/{pid}", headers=AUTH).status_code == 200
@@ -63,7 +64,7 @@ class TestProviders:
         assert p.status_code == 200 and p.json()["success"] is True
 
     def test_update_missing(self, client):
-        assert client.patch("/admin/providers/9999", params={"base_url": "x"}, headers=AUTH).status_code == 404
+        assert client.patch("/admin/providers/9999", json={"base_url": "x"}, headers=AUTH).status_code == 404
 
     def test_delete_missing(self, client):
         assert client.delete("/admin/providers/9999", headers=AUTH).status_code == 404
@@ -80,7 +81,7 @@ class TestModels:
         mid = m.json()["model_id"]
         assert client.get("/admin/models", headers=AUTH).json()["models"]
         assert client.get(f"/admin/models/{mid}", headers=AUTH).json()["success"] is True
-        u = client.patch(f"/admin/models/{mid}", params={"display_name": "GPT4"}, headers=AUTH)
+        u = client.patch(f"/admin/models/{mid}", json={"display_name": "GPT4"}, headers=AUTH)
         assert u.status_code == 200 and u.json()["model_id"] == mid
         assert client.get(f"/admin/models/{mid}", headers=AUTH).json()["model"]["display_name"] == "GPT4"
         assert client.delete(f"/admin/models/{mid}", headers=AUTH).json()["success"] is True
@@ -92,7 +93,7 @@ class TestModels:
         assert m.status_code == 200
 
     def test_update_missing(self, client):
-        assert client.patch("/admin/models/9999", params={"display_name": "x"}, headers=AUTH).status_code == 404
+        assert client.patch("/admin/models/9999", json={"display_name": "x"}, headers=AUTH).status_code == 404
 
     def test_create_with_missing_provider(self, client):
         m = client.post("/admin/models", json={"req": {"provider_id": 9999, "name": "ghost"}}, headers=AUTH)
@@ -109,14 +110,14 @@ class TestGroups:
         gid = g.json()["group_id"]
         assert client.get("/admin/groups", headers=AUTH).json()["groups"]
         assert client.get(f"/admin/groups/{gid}", headers=AUTH).json()["success"] is True
-        u = client.patch(f"/admin/groups/{gid}", params={"description": "up"}, headers=AUTH)
+        u = client.patch(f"/admin/groups/{gid}", json={"description": "up"}, headers=AUTH)
         assert u.status_code == 200 and u.json()["group_id"] == gid
         assert client.delete(f"/admin/groups/{gid}", headers=AUTH).json()["success"] is True
         assert client.get(f"/admin/groups/{gid}", headers=AUTH).status_code == 404
 
     def test_missing_branches(self, client):
         assert client.get("/admin/groups/9999", headers=AUTH).status_code == 404
-        assert client.patch("/admin/groups/9999", params={}, headers=AUTH).status_code == 404
+        assert client.patch("/admin/groups/9999", json={}, headers=AUTH).status_code == 404
         assert client.delete("/admin/groups/9999", headers=AUTH).status_code == 404
 
 
@@ -182,10 +183,30 @@ class TestLogs:
         assert r.status_code == 200 and len(r.json()["logs"]) == 1
 
 
+class TestStrategies:
+    def test_list_strategies(self, client):
+        from botflow.pipeline.base import STRATEGY_REGISTRY
+
+        r = client.get("/admin/strategies", headers=AUTH)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["success"] is True
+        assert body["strategies"] == sorted(STRATEGY_REGISTRY.keys())
+        assert body["strategies"], "at least one routing strategy must be registered"
+
+
 class TestSummaries:
     def test_get_summary(self, client):
         r = client.get("/admin/summaries/2099-01-01", headers=AUTH)
         assert r.status_code == 404
+
+    def test_get_existing_summary(self, client):
+        d = client.app.dependency_overrides[dbmod.get_db]()
+        asyncio.new_event_loop().run_until_complete(
+            d.upsert_daily_summary("2099-01-02", "# daily md", "{}"))
+        r = client.get("/admin/summaries/2099-01-02", headers=AUTH)
+        assert r.status_code == 200
+        assert r.json()["summary"]["summary_md"] == "# daily md"
 
 
 class TestApiKeys:
@@ -200,15 +221,119 @@ class TestApiKeys:
         kid = body["id"]
         listed = client.get("/admin/apikeys", headers=AUTH).json()["api_keys"]
         assert len(listed) == 1 and "secret-key" not in str(listed)
-        d = client.patch(f"/admin/apikeys/{kid}", params={"is_enabled": False}, headers=AUTH)
+        d = client.patch(f"/admin/apikeys/{kid}", json={"is_enabled": False}, headers=AUTH)
         assert d.status_code == 200 and d.json()["is_enabled"] is False
         rm = client.delete(f"/admin/apikeys/{kid}", headers=AUTH)
         assert rm.status_code == 200 and rm.json()["success"] is True
         assert client.get("/admin/apikeys", headers=AUTH).json()["api_keys"] == []
 
     def test_not_found(self, client):
-        assert client.patch("/admin/apikeys/9999", params={"is_enabled": False}, headers=AUTH).status_code == 404
+        assert client.patch("/admin/apikeys/9999", json={"is_enabled": False}, headers=AUTH).status_code == 404
         assert client.delete("/admin/apikeys/9999", headers=AUTH).status_code == 404
+
+
+class TestWriteEndpointsUseJsonBody:
+    """Regression guard: non-GET admin endpoints must read their payload from
+    the JSON body.
+
+    The auth dependency used to declare
+    ``credentials: HTTPAuthorizationCredentials = None``. FastAPI classifies a
+    Pydantic-typed *default* as a request-body field, and because the update
+    handlers had no other body parameter, that lone field captured the whole
+    body. Consequences ("点禁用报错" / "删除后列表不变"):
+
+      * PATCH /admin/models|providers|apikeys -> 422
+        ``{"loc": ["body", "scheme"], "msg": "Field required"}``
+      * PATCH /admin/groups -> 200 but the payload was silently dropped
+        (``params: dict`` was a second body field, so FastAPI switched to
+        embedding and every other value stayed at its default).
+
+    ``test_no_request_body_exposes_the_auth_model`` reads the generated OpenAPI
+    document so the whole bug class cannot silently return.
+    """
+
+    def _seed(self, client):
+        pid = client.post("/admin/providers", headers=AUTH,
+                          json={"req": {"name": "p1", "base_url": "https://x", "api_key": "sk-1"}}).json()["provider_id"]
+        mid = client.post("/admin/models", headers=AUTH,
+                          json={"req": {"provider_id": pid, "name": "m1"}}).json()["model_id"]
+        gid = client.post("/admin/groups", headers=AUTH, json={"req": {"name": "g1"}}).json()["group_id"]
+        kid = client.post("/admin/apikeys", headers=AUTH,
+                          json={"req": {"raw_key": "secret-key", "label": "t"}}).json()["id"]
+        return pid, mid, gid, kid
+
+    def test_no_request_body_exposes_the_auth_model(self, client):
+        spec = client.get("/openapi.json").json()
+        assert spec["paths"], "openapi spec should describe the admin routes"
+        for path, ops in spec["paths"].items():
+            for method, op in ops.items():
+                body = json.dumps(op.get("requestBody") or {})
+                assert "HTTPAuthorizationCredentials" not in body, (
+                    f"{method.upper()} {path} exposes the auth model as a request body"
+                )
+
+    def test_patch_provider_reads_body(self, client):
+        pid, _, _, _ = self._seed(client)
+        r = client.patch(f"/admin/providers/{pid}", headers=AUTH, json={
+            "name": "p2", "base_url": "https://y", "api_key": "sk-2",
+            "type": "anthropic", "is_enabled": False,
+        })
+        assert r.status_code == 200
+        p = client.get(f"/admin/providers/{pid}", headers=AUTH).json()["provider"]
+        assert p["name"] == "p2" and p["base_url"] == "https://y"
+        assert p["api_key"] == "sk-2" and p["provider_type"] == "anthropic"
+        assert p["is_enabled"] is False
+
+    def test_patch_model_toggle_persists(self, client):
+        _, mid, _, _ = self._seed(client)
+        assert client.patch(f"/admin/models/{mid}", headers=AUTH,
+                            json={"is_enabled": False}).status_code == 200
+        assert client.get(f"/admin/models/{mid}", headers=AUTH).json()["model"]["is_enabled"] is False
+        assert client.patch(f"/admin/models/{mid}", headers=AUTH,
+                            json={"is_enabled": True}).status_code == 200
+        assert client.get(f"/admin/models/{mid}", headers=AUTH).json()["model"]["is_enabled"] is True
+
+    def test_patch_model_reads_every_field(self, client):
+        _, mid, _, _ = self._seed(client)
+        r = client.patch(f"/admin/models/{mid}", headers=AUTH, json={
+            "name": "m2", "context_window": 8192, "display_name": "M2",
+            "api_format": "anthropic", "max_retries": 5,
+            "cooldown_seconds": 30, "cooldown_failure_threshold": 7,
+        })
+        assert r.status_code == 200
+        m = client.get(f"/admin/models/{mid}", headers=AUTH).json()["model"]
+        assert m["name"] == "m2" and m["context_window"] == 8192
+        assert m["display_name"] == "M2" and m["api_format"] == "anthropic"
+        assert (m["max_retries"], m["cooldown_seconds"], m["cooldown_failure_threshold"]) == (5, 30, 7)
+
+    def test_patch_group_reads_body(self, client):
+        _, _, gid, _ = self._seed(client)
+        fallback = client.post("/admin/groups", headers=AUTH,
+                               json={"req": {"name": "fallback"}}).json()["group_id"]
+        r = client.patch(f"/admin/groups/{gid}", headers=AUTH, json={
+            "name": "g2", "description": "d2", "is_enabled": False,
+            "fallback_group_id": fallback, "type": "round_robin", "params": {"weights": [1, 2]},
+        })
+        assert r.status_code == 200
+        g = client.get(f"/admin/groups/{gid}", headers=AUTH).json()["group"]
+        assert g["name"] == "g2" and g["description"] == "d2"
+        assert g["is_enabled"] is False and g["fallback_group_id"] == fallback
+        assert g["type"] == "round_robin" and g["params"] == {"weights": [1, 2]}
+
+    def test_patch_apikey_toggle_persists(self, client):
+        _, _, _, kid = self._seed(client)
+        r = client.patch(f"/admin/apikeys/{kid}", headers=AUTH, json={"is_enabled": False})
+        assert r.status_code == 200 and r.json()["is_enabled"] is False
+        assert client.get("/admin/apikeys", headers=AUTH).json()["api_keys"][0]["is_enabled"] is False
+
+    def test_patch_empty_body_keeps_existing_values(self, client):
+        pid, mid, gid, _ = self._seed(client)
+        assert client.patch(f"/admin/providers/{pid}", headers=AUTH, json={}).status_code == 200
+        assert client.patch(f"/admin/models/{mid}", headers=AUTH, json={}).status_code == 200
+        assert client.patch(f"/admin/groups/{gid}", headers=AUTH, json={}).status_code == 200
+        assert client.get(f"/admin/providers/{pid}", headers=AUTH).json()["provider"]["name"] == "p1"
+        assert client.get(f"/admin/models/{mid}", headers=AUTH).json()["model"]["name"] == "m1"
+        assert client.get(f"/admin/groups/{gid}", headers=AUTH).json()["group"]["name"] == "g1"
 
 
 class TestAdminDashboard:

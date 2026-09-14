@@ -4,17 +4,88 @@ Replaces the old MCP-based management tools with plain HTTP endpoints guarded
 by the admin key (BOTFLOW_ADMIN_KEY). Each route maps 1:1 to a former MCP tool.
 """
 
-from __future__ import annotations
+from typing import Optional
 
-from typing import Any, Optional
-
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from pydantic import BaseModel
 
 from botflow.auth import verify_admin_key
+from botflow.router import invalidate_endpoint_cache, invalidate_all_caches
 from botflow.storage.db import get_db
 from botflow.storage.models import ApiKey
 
 admin_router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+# ---------------------------------------------------------------------------
+# Request body models (replacing raw query params for create endpoints)
+#
+# Create endpoints declare ``Body(embed=True)`` so the payload stays wrapped as
+# ``{"req": {...}}``; that is the shape the shipped admin SPA sends, so keeping
+# it avoids a breaking change. PATCH never had a working body path at all
+# (its payload was silently ignored), so it uses the natural flat object.
+# ---------------------------------------------------------------------------
+
+class CreateProviderReq(BaseModel):
+    name: str
+    base_url: str
+    api_key: str = ""
+    type: str = "openai"
+    is_enabled: bool = True
+
+class CreateModelReq(BaseModel):
+    provider_id: int
+    name: str
+    type: str = "openai"
+    context_window: int = 0
+    api_format: str = ""
+    is_enabled: bool = True
+
+class CreateGroupReq(BaseModel):
+    name: str
+    description: str = ""
+    is_enabled: bool = True
+    fallback_group_id: Optional[int] = None
+    type: str = "random_weights"
+    params: Optional[dict] = None
+
+class CreateApiKeyReq(BaseModel):
+    raw_key: str
+    label: str = ""
+
+
+# Update bodies. Every field is optional: a PATCH only touches the keys the
+# client actually sent (``None`` means "leave as is"). They must be explicit
+# Pydantic models — bare scalar parameters are classified as *query* params by
+# FastAPI, so a client sending a JSON body would have it ignored (the request
+# then returns 200 without changing anything).
+class UpdateProviderReq(BaseModel):
+    name: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    type: Optional[str] = None
+    is_enabled: Optional[bool] = None
+
+class UpdateModelReq(BaseModel):
+    name: Optional[str] = None
+    context_window: Optional[int] = None
+    display_name: Optional[str] = None
+    api_format: Optional[str] = None
+    max_retries: Optional[int] = None
+    cooldown_seconds: Optional[int] = None
+    cooldown_failure_threshold: Optional[int] = None
+    is_enabled: Optional[bool] = None
+
+class UpdateGroupReq(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    is_enabled: Optional[bool] = None
+    fallback_group_id: Optional[int] = None
+    type: Optional[str] = None
+    params: Optional[dict] = None
+
+class UpdateApiKeyReq(BaseModel):
+    is_enabled: bool
 
 
 # ---------------------------------------------------------------------------
@@ -24,20 +95,15 @@ admin_router = APIRouter(prefix="/admin", tags=["admin"])
 
 @admin_router.post("/providers")
 async def create_provider(
-    name: str,
-    base_url: str,
-    api_key: str = "",
-    type: str = "openai",
-    is_enabled: bool = True,
+    req: CreateProviderReq = Body(embed=True),
     _=Depends(verify_admin_key),
 ):
-    # SECURITY NOTE: api_key 通过 query param 传递可能被 URL 日志记录。
-    # 后续重构时应改为 Pydantic Body 请求体，但需同步更新所有客户端调用。
     db = get_db()
     pid = await db.create_provider_raw(
-        name=name, type=type, base_url=base_url, api_key=api_key, is_enabled=is_enabled
+        name=req.name, type=req.type, base_url=req.base_url,
+        api_key=req.api_key, is_enabled=req.is_enabled,
     )
-    return {"success": True, "provider_id": pid, "name": name}
+    return {"success": True, "provider_id": pid, "name": req.name}
 
 
 @admin_router.get("/providers")
@@ -59,11 +125,7 @@ async def get_provider(provider_id: int, _=Depends(verify_admin_key)):
 @admin_router.patch("/providers/{provider_id}")
 async def update_provider(
     provider_id: int,
-    name: Optional[str] = None,
-    base_url: Optional[str] = None,
-    api_key: Optional[str] = None,
-    type: Optional[str] = None,
-    is_enabled: Optional[bool] = None,
+    req: UpdateProviderReq,
     _=Depends(verify_admin_key),
 ):
     db = get_db()
@@ -72,12 +134,13 @@ async def update_provider(
         raise HTTPException(status_code=404, detail={"success": False, "error": f"Provider {provider_id} not found"})
     await db.update_provider_raw(
         provider_id,
-        name=name if name is not None else provider.name,
-        base_url=base_url if base_url is not None else provider.base_url,
-        api_key=api_key if api_key is not None else provider.api_key,
-        type=type if type is not None else provider.provider_type,
-        is_enabled=is_enabled if is_enabled is not None else provider.is_enabled,
+        name=req.name if req.name is not None else provider.name,
+        base_url=req.base_url if req.base_url is not None else provider.base_url,
+        api_key=req.api_key if req.api_key is not None else provider.api_key,
+        type=req.type if req.type is not None else provider.provider_type,
+        is_enabled=req.is_enabled if req.is_enabled is not None else provider.is_enabled,
     )
+    invalidate_all_caches()
     return {"success": True, "provider_id": provider_id}
 
 
@@ -88,6 +151,7 @@ async def delete_provider(provider_id: int, _=Depends(verify_admin_key)):
     ok = await db.delete_provider_raw(provider_id)
     if not ok:
         raise HTTPException(status_code=404, detail={"success": False, "error": f"Provider {provider_id} not found"})
+    invalidate_all_caches()
     return {"success": True, "provider_id": provider_id}
 
 
@@ -98,23 +162,18 @@ async def delete_provider(provider_id: int, _=Depends(verify_admin_key)):
 
 @admin_router.post("/models")
 async def create_model(
-    provider_id: int,
-    name: str,
-    type: str = "openai",
-    context_window: int = 0,
-    api_format: str = "",
-    is_enabled: bool = True,
+    req: CreateModelReq = Body(embed=True),
     _=Depends(verify_admin_key),
 ):
     db = get_db()
-    provider = await db.get_provider_raw(provider_id)
+    provider = await db.get_provider_raw(req.provider_id)
     if not provider:
-        raise HTTPException(status_code=404, detail={"success": False, "error": f"Provider {provider_id} not found"})
+        raise HTTPException(status_code=404, detail={"success": False, "error": f"Provider {req.provider_id} not found"})
     mid = await db.create_model_raw(
-        provider_id=provider_id, name=name,
-        context_window=context_window, api_format=api_format, is_enabled=is_enabled,
+        provider_id=req.provider_id, name=req.name,
+        context_window=req.context_window, api_format=req.api_format, is_enabled=req.is_enabled,
     )
-    return {"success": True, "model_id": mid, "name": name}
+    return {"success": True, "model_id": mid, "name": req.name}
 
 
 @admin_router.get("/models")
@@ -140,15 +199,7 @@ async def get_model(model_id: int, _=Depends(verify_admin_key)):
 @admin_router.patch("/models/{model_id}")
 async def update_model(
     model_id: int,
-    name: Optional[str] = None,
-    type: Optional[str] = None,
-    context_window: Optional[int] = None,
-    display_name: Optional[str] = None,
-    api_format: Optional[str] = None,
-    max_retries: Optional[int] = None,
-    cooldown_seconds: Optional[int] = None,
-    cooldown_failure_threshold: Optional[int] = None,
-    is_enabled: Optional[bool] = None,
+    req: UpdateModelReq,
     _=Depends(verify_admin_key),
 ):
     db = get_db()
@@ -157,15 +208,16 @@ async def update_model(
         raise HTTPException(status_code=404, detail={"success": False, "error": f"Model {model_id} not found"})
     await db.update_model_raw(
         model_id,
-        name=name if name is not None else model.name,
-        context_window=context_window if context_window is not None else model.context_window,
-        display_name=display_name if display_name is not None else model.display_name,
-        api_format=api_format if api_format is not None else model.api_format,
-        max_retries=max_retries if max_retries is not None else model.max_retries,
-        cooldown_seconds=cooldown_seconds if cooldown_seconds is not None else model.cooldown_seconds,
-        cooldown_failure_threshold=cooldown_failure_threshold if cooldown_failure_threshold is not None else model.cooldown_failure_threshold,
-        is_enabled=is_enabled if is_enabled is not None else model.is_enabled,
+        name=req.name if req.name is not None else model.name,
+        context_window=req.context_window if req.context_window is not None else model.context_window,
+        display_name=req.display_name if req.display_name is not None else model.display_name,
+        api_format=req.api_format if req.api_format is not None else model.api_format,
+        max_retries=req.max_retries if req.max_retries is not None else model.max_retries,
+        cooldown_seconds=req.cooldown_seconds if req.cooldown_seconds is not None else model.cooldown_seconds,
+        cooldown_failure_threshold=req.cooldown_failure_threshold if req.cooldown_failure_threshold is not None else model.cooldown_failure_threshold,
+        is_enabled=req.is_enabled if req.is_enabled is not None else model.is_enabled,
     )
+    invalidate_all_caches()
     return {"success": True, "model_id": model_id}
 
 
@@ -175,6 +227,7 @@ async def delete_model(model_id: int, _=Depends(verify_admin_key)):
     ok = await db.delete_model_raw(model_id)
     if not ok:
         raise HTTPException(status_code=404, detail={"success": False, "error": f"Model {model_id} not found"})
+    invalidate_all_caches()
     return {"success": True, "model_id": model_id}
 
 
@@ -185,17 +238,15 @@ async def delete_model(model_id: int, _=Depends(verify_admin_key)):
 
 @admin_router.post("/groups")
 async def create_group(
-    name: str,
-    description: str = "",
-    is_enabled: bool = True,
-    fallback_group_id: Optional[int] = None,
+    req: CreateGroupReq = Body(embed=True),
     _=Depends(verify_admin_key),
 ):
     db = get_db()
     gid = await db.create_group_raw(
-        name=name, description=description, is_enabled=is_enabled, fallback_group_id=fallback_group_id
+        name=req.name, description=req.description, is_enabled=req.is_enabled,
+        fallback_group_id=req.fallback_group_id, type=req.type, params=req.params,
     )
-    return {"success": True, "group_id": gid, "name": name}
+    return {"success": True, "group_id": gid, "name": req.name}
 
 
 @admin_router.get("/groups")
@@ -217,10 +268,7 @@ async def get_group(group_id: int, _=Depends(verify_admin_key)):
 @admin_router.patch("/groups/{group_id}")
 async def update_group(
     group_id: int,
-    name: Optional[str] = None,
-    description: Optional[str] = None,
-    is_enabled: Optional[bool] = None,
-    fallback_group_id: Optional[int] = None,
+    req: UpdateGroupReq,
     _=Depends(verify_admin_key),
 ):
     db = get_db()
@@ -229,11 +277,14 @@ async def update_group(
         raise HTTPException(status_code=404, detail={"success": False, "error": f"Group {group_id} not found"})
     await db.update_group_raw(
         group_id,
-        name=name if name is not None else group.name,
-        description=description if description is not None else group.description,
-        is_enabled=is_enabled if is_enabled is not None else group.is_enabled,
-        fallback_group_id=fallback_group_id if fallback_group_id is not None else group.fallback_group_id,
+        name=req.name if req.name is not None else group.name,
+        description=req.description if req.description is not None else group.description,
+        is_enabled=req.is_enabled if req.is_enabled is not None else group.is_enabled,
+        fallback_group_id=req.fallback_group_id if req.fallback_group_id is not None else group.fallback_group_id,
+        type=req.type if req.type is not None else group.type,
+        params=req.params if req.params is not None else group.params,
     )
+    invalidate_endpoint_cache(group_id)
     return {"success": True, "group_id": group_id}
 
 
@@ -243,6 +294,7 @@ async def delete_group(group_id: int, _=Depends(verify_admin_key)):
     ok = await db.delete_group_raw(group_id)
     if not ok:
         raise HTTPException(status_code=404, detail={"success": False, "error": f"Group {group_id} not found"})
+    invalidate_endpoint_cache(group_id)
     return {"success": True, "group_id": group_id}
 
 
@@ -259,6 +311,7 @@ async def add_model_to_group(
     if not model:
         raise HTTPException(status_code=404, detail={"success": False, "error": f"Model {model_id} not found"})
     await db.add_model_to_group_raw(group_id, model_id, weight=weight)
+    invalidate_endpoint_cache(group_id)
     return {"success": True, "group_id": group_id, "model_id": model_id}
 
 
@@ -266,6 +319,7 @@ async def add_model_to_group(
 async def remove_model_from_group(group_id: int, model_id: int, _=Depends(verify_admin_key)):
     db = get_db()
     await db.remove_model_from_group_raw(group_id, model_id)
+    invalidate_endpoint_cache(group_id)
     return {"success": True, "group_id": group_id, "model_id": model_id}
 
 
@@ -277,6 +331,7 @@ async def update_model_weight(
 ):
     db = get_db()
     await db.update_model_weight_raw(group_id, model_id, weight=weight)
+    invalidate_endpoint_cache(group_id)
     return {"success": True, "group_id": group_id, "model_id": model_id}
 
 
@@ -292,6 +347,19 @@ async def get_group_details(group_id: int, _=Depends(verify_admin_key)):
         "group": group.model_dump(),
         "models": [m.model_dump() for m in models],
     }
+
+
+# ---------------------------------------------------------------------------
+# Strategies
+# ---------------------------------------------------------------------------
+
+
+@admin_router.get("/strategies")
+async def list_strategies(_=Depends(verify_admin_key)):
+    """Return registered strategy types."""
+    from botflow.pipeline.base import STRATEGY_REGISTRY
+    strategies = sorted(STRATEGY_REGISTRY.keys())
+    return {"success": True, "strategies": strategies}
 
 
 # ---------------------------------------------------------------------------
@@ -366,12 +434,11 @@ async def get_summary(day: str, _=Depends(verify_admin_key)):
 
 @admin_router.post("/apikeys")
 async def create_api_key(
-    raw_key: str,
-    label: str = "",
+    req: CreateApiKeyReq = Body(embed=True),
     _=Depends(verify_admin_key),
 ):
     db = get_db()
-    key = await db.create_api_key(raw_key, label=label)
+    key = await db.create_api_key(req.raw_key, label=req.label)
     # Return only a hash prefix — never the raw key after creation.
     return {
         "success": True,
@@ -404,14 +471,14 @@ async def list_api_keys(_=Depends(verify_admin_key)):
 @admin_router.patch("/apikeys/{key_id}")
 async def set_api_key_enabled(
     key_id: int,
-    is_enabled: bool,
+    req: UpdateApiKeyReq,
     _=Depends(verify_admin_key),
 ):
     db = get_db()
-    ok = await db.set_api_key_enabled(key_id, is_enabled)
+    ok = await db.set_api_key_enabled(key_id, req.is_enabled)
     if not ok:
         raise HTTPException(status_code=404, detail={"success": False, "error": f"API key {key_id} not found"})
-    return {"success": True, "key_id": key_id, "is_enabled": is_enabled}
+    return {"success": True, "key_id": key_id, "is_enabled": req.is_enabled}
 
 
 @admin_router.delete("/apikeys/{key_id}")

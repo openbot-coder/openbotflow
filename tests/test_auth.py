@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 from fastapi import HTTPException
+from fastapi.security import HTTPAuthorizationCredentials
 
 from botflow.auth import _extract_token, resolve_api_key, verify_admin_key, verify_llm_key
 from botflow.config import BotflowSettings, set_config
@@ -112,7 +113,7 @@ class TestVerifyLLMKey:
             class Req:
                 def __init__(self):
                     self.state = type("S", (), {})()
-            creds = type("C", (), {"credentials": "legacy-key"})()
+            creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials="legacy-key")
             req = Req()
             ak = await verify_llm_key(req, authorization="Bearer junk", credentials=creds, db=db)
             assert ak.id == 0
@@ -178,7 +179,7 @@ class TestVerifyAdminKey:
             class Req:
                 def __init__(self):
                     self.state = type("S", (), {})()
-            creds = type("C", (), {"credentials": "admin-secret"})()
+            creds = HTTPAuthorizationCredentials(scheme="Bearer", credentials="admin-secret")
             req = Req()
             await verify_admin_key(req, authorization="Bearer junk", credentials=creds)
             assert req.state.is_admin is True
