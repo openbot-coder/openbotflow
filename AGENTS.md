@@ -153,3 +153,59 @@ botflow/
     ├── providers/         # LLM 供应商适配
     └── storage/           # 数据库层
 ```
+
+---
+
+---
+
+> 以下章节原样迁移自生产服务器 `/mnt/deploy/botflow` 的 `AGENTS.md`（2026-09-15 快照），此前从未入库。
+> ⚠️ 内容为 2026-08 的历史快照，部分已过时（如模型组配置、`src/botflow/mcp/registry.py` 已于 P7 清理），保留以存档。最新事实以 `.workbuddy/memory/MEMORY.md` 为准。
+
+## 项目目录管理规范
+
+```
+botflow/
+│
+├── AGENTS.md              # AI 助手行为规范（本文件）
+├── README.md              # 项目介绍
+├── pyproject.toml         # Python 包配置（依赖、构建、CLI 入口）
+├── .python-version        # Python 版本锁定
+│
+├── scripts/               # 存放各种脚本
+│
+├── docs/
+│   └── design.md          # 系统设计文档（架构、数据模型、API 定义）
+│
+└── src/botflow/           # 源码根包
+    ├── __init__.py        # 包入口
+    ├── cli.py             # CLI 命令行
+    ├── config.py          # 全局配置 + .env 加载
+    ├── workspace.py       # Workspace 路径管理
+    ├── core.py            # FastAPI 主服务
+    ├── router.py          # 核心路由引擎
+    ├── protocol_adapter.py# 协议适配层
+    ├── auth.py            # 鉴权中间件
+    ├── admin_api.py       # REST 管理接口
+    ├── daily_summary.py   # 每日摘要定时任务
+    ├── rate_limit.py      # IP 级速率限制
+    ├── common/            # 通用工具
+    ├── providers/         # LLM 供应商适配
+    └── storage/           # 数据库层
+```
+
+## 部署与运维笔记（迁移自 agent 长期记忆，2026-08-11）
+
+> 项目概况：AI 模型路由网关 V0.2.1；直接运行；v2.2.0
+
+- 源码：`/home/openbot/workspace/projects/openbotflow`（远程 github.com/openbot-coder/openbotflow.git，develop 跟踪 origin/develop）；生产：`/mnt/deploy/botflow/`
+- 部署：直接运行（openbot 用户），端口 4000；`--workspace` 必须在子命令前
+- **MCP 客户端注册**：`/mnt/deploy/botflow/mcp.json` 引用 llm-wiki 与 sim-trade（端点见 botflow-mcp skill）
+- 数据库：`/mnt/deploy/botflow/data/botflow.db`（生产无 sqlite3 CLI，须用 Python 模块）
+- 模型组：fast=1（现仅含 zd/deepseek-v4-flash，2026-08-05 由 zd/mimo-v2.5 更换，用户确认）/ free=2(openrouter+tencent) / smart=3(mimo-v2.5-pro+glm5.2+kimi-k2.6) / backup=4(deepseek-v4-flash)；顺序 fallback
+- 路由：reasoning_content 需回传（opencode.ai 上游 API 要求多轮对话中回传，openai_compat provider 未携带则触发 cooldown 循环）
+- **Web search**：仅配百度 API key（baidu_web_search / baidu_ai_search）；engines 列表含 bing/sogou/baidu/360/duckduckgo/brave，但实际调用 bing 报 "unknown search provider 'bing'"
+- **tool_search**：SimpleBM25（src/botflow/mcp/registry.py，k1=1.5、b=0.75、BM25+ IDF 变体）；tokenize 按非字母数字/非 CJK 切分，连续中文为整 token（不分词）→ 中文查询匹配率低、英文可靠（用户因此要求默认英文检索）；长度归一化（b=0.75）压低长文档分，单篇超长文档拉高全局 avgdl 扭曲索引分数分布，描述越长中文子串匹配率越低
+- 测试：`PYTHONPATH=src make test-cov`
+- **已知问题**：mimo-v2.5 超时等待首个 chunk，导致 fast 组失败 fallback 到 group 4；vex/zd provider 401 持续（API key 不匹配）；「Provider authentication failed」错误来自 nanobot gateway 而非 botflow 本身
+- **已修复**：cooldown 持久化（`time.monotonic()` → `time.time()`；`remaining_seconds` → `cooldown_until` KeyError）；2026-08-03 双源同步
+- **历史错误模式**（7/31）：Group models exhausted(46) > Console Go upstream failed(45) > deepseek package missing(12)
