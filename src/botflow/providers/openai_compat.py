@@ -4,9 +4,16 @@ Uses the official openai SDK which supports:
 - Direct OpenAI API
 - Azure OpenAI
 - Any OpenAI-compatible endpoint (vLLM, Ollama, etc.)
+
+``extra_config["headers"]`` adds custom request headers.  Some upstreams require
+this — e.g. OpenCode Go rejects requests with a generic SDK user agent and needs
+a stable per-conversation ``x-opencode-session``; use the ``{conversation_id}``
+placeholder to derive one from the conversation itself.
 """
 
 from __future__ import annotations
+
+import hashlib
 
 from typing import Any, AsyncGenerator
 
@@ -41,6 +48,42 @@ def _extract_text_from_content(content: Any) -> str:
                 parts.append(item.get("text", ""))
         return " ".join(parts)
     return str(content) if content else ""
+
+
+def _conversation_id(messages: list[dict[str, Any]]) -> str:
+    """Stable digest of a conversation, for upstreams that key routing on it.
+
+    Seeds on the system prompt plus the *first* user message.  OpenAI-style
+    histories are append-only, so those two never move — every turn of the same
+    conversation hashes the same, while different conversations differ.
+    """
+    system = next((m for m in messages if m.get("role") == "system"), None)
+    first_user = next((m for m in messages if m.get("role") == "user"), None)
+    seed = "{}\n{}".format(
+        _extract_text_from_content(system.get("content")) if system else "",
+        _extract_text_from_content(first_user.get("content")) if first_user else "",
+    )
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+
+
+def _apply_headers(
+    extra_config: dict[str, Any],
+    messages: list[dict[str, Any]],
+) -> dict[str, str] | None:
+    """Resolve ``extra_config["headers"]`` into request headers.
+
+    Values pass through as-is, except the ``{conversation_id}`` placeholder,
+    which is replaced with :func:`_conversation_id`.  Returns ``None`` when
+    nothing is configured, so the SDK keeps its own defaults.
+    """
+    raw = extra_config.get("headers")
+    if not isinstance(raw, dict) or not raw:
+        return None
+    headers = {str(k): str(v) for k, v in raw.items()}
+    if not any("{conversation_id}" in v for v in headers.values()):
+        return headers
+    cid = _conversation_id(messages)
+    return {k: v.replace("{conversation_id}", cid) for k, v in headers.items()}
 
 
 class OpenAICompatProvider(BaseProvider):
@@ -99,6 +142,7 @@ class OpenAICompatProvider(BaseProvider):
                 temperature=temperature,
                 max_tokens=max_tokens,
                 stream=False,
+                extra_headers=_apply_headers(self.extra_config, messages),
                 **kwargs,
             )
             return self._to_unified(response.model_dump(), model)
@@ -124,6 +168,7 @@ class OpenAICompatProvider(BaseProvider):
                 max_tokens=max_tokens,
                 stream=True,
                 stream_options=stream_options,
+                extra_headers=_apply_headers(self.extra_config, messages),
                 **kwargs,
             )
             async for chunk in stream:
