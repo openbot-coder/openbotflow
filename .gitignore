@@ -36,11 +36,11 @@ data/
 logs/
 *.log
 
-# Temp/debug files
-_*.py
-_*.log
-_*.txt
-_*.json
+# Temp/debug files (root-only: keep nested package files like pipeline/_shared.py tracked)
+/_*.py
+/_*.log
+/_*.txt
+/_*.json
 prod_core.py
 
 # Environment variables
@@ -58,3 +58,27 @@ uv.lock
 
 # Tools
 .qoder/
+
+# Local scratch / debug artifacts (never commit)
+.workbuddy/
+*.cover
+covout/
+covout2/
+*.dat
+ocr-bin/
+/check_*.py
+/debug*.py
+/cov_sync.py
+/extract_conversations.py
+/find_real_conversations.py
+/test_*.py
+/ck*.txt
+/dbg*.txt
+/r[0-9].txt
+/covrun*.txt
+/p01.txt
+/pip.txt
+/pytest_*.txt
+/test_output.txt
+/test_result.txt
+/rtrace.txt

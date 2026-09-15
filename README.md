@@ -15,12 +15,13 @@ botflow 是一个轻量级 AI 中间件平台，提供三大核心能力：
 2. **LLM-Wiki** - 基于 Memory Agent 的自主维护知识库（Phase 2）
 3. **IM Bridge** - 多平台 IM 统一接入（Phase 3）
 
-当前版本：**Phase 1 - LLM Proxy**
+当前版本：**v3.0.0 — LangGraph 工作流引擎（PipelineEngine + 策略系统）**
 
 ## 核心特性
 
 - **四种 API 格式** - OpenAI Chat Completions / Responses、Anthropic Messages、Google Gemini、DeepSeek 全兼容
 - **per-model SDK 覆盖** - `api_format` 字段实现单 Provider 聚合多厂商模型（中转站场景）
+- **工作流引擎** - 基于 LangGraph 的 `PipelineEngine` + 可插拔策略系统（fallback / round_robin / weighted / langgraph），分组路由由策略驱动
 - **分组路由** - 权重随机选择，支持跨 Provider 模型混合调度，失败自动降级到 fallback group
 - **错误容错** - 自动重试、冷却机制、故障转移
 - **Context Window Truncation** - 按最小上下文窗口截断超长消息（BM25 相关性排序）

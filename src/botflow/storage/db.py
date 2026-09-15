@@ -72,6 +72,8 @@ CREATE TABLE IF NOT EXISTS model_groups (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
     description TEXT NOT NULL DEFAULT '',
+    type TEXT NOT NULL DEFAULT 'random_weights',
+    params TEXT NOT NULL DEFAULT '{}',
     is_enabled INTEGER NOT NULL DEFAULT 1,
     fallback_group_id INTEGER,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -216,6 +218,13 @@ class Database:
                 await self._conn.execute(f"SELECT {col_name} FROM call_logs LIMIT 1")
             except sqlite3.OperationalError:  # UNCOVERED: 旧库迁移路径，全新数据库已含审计列，无法单元测试触发
                 await self._conn.execute(f"ALTER TABLE call_logs ADD COLUMN {col}")  # UNCOVERED
+
+        # Migrations for model_groups (new type/params columns) — P1-1
+        try:
+            await self._conn.execute("SELECT type FROM model_groups LIMIT 1")
+        except sqlite3.OperationalError:  # UNCOVERED: 旧库迁移路径，全新数据库已含该列，无法单元测试触发
+            await self._conn.execute("ALTER TABLE model_groups ADD COLUMN type TEXT NOT NULL DEFAULT 'random_weights'")  # UNCOVERED
+            await self._conn.execute("ALTER TABLE model_groups ADD COLUMN params TEXT NOT NULL DEFAULT '{}'")  # UNCOVERED
 
         await self._conn.executescript(CREATE_INDEXES_SQL)
         await self._conn.commit()
@@ -532,22 +541,29 @@ class Database:
     async def create_group(self, group: ModelGroup) -> int:
         conn = await self._ensure_connection()
         cursor = await conn.execute(
-            "INSERT INTO model_groups (name, description, is_enabled) VALUES (?, ?, ?)",
-            (group.name, group.description, 1 if group.is_enabled else 0),
+            "INSERT INTO model_groups (name, description, type, params, is_enabled) VALUES (?, ?, ?, ?, ?)",
+            (group.name, group.description, group.type, json.dumps(group.params), 1 if group.is_enabled else 0),
         )
         await conn.commit()
         return cursor.lastrowid  # type: ignore[return-value]
 
-    _GROUP_UPDATE_COLUMNS = {"name", "description", "is_enabled", "fallback_group_id"}
+    _GROUP_UPDATE_COLUMNS = {"name", "description", "is_enabled", "fallback_group_id", "type", "params"}  # P1-1: added type/params
 
     async def update_group(self, group_id: int, updates: dict[str, Any]) -> None:
         conn = await self._ensure_connection()
         for key in updates:
             if key not in self._GROUP_UPDATE_COLUMNS:
                 raise ValueError(f"Invalid column for group update: {key}")
-        sets = [f"{k} = ?" for k in updates]
-        values = list(updates.values()) + [group_id]
+        sets = []
+        values = []
+        for key, value in updates.items():
+            if key == "params":
+                # params 必须是 dict 或 None；若已为 JSON 字符串则直接存储
+                value = json.dumps(value) if isinstance(value, dict) else (value or '{}')
+            sets.append(f"{key} = ?")
+            values.append(value)
         sets.append("updated_at = datetime('now')")
+        values.append(group_id)
         await conn.execute(f"UPDATE model_groups SET {', '.join(sets)} WHERE id = ?", values)
         await conn.commit()
 
@@ -577,10 +593,17 @@ class Database:
         return [self._row_to_group(r) for r in rows]
 
     def _row_to_group(self, row: sqlite3.Row) -> ModelGroup:
+        params_raw = row["params"]
+        try:
+            params = json.loads(params_raw) if params_raw else {}
+        except (json.JSONDecodeError, TypeError):
+            params = {}
         return ModelGroup(
             id=row["id"],
             name=row["name"],
             description=row["description"],
+            type=row["type"],
+            params=params,
             is_enabled=bool(row["is_enabled"]),
             fallback_group_id=row["fallback_group_id"],
         )
@@ -618,7 +641,7 @@ class Database:
         conn = await self._ensure_connection()
         sql = """
             SELECT
-                mg.id, mg.name, mg.description, mg.is_enabled,
+                mg.id, mg.name, mg.description, mg.type, mg.params, mg.is_enabled,
                 m.name AS model_name
             FROM model_groups mg
             JOIN group_models gm ON gm.group_id = mg.id
@@ -637,10 +660,17 @@ class Database:
         for row in rows:
             gid = row["id"]
             if gid not in groups_map:
+                params_raw = row["params"]
+                try:
+                    params = json.loads(params_raw) if params_raw else {}
+                except (json.JSONDecodeError, TypeError):
+                    params = {}
                 groups_map[gid] = {
                     "id": gid,
                     "name": row["name"],
                     "description": row["description"],
+                    "type": row["type"],
+                    "params": params,
                     "is_enabled": bool(row["is_enabled"]),
                     "model_names": [],
                 }
@@ -1034,9 +1064,12 @@ class Database:
     async def delete_model_raw(self, model_id: int) -> int:
         return await self.delete_model(model_id)
 
-    async def create_group_raw(self, *, name, description="", is_enabled=True, fallback_group_id=None) -> ModelGroup:
+    async def create_group_raw(self, *, name, description="", is_enabled=True,
+                               fallback_group_id=None, type="random_weights", params=None) -> ModelGroup:  # P1-1: added type/params
         return await self.create_group(ModelGroup(
-            name=name, description=description, is_enabled=is_enabled, fallback_group_id=fallback_group_id
+            name=name, description=description, type=type,
+            params=params if params is not None else {},
+            is_enabled=is_enabled, fallback_group_id=fallback_group_id
         ))
 
     async def get_group_raw(self, group_id: int) -> Optional[ModelGroup]:
@@ -1048,11 +1081,14 @@ class Database:
     async def list_groups_raw(self, enabled_only: bool = False) -> list[ModelGroup]:
         return await self.list_groups(enabled_only=enabled_only)
 
-    async def update_group_raw(self, group_id, *, name, description, is_enabled, fallback_group_id) -> None:
+    async def update_group_raw(self, group_id, *, name, description, is_enabled,
+                               fallback_group_id, type="random_weights", params=None) -> None:  # P1-1: added type/params
         conn = await self._ensure_connection()
         await conn.execute(
-            "UPDATE model_groups SET name=?, description=?, is_enabled=?, fallback_group_id=? WHERE id=?",
-            (name, description, 1 if is_enabled else 0, fallback_group_id, group_id),
+            "UPDATE model_groups SET name=?, description=?, type=?, params=?, is_enabled=?, fallback_group_id=? WHERE id=?",
+            (name, description, type,
+             json.dumps(params) if isinstance(params, dict) else (params or '{}'),  # P1-1: params JSON serialization
+             1 if is_enabled else 0, fallback_group_id, group_id),
         )
         await conn.commit()
 

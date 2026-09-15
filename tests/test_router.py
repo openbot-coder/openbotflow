@@ -14,7 +14,6 @@ from botflow.common.exceptions import (
 )
 from botflow.router import (
     CooldownManager,
-    GroupRouter,
     weighted_random_order,
     weighted_random_select,
     is_retryable_error,
@@ -221,10 +220,11 @@ class TestExponentialBackoff:
 # GroupRouter tests (with mocked DB)
 # ---------------------------------------------------------------------------
 
-class TestGroupRouter:
+class TestPipelineEngineRouting:
+    """Tests for PipelineEngine routing (replaced old GroupRouter tests)."""
+
     @pytest.fixture(autouse=True)
     def _clear_caches(self):
-        # 全局 endpoint/provider 缓存会让测试顺序相关，每个测试前清空
         from botflow.router import _endpoint_cache, _provider_cache
         _endpoint_cache.clear()
         _provider_cache.clear()
@@ -234,38 +234,51 @@ class TestGroupRouter:
         return AsyncMock()
 
     @pytest.fixture
-    def router(self, mock_db):
-        return GroupRouter(group_id=1, db=mock_db, cooldown_manager=CooldownManager())
+    def engine(self, mock_db):
+        from botflow.pipeline.engine import PipelineEngine
+        return PipelineEngine(db_factory=lambda: mock_db, cooldown=CooldownManager())
+
+    def _make_group(self, group_id=1, name="default", type_="random_weights", params=None, fallback_group_id=None):
+        from botflow.storage.models import ModelGroup
+        return ModelGroup(
+            id=group_id, name=name, description="test", is_enabled=True,
+            type=type_, params=params or {}, fallback_group_id=fallback_group_id,
+            created_at="2026-01-01", updated_at="2026-01-01",
+        )
 
     @pytest.mark.asyncio
-    async def test_no_models_in_group(self, router, mock_db):
+    async def test_no_models_in_group(self, engine, mock_db):
+        group = self._make_group()
+        mock_db.get_group.return_value = group
         mock_db.get_group_models.return_value = []
         with pytest.raises(NoAvailableModelError):
-            await router.route(messages=[{"role": "user", "content": "hi"}])
+            await engine.route(group=group, messages=[{"role": "user", "content": "hi"}])
 
     @pytest.mark.asyncio
-    async def test_no_available_provider(self, router, mock_db):
-        mock_db.get_group_models.return_value = [
-            _make_model_detail(1, 1.0)
-        ]
+    async def test_no_available_provider(self, engine, mock_db):
+        group = self._make_group()
+        mock_db.get_group.return_value = group
+        mock_db.get_group_models.return_value = [_make_model_detail(1, 1.0)]
         mock_db.get_provider.return_value = None
         with pytest.raises(NoAvailableModelError):
-            await router.route(messages=[{"role": "user", "content": "hi"}])
+            await engine.route(group=group, messages=[{"role": "user", "content": "hi"}])
 
     @pytest.mark.asyncio
-    async def test_disabled_provider_skipped(self, router, mock_db):
-        mock_db.get_group_models.return_value = [
-            _make_model_detail(1, 1.0)
-        ]
+    async def test_disabled_provider_skipped(self, engine, mock_db):
+        group = self._make_group()
+        mock_db.get_group.return_value = group
+        mock_db.get_group_models.return_value = [_make_model_detail(1, 1.0)]
         disabled_provider = Provider(id=1, name="disabled", provider_type="openai", is_enabled=False)
         mock_db.get_provider.return_value = disabled_provider
         with pytest.raises(NoAvailableModelError):
-            await router.route(messages=[{"role": "user", "content": "hi"}])
+            await engine.route(group=group, messages=[{"role": "user", "content": "hi"}])
 
     # -- streaming routing -------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_route_stream_returns_all_available_in_weighted_order(self, router, mock_db):
+    async def test_route_stream_returns_all_available(self, engine, mock_db):
+        group = self._make_group()
+        mock_db.get_group.return_value = group
         mock_db.get_group_models.return_value = [
             _make_model_detail(1, 1.0),
             _make_model_detail(2, 2.0),
@@ -273,54 +286,45 @@ class TestGroupRouter:
         mock_db.get_provider.return_value = Provider(id=1, name="p", provider_type="openai")
 
         msgs = [{"role": "user", "content": "hi"}]
-        result = await router.route(messages=msgs, temperature=0.5, max_tokens=100, stream=True, tools=[{"type": "function"}])
+        result = await engine.route_stream(group=group, messages=msgs, temperature=0.5, max_tokens=100, tools=[{"type": "function"}])
 
         assert result["group_id"] == 1
-        assert {ep.model_id for ep in result["endpoints"]} == {1, 2}  # 所有可用模型都作为候选
+        assert {ep.model_id for ep in result["endpoints"]} == {1, 2}
         assert result["temperature"] == 0.5
         assert result["max_tokens"] == 100
         assert result["kwargs"] == {"tools": [{"type": "function"}]}
         assert result["messages"] == msgs
 
     @pytest.mark.asyncio
-    async def test_route_stream_excludes_cooldown_models(self, mock_db):
-        cm = CooldownManager()
-        cm.record_failure(1, 2, 1, 60)  # model 2 冷却中
-        router = GroupRouter(group_id=1, db=mock_db, cooldown_manager=cm)
+    async def test_route_stream_excludes_cooldown_models(self, engine, mock_db):
+        cm = engine.cooldown
+        cm.record_failure(1, 2, 1, 60)
+        group = self._make_group()
+        mock_db.get_group.return_value = group
         mock_db.get_group_models.return_value = [
             _make_model_detail(1, 1.0),
             _make_model_detail(2, 2.0),
         ]
         mock_db.get_provider.return_value = Provider(id=1, name="p", provider_type="openai")
 
-        result = await router.route(messages=[{"role": "user", "content": "hi"}], stream=True)
-
+        result = await engine.route_stream(group=group, messages=[{"role": "user", "content": "hi"}])
         assert [ep.model_id for ep in result["endpoints"]] == [1]
 
     @pytest.mark.asyncio
-    async def test_route_stream_all_on_cooldown_raises(self, mock_db):
-        cm = CooldownManager()
+    async def test_route_stream_all_on_cooldown_fallback(self, engine, mock_db):
+        cm = engine.cooldown
         cm.record_failure(1, 1, 1, 60)
-        router = GroupRouter(group_id=1, db=mock_db, cooldown_manager=cm)
-        mock_db.get_group_models.return_value = [_make_model_detail(1, 1.0)]
-        mock_db.get_provider.return_value = Provider(id=1, name="p", provider_type="openai")
+        group = self._make_group(group_id=1, fallback_group_id=4)
+        group4 = self._make_group(group_id=4, name="fallback")
 
-        with pytest.raises(AllModelsCooldownError):
-            await router.route(messages=[{"role": "user", "content": "hi"}], stream=True)
-
-    @pytest.mark.asyncio
-    async def test_route_stream_falls_back_to_group_when_all_on_cooldown(self, mock_db):
-        cm = CooldownManager()
-        cm.record_failure(1, 1, 1, 60)
-        router = GroupRouter(group_id=1, db=mock_db, cooldown_manager=cm, fallback_group_id=4)
+        mock_db.get_group.side_effect = lambda gid: group if gid == 1 else group4
         mock_db.get_group_models.side_effect = (
             lambda gid, enabled_only=True: [_make_model_detail(1, 1.0)] if gid == 1 else [_make_model_detail(2, 1.0)]
         )
         mock_db.get_provider.return_value = Provider(id=1, name="p", provider_type="openai")
 
-        result = await router.route(messages=[{"role": "user", "content": "hi"}], stream=True)
-
-        assert result["group_id"] == 4  # 结果是 fallback 组的
+        result = await engine.route_stream(group=group, messages=[{"role": "user", "content": "hi"}])
+        assert result["group_id"] == 4
         assert [ep.model_id for ep in result["endpoints"]] == [2]
 
 

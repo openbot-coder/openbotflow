@@ -30,7 +30,7 @@ def _log(**kw):
 
 
 def _group(name, gid):
-    return types.SimpleNamespace(id=gid, name=name, is_enabled=True)
+    return types.SimpleNamespace(id=gid, name=name, is_enabled=True, type="random_weights", params={})
 
 
 def test_yesterday_day_default():
@@ -98,15 +98,17 @@ async def test_generate_wiki_falls_back_to_first_group(monkeypatch):
 
     captured = {}
 
-    class FakeRouter:
-        def __init__(self, group_id, db):
+    from botflow.pipeline.base import STRATEGY_REGISTRY
+
+    class FakeStrategy:
+        def __init__(self, params=None):
+            captured["params"] = params
+        async def execute(self, messages, db, cooldown, group_id, **kwargs):
             captured["group_id"] = group_id
             captured["db"] = db
+            return {"choices": [{"message": {"content": "wiki entry"}}]}
 
-        async def route(self, **kwargs):
-            return {"content": "wiki entry"}
-
-    monkeypatch.setattr(ds, "GroupRouter", FakeRouter)
+    monkeypatch.setitem(STRATEGY_REGISTRY, "random_weights", FakeStrategy)
     set_config(BotflowSettings(summary_group="does-not-exist"))
     try:
         out = await ds._generate_wiki(DB(), None, get_config())

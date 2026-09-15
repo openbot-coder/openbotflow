@@ -17,6 +17,7 @@ from botflow.common.exceptions import (
 )
 from botflow.common.context import truncate_to_context_window
 from botflow.common.logger import get_logger
+from botflow.config import get_config
 from botflow.providers.base import BaseProvider
 from botflow.providers.anthropic_provider import AnthropicProvider
 from botflow.providers.google_provider import GoogleProvider
@@ -225,6 +226,69 @@ def _get_cached_provider(provider_id: int, provider_type: str, api_key: str, bas
     return instance
 
 
+async def load_endpoints(group_id: int, db: Database) -> list[ModelEndpoint]:
+    """从 DB 加载 group 的所有 enabled endpoints（带缓存）。
+
+    1:1 复用 _endpoint_cache 逻辑和 _get_cached_provider。
+    """
+    now = time.time()
+    cached = _endpoint_cache.get(group_id)
+    if cached:
+        endpoints, create_time = cached
+        if now - create_time < _ENDPOINT_CACHE_TTL:
+            return endpoints
+
+    # Cache miss or expired — reload from DB
+    models = await db.get_group_models(group_id, enabled_only=True)
+    endpoints: list[ModelEndpoint] = []
+    for m in models:
+        provider = await db.get_provider(m.provider_id)
+        if provider is None or not provider.is_enabled:
+            continue
+        provider_instance = _get_cached_provider(
+            provider_id=provider.id,
+            provider_type=provider.provider_type,
+            api_key=provider.api_key,
+            base_url=provider.base_url,
+            extra_config=provider.extra_config,
+            api_format=m.api_format,
+            proxy=m.proxy,
+        )
+        endpoints.append(ModelEndpoint(m, provider_instance))
+
+    _endpoint_cache[group_id] = (endpoints, now)
+    return endpoints
+
+
+def invalidate_endpoint_cache(group_id: int) -> None:
+    """Admin 修改 group_models 后调用，清除缓存。"""
+    _endpoint_cache.pop(group_id, None)
+
+
+def invalidate_provider_cache(provider_id: int | None = None) -> None:
+    """清除 provider 实例缓存。
+
+    provider_id=None 时清空整个 _provider_cache；否则只清掉
+    key[0] == provider_id 的所有条目（同 provider 跨 type/proxy 的所有实例）。
+    """
+    if provider_id is None:
+        _provider_cache.clear()
+        return
+    for key in list(_provider_cache.keys()):
+        if key[0] == provider_id:
+            _provider_cache.pop(key, None)
+
+
+def invalidate_all_caches() -> None:
+    """Admin 改动 provider/model（波及多 group）后调用。
+
+    清空 _endpoint_cache 与 _provider_cache，但**不**清空 _provider_semaphores
+    （信号量对象身份不能打断，否则并发上限被绕过）。
+    """
+    _endpoint_cache.clear()
+    _provider_cache.clear()
+
+
 # ---------------------------------------------------------------------------
 # Weighted random selection
 # ---------------------------------------------------------------------------
@@ -341,280 +405,4 @@ class ModelEndpoint:
         return self.detail.max_retries
 
 
-# ---------------------------------------------------------------------------
-# Group Router
-# ---------------------------------------------------------------------------
-
-
-class GroupRouter:
-    """Routes requests through models in a group with retry and fallback."""
-
-    def __init__(self, group_id: int, db: Database, cooldown_manager: CooldownManager, fallback_group_id: int | None = None) -> None:
-        self.group_id = group_id
-        self.db = db
-        self.cooldown = cooldown_manager
-        self.fallback_group_id = fallback_group_id
-
-    async def _load_endpoints(self) -> list[ModelEndpoint]:
-        """Load and build endpoints for all enabled models in the group (with caching)."""
-        now = time.time()
-        cached = _endpoint_cache.get(self.group_id)
-        if cached:
-            endpoints, create_time = cached
-            if now - create_time < _ENDPOINT_CACHE_TTL:
-                return endpoints
-        
-        # Cache miss or expired - reload from DB
-        models = await self.db.get_group_models(self.group_id, enabled_only=True)
-        endpoints: list[ModelEndpoint] = []
-        for m in models:
-            provider = await self.db.get_provider(m.provider_id)
-            if provider is None or not provider.is_enabled:
-                continue
-            provider_instance = _get_cached_provider(
-                provider_id=provider.id,
-                provider_type=provider.provider_type,
-                api_key=provider.api_key,
-                base_url=provider.base_url,
-                extra_config=provider.extra_config,
-                api_format=m.api_format,
-                proxy=m.proxy,
-            )
-            endpoints.append(ModelEndpoint(m, provider_instance))
-        
-        _endpoint_cache[self.group_id] = (endpoints, now)
-        return endpoints
-
-    def _get_available(self, endpoints: list[ModelEndpoint]) -> list[ModelEndpoint]:
-        """Filter out models currently on cooldown."""
-        return [
-            ep
-            for ep in endpoints
-            if not self.cooldown.is_on_cooldown(self.group_id, ep.model_id)
-        ]
-
-    async def route(
-        self,
-        messages: list[dict[str, Any]],
-        temperature: float | None = None,
-        max_tokens: int | None = None,
-        stream: bool = False,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Route a chat completion request through the group.
-
-        Process:
-            1. Load endpoints from DB
-            2. Filter available (not cooling)
-            3. Weighted random select
-            4. Attempt with retry
-            5. On failure: record cooldown, fallback to next model
-            6. Log to call_logs
-        """
-        endpoints = await self._load_endpoints()
-        if not endpoints:
-            raise NoAvailableModelError(f"Group {self.group_id} has no enabled models")
-
-        if stream:
-            return await self._route_stream(endpoints, messages, temperature, max_tokens, **kwargs)
-        return await self._route_non_stream(endpoints, messages, temperature, max_tokens, **kwargs)
-
-    async def _route_non_stream(
-        self,
-        endpoints: list[ModelEndpoint],
-        messages: list[dict[str, Any]],
-        temperature: float | None,
-        max_tokens: int | None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Non-streaming routing with retry + fallback."""
-        used_endpoints: list[ModelEndpoint] = []
-
-        while True:
-            available = self._get_available(endpoints)
-            if not available:
-                # All models on cooldown — try fallback group before raising
-                if self.fallback_group_id is not None:
-                    log.warning("Group {} all models on cooldown, falling back to group {}", self.group_id, self.fallback_group_id)
-                    fallback_router = GroupRouter(self.fallback_group_id, self.db, self.cooldown)
-                    return await fallback_router.route(
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        stream=False,
-                        **kwargs,
-                    )
-                raise AllModelsCooldownError(f"Group {self.group_id}: all models are on cooldown")
-
-            selected = weighted_random_select([ep.detail for ep in available])
-            matching_ep = next(ep for ep in available if ep.model_id == selected.model_id)
-            used_endpoints.append(matching_ep)
-
-            context_windows = [ep.detail.context_window for ep in available if ep.detail.context_window > 0]
-            context_window = min(context_windows) if context_windows else 0
-            if context_window > 0:
-                messages = truncate_to_context_window(messages, context_window, max_tokens)
-
-            result = await self._attempt_call(matching_ep, messages, temperature, max_tokens, **kwargs)
-            if result is not None:
-                result["_routing"] = {
-                    "model_id": matching_ep.model_id,
-                    "provider_id": matching_ep.detail.provider_id,
-                }
-                return result
-
-            # If all endpoints have been tried and all failed
-            if len(used_endpoints) >= len(endpoints):
-                if self.fallback_group_id is not None:
-                    log.warning("Group {} exhausted, falling back to group {}", self.group_id, self.fallback_group_id)
-                    fallback_router = GroupRouter(self.fallback_group_id, self.db, self.cooldown)
-                    return await fallback_router.route(
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        stream=False,
-                        **kwargs,
-                    )
-                raise ProviderError(f"Group {self.group_id}: all models exhausted")
-
-    async def _route_stream(
-        self,
-        endpoints: list[ModelEndpoint],
-        messages: list[dict[str, Any]],
-        temperature: float | None,
-        max_tokens: int | None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Streaming routing — returns candidate endpoints in weighted order.
-
-        The caller tries each endpoint in order until one starts streaming,
-        then falls back to the next on pre-stream failure (mirrors
-        ``_route_non_stream`` fallback). Falls back to ``fallback_group_id``
-        if all models in this group are on cooldown.
-        """
-        available = self._get_available(endpoints)
-        if not available:
-            if self.fallback_group_id is not None:
-                log.warning("Group {} all models on cooldown, falling back to group {}", self.group_id, self.fallback_group_id)
-                fallback_router = GroupRouter(self.fallback_group_id, self.db, self.cooldown)
-                return await fallback_router.route(
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    stream=True,
-                    **kwargs,
-                )
-            raise AllModelsCooldownError(f"Group {self.group_id}: all models are on cooldown")
-
-        ordered = weighted_random_order([ep.detail for ep in available])
-        endpoints_ordered = [next(ep for ep in available if ep.model_id == d.model_id) for d in ordered]
-
-        context_windows = [ep.detail.context_window for ep in available if ep.detail.context_window > 0]
-        if context_windows:
-            messages = truncate_to_context_window(messages, min(context_windows), max_tokens)
-
-        # extra_config filtering is now done per-endpoint inside _attempt_call
-
-        return {
-            "endpoints": endpoints_ordered,
-            "group_id": self.group_id,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "kwargs": kwargs,
-        }
-
-    @staticmethod
-    def _apply_model_extra_config(kwargs: dict[str, Any], model_extra_config: dict[str, Any] | None) -> dict[str, Any]:
-        """Strip model-unsupported kwargs based on extra_config.
-
-        Supported extra_config keys:
-          - ``strip_params``: list[str] — list of parameter names to always remove.
-          - ``reasoning_mode``: "off" — shorthand that adds reasoning_effort/reasoning_content to strip list.
-        """
-        cfg = model_extra_config or {}
-        strip_keys: set[str] = set()
-
-        # Collect explicit strip_params from config
-        explicit_strip = cfg.get("strip_params")
-        if isinstance(explicit_strip, list):
-            strip_keys.update(explicit_strip)
-
-        # reasoning_mode="off" is shorthand for stripping reasoning params
-        if cfg.get("reasoning_mode") == "off":
-            strip_keys.update({"reasoning_effort", "reasoning_content"})
-
-        # Per-request override: reasoning_mode="off" in kwargs also strips
-        if kwargs.get("reasoning_mode") == "off":
-            strip_keys.update({"reasoning_effort", "reasoning_content"})
-
-        if strip_keys:
-            kwargs = {k: v for k, v in kwargs.items() if k not in strip_keys}
-        return kwargs
-
-    async def _attempt_call(
-        self,
-        ep: ModelEndpoint,
-        messages: list[dict[str, Any]],
-        temperature: float | None,
-        max_tokens: int | None,
-        **kwargs: Any,
-    ) -> dict[str, Any] | None:
-        """Try calling a single endpoint with retry logic.
-
-        Returns the response dict on success, or None on failure (for fallback).
-        """
-        # Apply per-endpoint extra_config filtering (strip_params, reasoning_mode)
-        kwargs = self._apply_model_extra_config(kwargs, ep.detail.extra_config)
-
-        last_error: Exception | None = None
-
-        # Acquire the provider-level concurrency semaphore (if configured).
-        # This is shared across all groups, so a burst against any group limits
-        # concurrent in-flight requests to the same upstream provider.
-        sem = _ensure_provider_semaphore(ep.detail.provider_id,
-                                         get_config().upstream_semaphore_size)
-
-        for attempt in range(ep.max_retries):
-            try:
-                async with sem if sem is not None else _noop_asynccontext():
-                    result = await ep.provider.chat(
-                    messages=messages,
-                    model=ep.detail.model_name,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    **kwargs,
-                )
-                self.cooldown.record_success(self.group_id, ep.model_id)
-                return result
-
-            except Exception as e:
-                last_error = e
-                log.warning(
-                    "Model {} (attempt {}/{}) failed: {}",
-                    ep.detail.model_name,
-                    attempt + 1,
-                    ep.max_retries,
-                    e,
-                )
-
-                if is_retryable_error(e) and attempt < ep.max_retries - 1:
-                    await exponential_backoff(attempt)
-                    continue
-                else:
-                    break
-
-        # All retries exhausted
-        self.cooldown.record_failure(
-            self.group_id,
-            ep.model_id,
-            ep.cooldown_threshold,
-            ep.cooldown_seconds,
-        )
-        log.error(
-            "Model {} exhausted after {} retries: {}",
-            ep.detail.model_name,
-            ep.max_retries,
-            last_error,
-        )
-        return None
+# GroupRouter 已迁移至 PipelineEngine + Strategy 系统，本模块保留基础设施函数。

@@ -30,6 +30,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from botflow.admin_api import admin_router
 from botflow.auth import ApiKey, resolve_api_key, verify_admin_key, verify_llm_key
 from botflow.common.exceptions import ProviderError
+from botflow.pipeline import PipelineEngine
 from botflow.common.logger import get_logger, setup_logging
 from botflow.config import BotflowSettings, get_config, set_config
 from botflow.protocol_adapter import (
@@ -47,7 +48,6 @@ from botflow.protocol_adapter import (
 )
 from botflow.router import (
     CooldownManager,
-    GroupRouter,
     exponential_backoff,
     is_retryable_error,
 )
@@ -60,7 +60,7 @@ from botflow.storage.daily_summary import (
 import httpx
 
 from botflow.storage.db import Database
-from botflow.storage.models import CallLog, Model
+from botflow.storage.models import CallLog, Model, ModelGroup
 from botflow.workspace import get_workspace_path, init_workspace
 
 log = get_logger("core")
@@ -104,6 +104,7 @@ def _filter_safe_extra(extra: dict[str, Any]) -> dict[str, Any]:
 _db: Optional[Database] = None
 _cooldown_manager = CooldownManager()
 _config: Optional[BotflowSettings] = None
+_engine: Optional[PipelineEngine] = None
 
 
 class CallLogWriter:
@@ -173,6 +174,13 @@ _log_writer: Optional[CallLogWriter] = None
 def _get_db() -> Database:
     assert _db is not None, "Database not initialized"
     return _db
+
+
+def _get_engine() -> PipelineEngine:
+    global _engine
+    if _engine is None:
+        _engine = PipelineEngine(db_factory=_get_db, cooldown=_cooldown_manager)
+    return _engine
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +286,10 @@ async def lifespan(app: FastAPI):
 
     # Mount REST admin API (management of providers/models/groups/keys/stats).
     app.include_router(admin_router)
+
+    # Mount admin SPA dashboard AFTER the REST router so API routes win.
+    from botflow.admin_dashboard import mount_admin_ui
+    mount_admin_ui(app)
 
     db = _get_db()
 
@@ -447,7 +459,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="botflow",
     description="AI Middleware Platform",
-    version="1.1.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -572,9 +584,14 @@ class AuthMiddleware:
         if request.url.path.startswith("/admin/"):
             return await self.app(scope, receive, send)
 
+        # Support both "Authorization: Bearer <key>" and "x-api-key: <key>" headers.
+        # x-api-key takes precedence when present (Anthropic/Google native clients use it).
+        x_api_key = request.headers.get("x-api-key", "")
         auth_header = request.headers.get("Authorization", "")
         token = None
-        if auth_header.startswith("Bearer "):
+        if x_api_key:
+            token = x_api_key.strip()
+        elif auth_header.startswith("Bearer "):
             token = auth_header.removeprefix("Bearer ").strip()
         elif auth_header:
             token = auth_header.strip()
@@ -582,7 +599,7 @@ class AuthMiddleware:
         if not token:
             response = JSONResponse(
                 status_code=401,
-                content={"error": "Missing API key. Provide Authorization: Bearer <key>."},
+                content={"error": "Missing API key. Provide Authorization: Bearer <key> or x-api-key: <key>."},
             )
             return await response(scope, receive, send)
 
@@ -602,13 +619,6 @@ app.add_middleware(AuthMiddleware)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-async def _get_router(group_id: int) -> GroupRouter:
-    db = _get_db()
-    group = await db.get_group(group_id)
-    fallback_group_id = group.fallback_group_id if group else None
-    return GroupRouter(group_id=group_id, db=db, cooldown_manager=_cooldown_manager, fallback_group_id=fallback_group_id)
 
 
 async def _get_group_id(request_body: dict) -> int:
@@ -926,15 +936,23 @@ def _limit_traceback(text: str, limit: int = 4000) -> str | None:
     return text if len(text) <= limit else text[:limit] + "\n…[truncated]"
 
 
-async def _get_extra_route_params(internal: dict, stream: bool = False) -> tuple[int, GroupRouter, dict]:
-    """Shared setup: resolve group, router, and safe extra kwargs."""
+async def _get_extra_route_params(internal: dict, stream: bool = False) -> tuple[int, PipelineEngine, "ModelGroup", dict]:
+    """Shared setup: resolve group, engine, group_obj, and safe extra kwargs.
+
+    返回 (group_id, engine, group_obj, safe_extra)。
+    """
     model_name = internal.get("model", "")
     group_id = await _get_group_id({"model": model_name})
-    router = await _get_router(group_id)
+    engine = _get_engine()
+    db = _get_db()
+    group = await db.get_group(group_id)
+    if group is None:
+        from botflow.common.exceptions import ConfigurationError
+        raise ConfigurationError(f"Group {group_id} not found")
     extra = internal.get("extra", {})
     if extra:
         log.debug("Extra kwargs for {}: {}", model_name, {k: type(v).__name__ for k, v in extra.items()})
-    return group_id, router, _filter_safe_extra(extra)
+    return group_id, engine, group, _filter_safe_extra(extra)
 
 
 async def _handle_chat_non_stream(
@@ -942,12 +960,18 @@ async def _handle_chat_non_stream(
     request: Request,
     format_response,
 ) -> JSONResponse:
-    """Handle a non-streaming chat request through the router."""
-    group_id, router, safe_extra = await _get_extra_route_params(internal)
+    """Handle a non-streaming chat request through PipelineEngine."""
+    model_name = internal.get("model", "")
+    group_id = await _get_group_id({"model": model_name})
+    db = _get_db()
+    group = await db.get_group(group_id)
+    engine = _get_engine()
+    safe_extra = _filter_safe_extra(internal.get("extra", {}))
     start = time.monotonic()
 
     try:
-        result = await router.route(
+        result = await engine.route(
+            group=group,
             messages=internal["messages"],
             temperature=internal.get("temperature"),
             max_tokens=internal.get("max_tokens"),
@@ -1049,6 +1073,8 @@ async def _stream_common(
     Once a stream has started, later failures are not retried — they propagate
     to the client as an SSE error event.
 
+    Now uses PipelineEngine.route_stream() instead of GroupRouter.
+
     Args:
         internal: Parsed internal request dict.
         serialize: Chunk serializer returning (sse_lines, usage) per chunk.
@@ -1056,21 +1082,20 @@ async def _stream_common(
         request: Optional Request object for disconnect detection.
     """
     model_name = internal.get("model", "")
-    group_id = None
-    group_id, router, safe_extra = await _get_extra_route_params(internal, stream=True)
     used_ep = None
     last_error: Exception | None = None
 
+    group_id, engine, active_group, safe_extra = await _get_extra_route_params(internal, stream=True)
+
     try:
         stream_timeout = float(internal.get("stream_timeout", _config.stream_timeout if _config else 30.0))
-        active_router = router
         fallback_attempted = False
         while True:
-            route_result = await active_router.route(
+            route_result = await engine.route_stream(
+                group=active_group,
                 messages=internal["messages"],
                 temperature=internal.get("temperature"),
                 max_tokens=internal.get("max_tokens"),
-                stream=True,
                 **safe_extra,
             )
             routed_group_id = route_result.get("group_id", group_id)
@@ -1125,7 +1150,7 @@ async def _stream_common(
                     # Stream started: commit to this model.
                     used_ep = ep
                     last_error = None
-                    active_router.cooldown.record_success(routed_group_id, ep.model_id)
+                    engine.cooldown.record_success(routed_group_id, ep.model_id)
 
                     try:
                         async for chunk in _chain_first(first_chunk, gen):
@@ -1170,7 +1195,7 @@ async def _stream_common(
                     return
 
                 # All attempts on this endpoint failed — cool it down, try next.
-                active_router.cooldown.record_failure(
+                engine.cooldown.record_failure(
                     routed_group_id,
                     ep.model_id,
                     ep.cooldown_threshold,
@@ -1178,14 +1203,20 @@ async def _stream_common(
                 )
 
             # All endpoints in this group failed — try the fallback group once.
-            if not fallback_attempted and active_router.fallback_group_id is not None:
+            fallback_gid = route_result.get("fallback_group_id")
+            if not fallback_attempted and fallback_gid is not None:
                 log.warning(
                     "Group {} exhausted for stream, falling back to group {}",
                     routed_group_id,
-                    active_router.fallback_group_id,
+                    fallback_gid,
                 )
                 fallback_attempted = True
-                active_router = GroupRouter(active_router.fallback_group_id, active_router.db, active_router.cooldown)
+                try:
+                    active_group = await engine._load_group(fallback_gid)
+                except Exception:
+                    raise last_error if last_error is not None else ProviderError(
+                        f"No models available to stream for model {model_name}"
+                    )
                 continue
 
             raise last_error if last_error is not None else ProviderError(f"No models available to stream for model {model_name}")
@@ -1228,16 +1259,20 @@ async def _stream_anthropic(
         yield line
 
 
-def _responses_serialize_raw(chunk: dict, response_id: str, created_at: int) -> list[str]:
-    """Serialize a raw provider chunk to Responses API SSE lines."""
-    choices = chunk.get("choices") or []
-    choice = choices[0] if choices and choices[0] is not None else {}
-    delta = choice.get("delta") or {}
-    finish_reason = choice.get("finish_reason")
+def _responses_serialize_raw(
+    chunk: dict,
+    response_id: str,
+    created_at: int,
+    *,
+    is_first: bool = False,
+    is_last: bool = False,
+) -> list[str]:
+    """Serialize a raw provider chunk to Responses API SSE lines.
 
-    is_first = bool(delta.get("role"))
-    is_last = bool(finish_reason)
-
+    ``is_first`` / ``is_last`` are tracked by the caller because the unified
+    chunk format always carries ``role=assistant`` (from ``_chunk_to_unified``),
+    making ``delta.get("role")`` unreliable for first-chunk detection.
+    """
     events = internal_chunk_to_responses_sse(
         chunk, is_first=is_first, is_last=is_last,
         response_id=response_id, created_at=created_at,
@@ -1259,12 +1294,25 @@ async def _stream_responses(
 
     response_id = "resp_" + _secrets.token_hex(8)
     created_at = int(time.time())
+    _first_chunk_seen = False
 
-    async def _responses_serialize_wrap(chunk: dict) -> tuple[list[str], dict | None]:
+    def _responses_serialize_wrap(chunk: dict) -> tuple[list[str], dict | None]:
         """Adapter: convert raw chunk to Responses SSE lines."""
+        nonlocal _first_chunk_seen
         # Responses API doesn't send [DONE] — just stop.
+        choices = chunk.get("choices") or []
+        choice = choices[0] if choices and choices[0] is not None else {}
+        finish_reason = choice.get("finish_reason")
+
+        is_first = not _first_chunk_seen
+        is_last = bool(finish_reason)
+        _first_chunk_seen = True
+
         lines: list[str] = []
-        for line in _responses_serialize_raw(chunk, response_id, created_at):
+        for line in _responses_serialize_raw(
+            chunk, response_id, created_at,
+            is_first=is_first, is_last=is_last,
+        ):
             lines.append(line)
         return lines, chunk.get("usage")
 

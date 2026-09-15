@@ -9,8 +9,12 @@ class NoAvailableModelError(BotflowError):
     """Raised when no model is available in a group (all weighted 0 or all cooling)."""
 
 
-class AllModelsCooldownError(BotflowError):
-    """Raised when all models in a group are in cooldown."""
+class AllModelsCooldownError(NoAvailableModelError):
+    """Raised when all models in a group are in cooldown.
+
+    Subclass of NoAvailableModelError for backward compatibility —
+    any ``except NoAvailableModelError`` will also catch this.
+    """
 
 
 class ProviderError(BotflowError):

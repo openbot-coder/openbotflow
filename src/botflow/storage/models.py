@@ -46,6 +46,8 @@ class ModelGroup(BaseModel):
     id: int = 0
     name: str
     description: str = ""
+    type: str = "random_weights"  # P1-1: routing strategy type (random_weights by default for backward compat)
+    params: dict[str, Any] = Field(default_factory=dict)  # P1-1: strategy parameters as structured dict
     is_enabled: bool = True
     fallback_group_id: Optional[int] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

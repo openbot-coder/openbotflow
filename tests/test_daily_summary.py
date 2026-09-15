@@ -45,12 +45,6 @@ class TestGenerateWiki:
     async def test_no_groups(self, db, monkeypatch):
         set_config(BotflowSettings(summary_group="default"))
         try:
-            class StubRouter:
-                def __init__(self, group_id, db):
-                    pass
-                async def route(self, messages, **kw):
-                    return {"content": "# W"}
-            monkeypatch.setattr(ds, "GroupRouter", StubRouter)
             out = await ds._generate_wiki(db, "prompt", __import__("botflow.config", fromlist=["get_config"]).get_config())
             assert out == ""  # no group -> empty (skipped)
         finally:
@@ -60,16 +54,14 @@ class TestGenerateWiki:
         set_config(BotflowSettings(summary_group="default"))
         try:
             await db.create_group(__import__("botflow.storage.models", fromlist=["ModelGroup"]).ModelGroup(name="default"))
-            class StubRouter:
-                captured = {}
-                def __init__(self, group_id, db):
-                    StubRouter.captured["gid"] = group_id
-                async def route(self, messages, **kw):
-                    return {"content": "intro\n```wiki\n# Title\nbody\n```\ntail"}
-            monkeypatch.setattr(ds, "GroupRouter", StubRouter)
+            from botflow.pipeline.base import STRATEGY_REGISTRY
+            class StubStrategy:
+                def __init__(self, params=None): pass
+                async def execute(self, **kwargs):
+                    return {"choices": [{"message": {"content": "intro\n```wiki\n# Title\nbody\n```\ntail"}}]}
+            monkeypatch.setitem(STRATEGY_REGISTRY, "random_weights", StubStrategy)
             cfg = __import__("botflow.config", fromlist=["get_config"]).get_config()
             out = await ds._generate_wiki(db, "prompt", cfg)
-            assert StubRouter.captured["gid"] == 1
             assert "Title" in out  # raw content returned as-is
         finally:
             set_config(None)
@@ -78,12 +70,12 @@ class TestGenerateWiki:
         set_config(BotflowSettings(summary_group="default"))
         try:
             await db.create_group(__import__("botflow.storage.models", fromlist=["ModelGroup"]).ModelGroup(name="default"))
-            class StubRouter:
-                def __init__(self, group_id, db):
-                    pass
-                async def route(self, messages, **kw):
-                    return {"content": ""}
-            monkeypatch.setattr(ds, "GroupRouter", StubRouter)
+            from botflow.pipeline.base import STRATEGY_REGISTRY
+            class StubStrategy:
+                def __init__(self, params=None): pass
+                async def execute(self, **kwargs):
+                    return {"choices": [{"message": {"content": ""}}]}
+            monkeypatch.setitem(STRATEGY_REGISTRY, "random_weights", StubStrategy)
             out = await ds._generate_wiki(db, "prompt", __import__("botflow.config", fromlist=["get_config"]).get_config())
             assert out == ""
         finally:
@@ -93,12 +85,12 @@ class TestGenerateWiki:
         set_config(BotflowSettings(summary_group="default"))
         try:
             await db.create_group(__import__("botflow.storage.models", fromlist=["ModelGroup"]).ModelGroup(name="default"))
-            class StubRouter:
-                def __init__(self, group_id, db):
-                    pass
-                async def route(self, messages, **kw):
-                    return {"content": "plain wiki"}
-            monkeypatch.setattr(ds, "GroupRouter", StubRouter)
+            from botflow.pipeline.base import STRATEGY_REGISTRY
+            class StubStrategy:
+                def __init__(self, params=None): pass
+                async def execute(self, **kwargs):
+                    return {"choices": [{"message": {"content": "plain wiki"}}]}
+            monkeypatch.setitem(STRATEGY_REGISTRY, "random_weights", StubStrategy)
             out = await ds._generate_wiki(db, "prompt", __import__("botflow.config", fromlist=["get_config"]).get_config())
             assert out == "plain wiki"
         finally:

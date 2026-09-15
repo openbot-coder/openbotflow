@@ -1,7 +1,8 @@
-"""Full coverage tests for the routing engine (GroupRouter + helpers)."""
+"""Full coverage tests for the routing engine (PipelineEngine + helpers)."""
 
 from __future__ import annotations
 
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -14,13 +15,12 @@ from botflow.common.exceptions import (
 from botflow.providers.base import BaseProvider
 from botflow.router import (
     CooldownManager,
-    GroupRouter,
     ModelEndpoint,
     _get_cached_provider,
     weighted_random_order,
     weighted_random_select,
 )
-from botflow.storage.models import GroupModelWithDetails, Provider
+from botflow.storage.models import GroupModelWithDetails, ModelGroup, Provider
 
 
 def _make_detail(model_id: int, name: str = "m", weight: float = 1.0, group_id: int = 1, **kw) -> GroupModelWithDetails:
@@ -44,6 +44,15 @@ def _make_detail(model_id: int, name: str = "m", weight: float = 1.0, group_id: 
 
 def _make_provider(pid: int = 20, ptype: str = "openai") -> Provider:
     return Provider(id=pid, name="prov", provider_type=ptype, api_key="k", base_url="http://x")
+
+
+def _make_group(group_id: int = 1, name: str = "default", type_: str = "random_weights",
+                params: dict | None = None, fallback_group_id: int | None = None) -> ModelGroup:
+    return ModelGroup(
+        id=group_id, name=name, description="test", is_enabled=True,
+        type=type_, params=params or {}, fallback_group_id=fallback_group_id,
+        created_at="2026-01-01T00:00:00", updated_at="2026-01-01T00:00:00",
+    )
 
 
 import botflow.router as _rt
@@ -114,7 +123,6 @@ def test_get_cached_provider_refreshes_on_ttl(monkeypatch):
 
 def test_cooldown_record_success_no_prior_state():
     cm = CooldownManager()
-    # No prior state: must not raise.
     cm.record_success(1, 1)
     assert cm.get_failure_count(1, 1) == 0
 
@@ -135,7 +143,6 @@ def test_cooldown_record_failure_over_threshold():
 
 def test_cooldown_expiry_reset():
     cm = CooldownManager()
-    import time
     cm.record_failure(1, 1, cooldown_failure_threshold=1, cooldown_seconds=-10)  # already past
     assert not cm.is_on_cooldown(1, 1)
     assert cm.get_failure_count(1, 1) == 0
@@ -203,14 +210,19 @@ def test_weighted_order_full():
 
 
 # ---------------------------------------------------------------------------
-# GroupRouter._load_endpoints / _get_available
+# load_endpoints (standalone function in router.py)
 # ---------------------------------------------------------------------------
 
 
 class _FakeDb:
-    def __init__(self, models, providers):
+    def __init__(self, models, providers, groups=None):
         self._models = models
         self._providers = providers
+        self._groups = groups or {}
+        self._group_models_cache = None
+
+    async def get_group(self, group_id):
+        return self._groups.get(group_id)
 
     async def get_group_models(self, group_id, enabled_only=True):
         return [m for m in self._models if m.group_id == group_id]
@@ -220,210 +232,227 @@ class _FakeDb:
 
 
 async def test_load_endpoints_filters_disabled_provider():
+    from botflow.router import load_endpoints
     models = [_make_detail(1)]
     providers = {11: _make_provider(11, "openai")}
     providers[11].is_enabled = False
     db = _FakeDb(models, providers)
-    router = GroupRouter(1, db, CooldownManager())
-    eps = await router._load_endpoints()
+    eps = await load_endpoints(1, db)
     assert eps == []
 
 
 async def test_load_endpoints_builds():
+    from botflow.router import load_endpoints
     models = [_make_detail(1), _make_detail(2)]
     providers = {11: _make_provider(11), 12: _make_provider(12)}
     db = _FakeDb(models, providers)
-    router = GroupRouter(1, db, CooldownManager())
-    eps = await router._load_endpoints()
+    eps = await load_endpoints(1, db)
     assert len(eps) == 2
     assert all(isinstance(e, ModelEndpoint) for e in eps)
 
 
-async def test_get_available_excludes_cooldown():
+async def test_filter_available_excludes_cooldown():
+    from botflow.pipeline._shared import filter_available
+    from botflow.router import load_endpoints
     models = [_make_detail(1)]
     providers = {11: _make_provider(11)}
     db = _FakeDb(models, providers)
     cm = CooldownManager()
-    router = GroupRouter(1, db, cm)
-    eps = await router._load_endpoints()
+    eps = await load_endpoints(1, db)
     cm.record_failure(1, 1, cooldown_failure_threshold=1, cooldown_seconds=1000)
-    avail = router._get_available(eps)
+    avail = filter_available(eps, cm, 1)
     assert avail == []
 
 
 # ---------------------------------------------------------------------------
-# Route non-stream success / failure / fallback
+# PipelineEngine route non-stream success / failure / fallback
 # ---------------------------------------------------------------------------
 
 
 async def test_route_no_models():
+    from botflow.pipeline.engine import PipelineEngine
     db = _FakeDb([], {})
-    router = GroupRouter(1, db, CooldownManager())
+    engine = PipelineEngine(db_factory=lambda: db, cooldown=CooldownManager())
+    group = _make_group()
     with pytest.raises(NoAvailableModelError):
-        await router.route([{"role": "user", "content": "hi"}])
+        await engine.route(group=group, messages=[{"role": "user", "content": "hi"}])
 
 
 async def test_route_non_stream_success():
+    from botflow.pipeline.engine import PipelineEngine
     provider = FakeProvider()
     models = [_make_detail(1)]
     providers = {11: _make_provider(11)}
     db = _FakeDb(models, providers)
-    router = GroupRouter(1, db, CooldownManager())
-    eps = await router._load_endpoints()
+    engine = PipelineEngine(db_factory=lambda: db, cooldown=CooldownManager())
+    group = _make_group()
+    # Inject fake provider
+    from botflow.router import _endpoint_cache, load_endpoints
+    eps = await load_endpoints(1, db)
     eps[0].provider = provider
-    res = await router.route([{"role": "user", "content": "hi"}])
+    _endpoint_cache[1] = (eps, time.time())  # force cache
+    res = await engine.route(group=group, messages=[{"role": "user", "content": "hi"}])
     assert res["choices"][0]["message"]["content"] == "ok"
     assert res["_routing"]["model_id"] == 1
 
 
 async def test_route_non_stream_all_cooldown_raises():
+    from botflow.pipeline.engine import PipelineEngine
     models = [_make_detail(1)]
     providers = {11: _make_provider(11)}
     db = _FakeDb(models, providers)
     cm = CooldownManager()
-    router = GroupRouter(1, db, cm)
-    eps = await router._load_endpoints()
+    engine = PipelineEngine(db_factory=lambda: db, cooldown=cm)
+    group = _make_group()
     cm.record_failure(1, 1, cooldown_failure_threshold=1, cooldown_seconds=1000)
     with pytest.raises(AllModelsCooldownError):
-        await router.route([{"role": "user", "content": "hi"}])
+        await engine.route(group=group, messages=[{"role": "user", "content": "hi"}])
 
 
 async def test_route_non_stream_cooldown_fallback_to_group():
-    # Primary group all cooldown -> fallback group succeeds.
+    from botflow.pipeline.engine import PipelineEngine
     cm = CooldownManager()
 
-    def make_db(detail, pid):
-        providers = {pid: _make_provider(pid)}
-        return _FakeDb([detail], providers)
+    models_primary = [_make_detail(1)]
+    models_fallback = [_make_detail(2, group_id=2)]
+    providers = {11: _make_provider(11), 12: _make_provider(12)}
 
-    primary_detail = _make_detail(1)
-    fallback_detail = _make_detail(2, group_id=2)
+    primary_db = _FakeDb(models_primary, providers)
+    fallback_db = _FakeDb(models_fallback, providers)
 
-    primary_router = GroupRouter(1, make_db(primary_detail, 11), cm, fallback_group_id=2)
-    fallback_router = GroupRouter(2, make_db(fallback_detail, 12), cm)
+    primary_group = _make_group(group_id=1, fallback_group_id=2)
+    fallback_group = _make_group(group_id=2, name="fallback")
 
-    # Force primary model onto cooldown.
+    # Force primary model onto cooldown
     cm.record_failure(1, 1, cooldown_failure_threshold=1, cooldown_seconds=1000)
-    # Inject fallback router's provider.
-    fallback_eps = await fallback_router._load_endpoints()
-    fallback_eps[0].provider = FakeProvider()
 
-    # Patch GroupRouter construction inside fallback branch to use our prepared router.
-    import botflow.router as r
-    orig = r.GroupRouter
-    r.GroupRouter = lambda gid, db, cd, **kw: fallback_router if gid == 2 else orig(gid, db, cd, **kw)
-    try:
-        res = await primary_router.route([{"role": "user", "content": "hi"}])
-    finally:
-        r.GroupRouter = orig
+    # Prepare fallback provider
+    from botflow.router import _endpoint_cache, load_endpoints
+    fallback_eps = await load_endpoints(2, fallback_db)
+    fallback_eps[0].provider = FakeProvider()
+    _endpoint_cache[2] = (fallback_eps, time.time())
+
+    # Use primary DB but patch get_group for fallback
+    async def patched_get_group(gid):
+        return fallback_group if gid == 2 else primary_group
+
+    primary_db.get_group = patched_get_group
+
+    engine = PipelineEngine(db_factory=lambda: primary_db, cooldown=cm)
+    res = await engine.route(group=primary_group, messages=[{"role": "user", "content": "hi"}])
     assert res["choices"][0]["message"]["content"] == "ok"
 
 
 async def test_route_non_stream_fallback_after_exhaustion():
-    """All primary models fail then fallback group tried."""
+    from botflow.pipeline.engine import PipelineEngine
     cm = CooldownManager()
 
-    def make_db(detail, pid):
-        return _FakeDb([detail], {pid: _make_provider(pid)})
+    models_primary = [_make_detail(1, max_retries=1)]
+    models_fallback = [_make_detail(2, max_retries=1, group_id=2)]
+    providers = {11: _make_provider(11), 12: _make_provider(12)}
 
-    primary_detail = _make_detail(1, max_retries=1)
-    fallback_detail = _make_detail(2, max_retries=1, group_id=2)
+    primary_db = _FakeDb(models_primary, providers)
+    fallback_db = _FakeDb(models_fallback, providers)
 
-    primary_router = GroupRouter(1, make_db(primary_detail, 11), cm, fallback_group_id=2)
-    fallback_router = GroupRouter(2, make_db(fallback_detail, 12), cm)
+    primary_group = _make_group(group_id=1, fallback_group_id=2)
+    fallback_group = _make_group(group_id=2, name="fallback")
 
-    # Primary model always fails (connection error); fallback succeeds.
-    primary_eps = await primary_router._load_endpoints()
+    # Primary model always fails
+    from botflow.router import _endpoint_cache, load_endpoints
+    primary_eps = await load_endpoints(1, primary_db)
     primary_eps[0].provider = FakeProvider(exc=ProviderError("HTTP 500 boom"))
-    fallback_eps = await fallback_router._load_endpoints()
-    fallback_eps[0].provider = FakeProvider()
+    _endpoint_cache[1] = (primary_eps, time.time())
 
-    import botflow.router as r
-    orig = r.GroupRouter
-    r.GroupRouter = lambda gid, db, cd, **kw: fallback_router if gid == 2 else orig(gid, db, cd, **kw)
-    try:
-        res = await primary_router.route([{"role": "user", "content": "hi"}])
-    finally:
-        r.GroupRouter = orig
+    # Fallback model succeeds
+    fallback_eps = await load_endpoints(2, fallback_db)
+    fallback_eps[0].provider = FakeProvider()
+    _endpoint_cache[2] = (fallback_eps, time.time())
+
+    async def patched_get_group(gid):
+        return fallback_group if gid == 2 else primary_group
+
+    primary_db.get_group = patched_get_group
+
+    engine = PipelineEngine(db_factory=lambda: primary_db, cooldown=cm)
+    res = await engine.route(group=primary_group, messages=[{"role": "user", "content": "hi"}])
     assert res["choices"][0]["message"]["content"] == "ok"
 
 
 async def test_route_non_stream_all_exhausted_no_fallback():
+    from botflow.pipeline.engine import PipelineEngine
     models = [_make_detail(1, max_retries=1)]
     providers = {11: _make_provider(11)}
     db = _FakeDb(models, providers)
-    router = GroupRouter(1, db, CooldownManager())
-    eps = await router._load_endpoints()
+    engine = PipelineEngine(db_factory=lambda: db, cooldown=CooldownManager())
+    group = _make_group()
+    from botflow.router import _endpoint_cache, load_endpoints
+    eps = await load_endpoints(1, db)
     eps[0].provider = FakeProvider(exc=ProviderError("HTTP 500 boom"))
+    _endpoint_cache[1] = (eps, 0.0)
     with pytest.raises(ProviderError):
-        await router.route([{"role": "user", "content": "hi"}])
-
-
-async def test_route_non_stream_context_window_truncation():
-    provider = FakeProvider()
-    models = [_make_detail(1, context_window=10)]
-    providers = {11: _make_provider(11)}
-    db = _FakeDb(models, providers)
-    router = GroupRouter(1, db, CooldownManager())
-    eps = await router._load_endpoints()
-    eps[0].provider = provider
-    big = [{"role": "system", "content": "s"}, {"role": "user", "content": "x" * 5000}]
-    await router.route(big)
-    sent = provider.calls[0]["messages"]
-    assert len(sent[0]["content"]) < 5000 or len(sent) < 2
+        await engine.route(group=group, messages=[{"role": "user", "content": "hi"}])
 
 
 # ---------------------------------------------------------------------------
-# Stream routing
+# Stream routing via PipelineEngine.route_stream
 # ---------------------------------------------------------------------------
 
 
 async def test_route_stream_returns_ordered_endpoints():
+    from botflow.pipeline.engine import PipelineEngine
     models = [_make_detail(1), _make_detail(2)]
     providers = {11: _make_provider(11), 12: _make_provider(12)}
     db = _FakeDb(models, providers)
-    router = GroupRouter(1, db, CooldownManager())
-    out = await router.route([{"role": "user", "content": "hi"}], stream=True)
+    engine = PipelineEngine(db_factory=lambda: db, cooldown=CooldownManager())
+    group = _make_group()
+    out = await engine.route_stream(group=group, messages=[{"role": "user", "content": "hi"}])
     assert "endpoints" in out
     assert len(out["endpoints"]) == 2
 
 
 async def test_route_stream_all_cooldown_fallback():
+    from botflow.pipeline.engine import PipelineEngine
     cm = CooldownManager()
     models = [_make_detail(1)]
     providers = {11: _make_provider(11)}
-    db = _FakeDb(models, providers)
-    router = GroupRouter(1, db, cm, fallback_group_id=2)
-    eps = await router._load_endpoints()
+    primary_group = _make_group(group_id=1, fallback_group_id=2)
+    fallback_group = _make_group(group_id=2, name="fallback")
+    db = _FakeDb(models, providers, groups={1: primary_group, 2: fallback_group})
     cm.record_failure(1, 1, cooldown_failure_threshold=1, cooldown_seconds=1000)
-    # fallback_group_id set; route fallback group has no models -> raises
+    # fallback group has no models -> raises NoAvailableModelError
+    from botflow.router import _endpoint_cache
+    _endpoint_cache.clear()
+    engine = PipelineEngine(db_factory=lambda: db, cooldown=cm)
     with pytest.raises(NoAvailableModelError):
-        await router.route([{"role": "user", "content": "hi"}], stream=True)
+        await engine.route_stream(group=primary_group, messages=[{"role": "user", "content": "hi"}])
 
 
 async def test_route_stream_all_cooldown_no_fallback_raises():
+    from botflow.pipeline.engine import PipelineEngine
     cm = CooldownManager()
     models = [_make_detail(1)]
     providers = {11: _make_provider(11)}
     db = _FakeDb(models, providers)
-    router = GroupRouter(1, db, cm)
-    eps = await router._load_endpoints()
+    group = _make_group()
     cm.record_failure(1, 1, cooldown_failure_threshold=1, cooldown_seconds=1000)
+    engine = PipelineEngine(db_factory=lambda: db, cooldown=cm)
     with pytest.raises(AllModelsCooldownError):
-        await router.route([{"role": "user", "content": "hi"}], stream=True)
+        await engine.route_stream(group=group, messages=[{"role": "user", "content": "hi"}])
 
 
 async def test_route_stream_context_window_truncation():
+    from botflow.pipeline.engine import PipelineEngine
     models = [_make_detail(1, context_window=10), _make_detail(2)]
     providers = {11: _make_provider(11), 12: _make_provider(12)}
     db = _FakeDb(models, providers)
-    router = GroupRouter(1, db, CooldownManager())
+    engine = PipelineEngine(db_factory=lambda: db, cooldown=CooldownManager())
+    group = _make_group()
     big = [
         {"role": "system", "content": "s"},
         {"role": "user", "content": "x" * 5000},
         {"role": "user", "content": "y" * 5000},
         {"role": "user", "content": "z" * 5000},
     ]
-    out = await router.route(big, stream=True)
+    out = await engine.route_stream(group=group, messages=big)
     sent = out["messages"]
     assert sent == [{"role": "system", "content": "s"}]

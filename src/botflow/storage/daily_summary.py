@@ -20,7 +20,6 @@ from datetime import datetime, timedelta, timezone
 from loguru import logger
 
 from botflow.config import get_config
-from botflow.router import GroupRouter
 from botflow.storage.db import Database
 
 # Maximum number of call logs fed to the summary LLM prompt (avoid huge payloads).
@@ -135,24 +134,38 @@ async def run_daily_summary(db: Database, day: str | None = None) -> None:
 
 async def _generate_wiki(db: Database, prompt: str, config) -> str:
     """Call the configured summary group/model to produce the wiki markdown."""
+    from botflow.pipeline.base import STRATEGY_REGISTRY
+    from botflow.router import CooldownManager
+
     group_name = config.summary_group or "default"
     groups = await db.list_groups(enabled_only=True)
-    group_id = None
+    group = None
     for g in groups:
         if g.name == group_name:
-            group_id = g.id
+            group = g
             break
-    if group_id is None and groups:
-        group_id = groups[0].id
-    if group_id is None:
+    if group is None and groups:
+        group = groups[0]
+    if group is None:
         return ""
-    router = GroupRouter(group_id=group_id, db=db)
-    result = await router.route(
+
+    strategy_cls = STRATEGY_REGISTRY.get(group.type or "random_weights")
+    if strategy_cls is None:
+        return ""
+    strategy = strategy_cls(params=group.params or {})
+    cooldown = CooldownManager()
+    result = await strategy.execute(
         messages=[{"role": "user", "content": prompt}],
+        db=db,
+        cooldown=cooldown,
+        group_id=group.id,
         temperature=0.3,
-        stream=False,
+        max_tokens=None,
     )
-    return result.get("content", "") if isinstance(result, dict) else str(result)
+    choices = result.get("choices", []) if isinstance(result, dict) else []
+    if choices:
+        return choices[0].get("message", {}).get("content", "")
+    return ""
 
 
 async def purge_old_detail(db: Database) -> int:
