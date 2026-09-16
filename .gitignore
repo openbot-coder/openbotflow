@@ -20,10 +20,11 @@ ENV/
 *.swo
 *~
 
-# Testing
+# Testing / coverage output
 .coverage
 .coverage.*
 htmlcov/
+covout*/
 .pytest_cache/
 .codebuddy
 .codegraph
@@ -35,13 +36,6 @@ data/
 # Logs
 logs/
 *.log
-
-# Temp/debug files (root-only: keep nested package files like pipeline/_shared.py tracked)
-/_*.py
-/_*.log
-/_*.txt
-/_*.json
-prod_core.py
 
 # Environment variables
 .env
@@ -59,26 +53,12 @@ uv.lock
 # Tools
 .qoder/
 
-# Local scratch / debug artifacts (never commit)
+# Local scratch / debug artifacts (ad-hoc scripts belong in .workbuddy/tmp/)
 .workbuddy/
-*.cover
-covout/
-covout2/
 *.dat
+*.cover
 ocr-bin/
-/check_*.py
-/debug*.py
-/cov_sync.py
-/extract_conversations.py
-/find_real_conversations.py
-/test_*.py
-/ck*.txt
-/dbg*.txt
-/r[0-9].txt
-/covrun*.txt
-/p01.txt
-/pip.txt
-/pytest_*.txt
-/test_output.txt
-/test_result.txt
-/rtrace.txt
+/_*.py
+/_*.log
+/_*.txt
+/_*.json

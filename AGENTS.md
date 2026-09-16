@@ -154,6 +154,21 @@ botflow/
     └── storage/           # 数据库层
 ```
 
+### 仓根纪律
+
+仓根**只放** 5 个文件：`AGENTS.md`、`README.md`、`pyproject.toml`、`.gitignore`、`.dockerignore`。
+
+| 产物 | 落点 |
+|------|------|
+| 临时/调试脚本（`check_*`、`debug*`、一次性的 `test_*`） | `.workbuddy/tmp/`（不入库） |
+| 正式单测 | `tests/`（`pyproject.toml` 已设 `testpaths = ["tests"]`，根目录脚本不会被 pytest 收集） |
+| 日志 | `logs/` |
+| 覆盖率 HTML | `covout*/`（可再生，不入库） |
+| 运行时数据 | `data/`（不入库） |
+| Agent skill | `.mimocode/skills/<name>/SKILL.md`（MiMoCode 官方发现路径，下一轮热重载） |
+
+历史教训：仓根曾被 29 个 `.py` + 27 个 `.txt` 调试残留占据，`.gitignore` 被迫长成 45 行逐文件黑名单。**不要用 `.gitignore` 藏垃圾，把文件放对地方。**
+
 ---
 
 ---

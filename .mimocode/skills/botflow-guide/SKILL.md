@@ -72,7 +72,7 @@ botflow run / stop / restart / status / logs
 
 ```bash
 uv sync
-pytest tests -q          # 回归测试（勿从 scripts/ 目录收集）
+pytest -q                # 回归测试（pyproject 已设 testpaths=["tests"]）
 uvicorn botflow.core:app --reload
 ```
 
@@ -94,4 +94,5 @@ src/botflow/
 
 ## 详细文档
 
-- 完整架构设计：[docs/design.md](docs/design.md)
+- 完整架构设计：仓库根目录 `docs/design.md`
+- 功能点/测试用例/审核报告：`docs/tasks/`
