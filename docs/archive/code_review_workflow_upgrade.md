@@ -1,5 +1,11 @@
 # botflow 代码审查：LLM-Proxy → LLM 工作流升级
 
+> ⚠️ **本文件已归档至 `docs/archive/`，是历史记录，不代表当前状态。**
+>
+> 本文审查的是 **v1.1.0**。当时列出的"未落地"项——流式路径切换、Admin API 的 `type`/`params` 透传、`/admin/strategies`、LangGraph 策略，以及 P0-1 / P1-1~P1-3 各项——**现已全部实现**，代码为 v3.0.0。
+>
+> **当前准确的设计请以 [`../design.md`](../design.md) 为准。**
+
 > 审查对象：`E:\src\openbotflow`（botflow v1.1.0）
 > 审查目的：熟悉项目代码与架构，评估"将简单 proxy 升级为 LLM 工作流"的改造基础
 > 结论先行：**PipelineEngine 骨架 + 3 个内建策略 + DB type/params 迁移已落地，非流式路径已切到 PipelineEngine；流式路径、Admin API type/params 透传、`/admin/strategies`、LangGraph 策略均未落地。代码可运行，但存在 1 个高严重度架构隐患和若干中低严重度问题，需在进入 P3/P5/P6 前修复。**

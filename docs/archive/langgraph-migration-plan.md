@@ -1,5 +1,11 @@
 # openbotflow 核心路由迁移至 LangGraph 改动方案（async 架构）
 
+> ⚠️ **本文件已归档至 `docs/archive/`，是历史记录，不代表当前状态。**
+>
+> LangGraph 迁移**已完成并随 v3.0.0 发布**。本文中的节点签名（`(state, config)` → 单参数）、`RouteState` 字段清单、`_route_after_call` 的分支集合、`_finalize_error` 返回结构、测试迁移状态（本文标注"需更新"，实际已完成）等细节，均与当前实现存在偏差。
+>
+> **当前准确的设计请以 [`../design.md`](../design.md) 为准。**
+
 > 目标：核心路由由手写循环 → LangGraph StateGraph 声明式驱动，全链路 async，
 > 非流式/流式统一走 `ainvoke()`。
 >
