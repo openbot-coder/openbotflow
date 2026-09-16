@@ -1,7 +1,7 @@
 # Pipeline Router 重构设计文档
 
 > 版本：2.0 | 日期：2026-09-01
-> 状态：审查完成，待实施
+> 状态：已实施并随 v3.0.0 发布（本文档为设计与实现记录，非待实施计划）
 > 审查者：架构审查 + 兼容性审查 + 实现审查（3 轮交叉审查）
 
 ## 1. 目标
@@ -11,7 +11,7 @@
 **核心原则**：
 - 原有 `random_weights` 行为 100% 不变
 - 新增路由策略只需实现一个 `Strategy` 接口
-- 不引入重型依赖（LangGraph 作为可选的 `langgraph` 类型策略）
+- 不引入重型依赖（LangGraph 作为独立的 `langgraph` 类型策略，实施时为 P6 硬依赖，见第 9 节）
 - 所有策略共享 cooldown、retry、fallback、context truncation、call logging
 
 ---
@@ -105,7 +105,7 @@ def _row_to_group(self, row: sqlite3.Row) -> ModelGroup:
 
 ### 2.4 `group_models` 表不变
 
-现有 `group_models` 关联表保持不动。`random_weights`、`round_robin`、`sequential` 等策略仍然从 `group_models` 读取模型列表和权重。`langgraph` 策略可以不用 `group_models`，而是通过 `params.graph.nodes` 引用其他 group。
+现有 `group_models` 关联表保持不动。`random_weights`、`round_robin`、`sequential` 等策略仍然从 `group_models` 读取模型列表和权重。`langgraph` 策略可以不用 `group_models`，而是通过 `params.nodes` 中各节点的 `group_id` 引用其他 group。
 
 **注意**：`langgraph` 类型的 group 在 `find_groups_by_model_name()` 中不可见（因为没有 `group_models` 关联）。`_get_group_id()` 的 step 2 无法匹配 langgraph 组，需要通过 step 1（精确 group name 匹配）路由。这是预期行为，应在文档中说明。
 
@@ -198,15 +198,9 @@ register_strategy("random_weights", RandomWeightsStrategy)
 register_strategy("round_robin", RoundRobinStrategy)
 register_strategy("sequential", SequentialStrategy)
 
-# 可选策略（langgraph 未安装时静默跳过）
-def _register_optional():
-    try:
-        from botflow.pipeline.langgraph_strategy import LangGraphStrategy
-        register_strategy("langgraph", LangGraphStrategy)
-    except ImportError:
-        pass
-
-_register_optional()
+# langgraph 策略：langgraph 为硬依赖，直接注册，无 ImportError 兜底
+from botflow.pipeline.langgraph_strategy import LangGraphStrategy
+register_strategy("langgraph", LangGraphStrategy)
 ```
 
 ---
@@ -215,7 +209,7 @@ _register_optional()
 
 ### 4.1 `random_weights`（现有逻辑，零改动）
 
-**行为**：与当前 `GroupRouter._route_non_stream` 完全一致。
+**行为**：与原 `GroupRouter._route_non_stream` 完全一致——该类已删除，逻辑现为 `RandomWeightsStrategy`。
 
 ```
 Load endpoints → Filter cooldown → Weighted random select → Context truncation
@@ -231,7 +225,7 @@ Load endpoints → Filter cooldown → Weighted random select → Context trunca
 }
 ```
 
-**实现**：核心逻辑从 `GroupRouter._route_non_stream` 搬过来，变为 `select_endpoints()` 的实现。
+**实现**：核心逻辑已从 `GroupRouter._route_non_stream` 搬至 `strategies.py`，变为 `select_endpoints()` 的实现；`GroupRouter` 类本身已删除。
 
 ### 4.2 `round_robin`（轮询）
 
@@ -268,89 +262,54 @@ Load endpoints → Filter cooldown → Weighted random select → Context trunca
 }
 ```
 
-### 4.4 `langgraph`（自定义图路由，P5）
+### 4.4 `langgraph`（自定义图路由，P6）
 
-**行为**：执行用户定义的 StateGraph，图中的节点可以是 LLM 调用、条件分支、数据变换等。
+**行为**：执行 `params` 中定义的有向图，每个节点是一次 LLM 调用，由边（可选条件）决定流转顺序。
 
-**params**：携带完整的 LangGraph 图定义。
+**params**：携带图定义（顶层 `nodes` / `edges` / `entry` / `final`，没有 `graph` 包装层）。
 
 ```json
 {
   "name": "smart-router",
   "type": "langgraph",
   "params": {
-    "entry": "classify",
+    "entry": "analyze",
+    "final": "respond",
     "nodes": {
-      "classify": {
-        "type": "llm_call",
-        "group": "fast",
-        "system_prompt": "判断用户意图。只输出一个词：code、search 或 chat。",
-        "input_key": "user_message",
-        "output_key": "intent"
+      "analyze": {
+        "prompt": "分析以下内容: {messages}",
+        "group_id": null
       },
-      "code_handler": {
-        "type": "llm_call",
-        "group": "code-expert",
-        "input_key": "messages"
-      },
-      "chat_handler": {
-        "type": "llm_call",
-        "group": "default",
-        "input_key": "messages"
+      "respond": {
+        "prompt": "基于分析结果回复: {state}",
+        "group_id": null
       }
     },
-    "edges": [
-      {"from": "classify", "to": "code_handler", "condition": "intent == 'code'"},
-      {"from": "classify", "to": "chat_handler", "condition": "default"}
-    ]
+    "edges": [["analyze", "respond"]]
   }
 }
 ```
 
-**图节点类型**：
+**节点与边的字段**：
 
-| node.type | 作用 | 参数 |
-|-----------|------|------|
-| `llm_call` | 调用指定 group 的 LLM | `group`, `system_prompt?`, `input_key`, `output_key` |
-| `condition` | 基于状态值分支 | `input_key`, `branches: [{when, to}]` |
-| `parallel` | 并行调用多个节点，合并结果 | `targets: [node_name]`, `merge: "concat"\|"join"` |
-| `transform` | 数据变换函数 | `function: "truncate"\|"compress"\|"format"`, `args` |
+| 字段 | 作用 |
+|------|------|
+| `nodes.<name>.prompt` | 该节点的 prompt 模板，支持 `{messages}` 与 `{state}` 两个占位符（未知占位符报 `ConfigurationError`） |
+| `nodes.<name>.group_id` | 该节点使用的 group；`null` 表示沿用当前 group |
+| `edges` | 边列表，元素为 `[from, to]` 或 `[from, to, condition]`；节点可有 0 / 1 / 多条出边 |
+| `entry` | 起始节点名，必须存在于 `nodes` |
+| `final` | 哪个节点的输出作为最终响应；缺省时取最后一个无出边的节点 |
 
-**条件表达式安全求值**（不用 `eval`，用 `ast.parse` + 白名单 operator）：
+**执行语义**：
 
-```python
-import ast
-import operator
+- 节点只有一种形态：调用该节点 group 的一个可用 endpoint（`filter_available` + `truncate_messages` + `call_llm`）
+- 节点输出写入 state（key 为节点名），可被后续节点的 `{state}` 引用
+- 多条出边时按 `condition` 做**子串匹配**（`condition in 上一节点输出`）选择下一个节点；全部不匹配则走第一条（默认分支）
+- `to` 可为 `__end__` / `END` 结束图；节点无出边即结束
+- `MAX_STEPS = 50` 防环，超出报 `StrategyError`
+- 条件不做表达式求值（没有 `eval` / AST 白名单），仅子串匹配
 
-SAFE_OPS = {
-    ast.Eq: operator.eq,
-    ast.NotEq: operator.ne,
-    ast.Gt: operator.gt,
-    ast.GtE: operator.ge,
-    ast.Lt: operator.lt,
-    ast.LtE: operator.le,
-}
-
-def safe_eval_condition(expr: str, state: dict) -> bool:
-    tree = ast.parse(expr, mode='eval')
-    if not isinstance(tree.body, ast.Compare):
-        raise ValueError(f"Condition must be a simple comparison: {expr}")
-    cmp = tree.body
-    if not isinstance(cmp.left, ast.Name):
-        raise ValueError(f"Left side must be a variable name: {expr}")
-    value = state.get(cmp.left.id)
-    for op, comparator in zip(cmp.ops, cmp.comparators):
-        if type(op) not in SAFE_OPS:
-            raise ValueError(f"Unsupported operator: {type(op).__name__}")
-        if not isinstance(comparator, (ast.Constant, ast.Str)):
-            raise ValueError(f"Right side must be a literal: {expr}")
-        right = comparator.value if isinstance(comparator, ast.Constant) else comparator.s
-        if not SAFE_OPS[op](str(value) if value is not None else "", right):
-            return False
-    return True
-```
-
-**未安装 langgraph 时**：在注册时静默跳过，`GET /admin/strategies` 返回的列表不包含 `langgraph`。
+**langgraph 为硬依赖**（见第 9 节）：`LangGraphStrategy` 在 `langgraph_strategy.py` 被 import 时无条件注册，`GET /admin/strategies` 始终包含 `langgraph`。
 
 ---
 
@@ -358,19 +317,17 @@ def safe_eval_condition(expr: str, state: dict) -> bool:
 
 所有共享函数为**独立的 async 函数**（不是 BaseStrategy 的方法），策略通过参数调用。
 
-**从 `router.py` 搬过来的全局状态**：
+**全局状态（缓存/信号量）的单一事实源是 `router.py`**，`_shared.py` 只做 re-export：
 
 ```python
-# pipeline/_shared.py
-
-# --- 从 router.py 搬过来，原封不动 ---
-_provider_semaphores: dict[int, asyncio.Semaphore | None] = {}
-_endpoint_cache: dict[int, tuple[list[ModelEndpoint], float]] = {}
-_ENDPOINT_CACHE_TTL = 60
-
-# provider 缓存也搬过来
-_provider_cache: dict[tuple[int, str], tuple[BaseProvider, float]] = {}
-_PROVIDER_CACHE_TTL = 300
+# pipeline/_shared.py — 自 router.py 导入，不重复定义
+from botflow.router import (
+    _provider_semaphores,
+    _endpoint_cache,
+    _ENDPOINT_CACHE_TTL,   # 60
+    _provider_cache,
+    _PROVIDER_CACHE_TTL,   # 300
+)
 ```
 
 **共享函数**：
@@ -398,7 +355,7 @@ async def call_llm(
 ) -> dict | None:
     """调用单个 endpoint，带 retry + cooldown + 信号量管理。
 
-    从 GroupRouter._attempt_call 1:1 搬过来。
+    从 GroupRouter._attempt_call 1:1 搬过来（该类已删除）。
     信号量是全局跨 group 共享的——同一个 provider 跨 group 限流。
     """
     kwargs = _apply_model_extra_config(kwargs, ep.detail.extra_config)
@@ -437,8 +394,8 @@ def invalidate_endpoint_cache(group_id: int) -> None:
 ```
 
 **关键决策**：
-- provider 信号量 `_provider_semaphores` 必须在 `_shared.py`，不能在 strategy 里——它是全局跨 group 共享的
-- `_endpoint_cache` 也搬到 `_shared.py`，与 provider 缓存一起管理
+- provider 信号量 `_provider_semaphores` 定义在 `router.py`（`_shared.py` re-export），不能在 strategy 里——它是全局跨 group 共享的
+- `_endpoint_cache` 同样定义在 `router.py`，与 `_provider_cache` 一起管理，`_shared.py` 只 re-export
 - `call_llm` 是独立函数，测试时不需要实例化 strategy
 
 ---
@@ -451,16 +408,15 @@ def invalidate_endpoint_cache(group_id: int) -> None:
 请求
   │
   ▼
-PipelineEngine.route(group, messages, stream=False, ...)
+PipelineEngine.route(group, messages, ...)          # 非流式 → dict
+PipelineEngine.route_stream(group, messages, ...)   # 流式 → 候选 endpoints dict
   │
   ├─ 查策略注册表 → strategy_cls = STRATEGY_REGISTRY[group.type]
   │
-  ├─ strategy = strategy_cls(group.params)
+  ├─ strategy = strategy_cls(group.params) → 由图选出候选 endpoints
   │
-  ├─ if stream:
-  │     return await strategy.select_endpoints(messages, ...)  → StreamRouteResult
-  │   else:
-  │     return await strategy.execute(messages, ...)           → dict
+  ├─ 非流式：strategy.execute(messages, ...)                     → dict
+  │  流式：{endpoints, group_id, messages, temperature, max_tokens, kwargs, fallback_group_id}
   │
   └─ 失败时 → engine 层 fallback（跨策略类型）
 ```
@@ -470,19 +426,21 @@ PipelineEngine.route(group, messages, stream=False, ...)
 ```
 src/botflow/
 ├── router.py                     # 保留：CooldownManager, ModelEndpoint,
-│                                 #        weighted_random_select/order, retry 工具函数
-│                                 #        （GroupRouter 类标记 @deprecated）
+│                                 #        weighted_random_select/order, retry 工具函数、
+│                                 #        endpoint/provider 缓存与信号量
+│                                 #        （GroupRouter 类已删除）
 │
 ├── pipeline/
 │   ├── __init__.py               # 导出 PipelineEngine
-│   ├── engine.py                 # PipelineEngine（统一入口）
+│   ├── engine.py                 # PipelineEngine（统一入口，代理到 LangGraphEngine）
+│   ├── langgraph_engine.py       # LangGraphEngine：StateGraph 节点 + 重试/降级生命周期
 │   ├── base.py                   # BaseStrategy ABC + RouteResult + STRATEGY_REGISTRY
 │   ├── _shared.py                # load_endpoints, call_llm, filter_available, etc.
 │   ├── strategies.py             # RandomWeightsStrategy + RoundRobinStrategy + SequentialStrategy
-│   └── langgraph_strategy.py     # LangGraphStrategy（P5，可选依赖）
+│   └── langgraph_strategy.py     # LangGraphStrategy（P6，硬依赖）
 ```
 
-**文件数从 9 个精简到 7 个**：3 个内建策略合并到 `strategies.py`（总共不到 100 行），`graph_types.py` 延迟到 P5。
+**文件数从 9 个精简到 7 个**：3 个内建策略合并到 `strategies.py`（总共不到 100 行），`graph_types.py` 延迟到 P6。
 
 ### 6.3 PipelineEngine 实现
 
@@ -531,7 +489,7 @@ class PipelineEngine:
         _fallback_depth: int = 0,
         _visited: set[int] | None = None,
         **kwargs,
-    ) -> dict | StreamRouteResult:
+    ) -> dict:
         """统一路由入口。"""
         if _fallback_depth > 3:
             raise ProviderError("Fallback chain too deep")
@@ -598,18 +556,18 @@ result = await engine.route(group=group, messages=..., temperature=..., stream=.
 
 ### 6.5 Streaming 路径处理
 
-**当前 `core.py` `_stream_common` 的流式 fallback 逻辑（110+ 行）分两阶段迁移**：
+**`core.py` `_stream_common` 的流式 fallback 逻辑（110+ 行）分两阶段迁移（两阶段均已完成）**：
 
-**第一阶段（P2）**：非流式先迁移，流式暂保持 GroupRouter
+**第一阶段（P2）**：非流式先迁移，流式暂保持 GroupRouter（中间状态，已被 P3 取代）
 ```
 core.py _handle_chat_non_stream → PipelineEngine.route(stream=False)
-core.py _stream_common → 仍用 GroupRouter（暂时）
+core.py _stream_common → GroupRouter（仅限第一阶段，该类现已删除）
 ```
 
 **第二阶段（P3）**：流式迁移到 PipelineEngine
 ```
-core.py _stream_common → PipelineEngine.route(stream=True) → select_endpoints()
-                        → 逐个 endpoint 尝试（逻辑从 _stream_common 搬到 engine 或保持在 core.py）
+core.py _stream_common → PipelineEngine.route_stream() → 候选 endpoints dict
+                        → 逐个 endpoint 尝试（逻辑仍留在 core.py）
 ```
 
 **流式中的 cooldown 记录**：`_stream_common` 中的 `cooldown.record_success/failure` 需要通过 engine 的 cooldown manager 访问。
@@ -631,11 +589,11 @@ POST /admin/groups
   name: "smart-router"
   description: "Intent-based routing"
   type: "langgraph"              # 新增，可选，默认 "random_weights"
-  params: '{"entry":"classify"}' # 新增，JSON 字符串（与现有 query param 风格一致）
+  params: {"entry": "classify"}  # 新增，JSON 对象（Pydantic body 字段）
   fallback_group_id: null
 ```
 
-**params 传递方式**：用 JSON 字符串（与现有 admin API 的 query param 风格一致），后端 `json.loads()` 解析。不改为 Pydantic Body（避免破坏现有客户端）。
+**params 传递方式**：Pydantic request body 模型（`CreateGroupReq.params: Optional[dict]`），直接传 JSON 对象。create 端点用 `Body(embed=True)`，payload 形如 `{"req": {...}}`；PATCH 用扁平的 `UpdateGroupReq`。
 
 ### 7.2 更新 Group
 
@@ -643,7 +601,7 @@ POST /admin/groups
 PATCH /admin/groups/{id}
   # 可更新 type 和 params
   type: "round_robin"
-  params: '{}'
+  params: {}
 ```
 
 ### 7.3 获取 Group
@@ -657,16 +615,9 @@ GET /admin/groups/{id}/details
 
 ```
 GET /admin/strategies
-  返回支持的策略类型列表及说明：
-  [
-    {"type": "random_weights", "name": "加权随机", "params_schema": {}},
-    {"type": "round_robin", "name": "轮询", "params_schema": {}},
-    {"type": "sequential", "name": "顺序降级", "params_schema": {}},
-    {"type": "langgraph", "name": "自定义图", "params_schema": "...", "available": true/false}
-  ]
+  返回已注册的策略类型名（字典序）：
+  {"success": true, "strategies": ["langgraph", "random_weights", "round_robin", "sequential"]}
 ```
-
-`available` 字段根据 langgraph 是否安装动态返回。
 
 ---
 
@@ -687,7 +638,7 @@ GET /admin/strategies
 | 测试文件 | 影响 |
 |---------|------|
 | `test_router.py` | **不改**：`weighted_random_select` 等纯函数保留 |
-| `test_router_full.py` | **不改**：`GroupRouter` 保留 |
+| `test_router_full.py` | **已改**：标题为「Full coverage tests for the routing engine (PipelineEngine + helpers)」，改为构造 `PipelineEngine` |
 | `test_group_routing.py` | **不改**：集成测试（random_weights 行为不变） |
 | `test_admin_api.py` | **需新增**：type/params 的 CRUD 用例 |
 | `test_db.py` | **需修改**：断言 `group.type` 和 `group.params` |
@@ -716,16 +667,23 @@ GET /admin/strategies
 
 | 依赖 | 必须/可选 | 说明 |
 |------|----------|------|
-| `langgraph` | 可选 | 仅 `langgraph` 类型策略需要 |
-| `langchain-core` | 可选 | langgraph 的依赖 |
+| `langgraph>=0.2.0` | **必须** | 路由图引擎与 `langgraph` 类型策略都依赖它 |
+| `langchain-core` | 传递引入 | 由 `langgraph` 依赖链带入 |
+
+实施时按决策改为 hard 依赖：安装即用，不再「未安装则静默跳过」——`pipeline/__init__.py` 无条件 import `LangGraphStrategy`。
 
 ```toml
 # pyproject.toml
+dependencies = [
+    ...
+    "langgraph>=0.2.0",
+]
+
 [project.optional-dependencies]
-pipeline = ["langgraph>=0.2", "langchain-core>=0.3"]
+deepseek = ["deepseek>=1.0.0"]   # 唯一保留的 extra
 ```
 
-安装方式：`pip install botflow[pipeline]`
+安装方式：`pip install botflow`（无需 extra）
 
 ---
 
@@ -734,16 +692,16 @@ pipeline = ["langgraph>=0.2", "langchain-core>=0.3"]
 | 阶段 | 内容 | 验证标准 | 风险 |
 |------|------|---------|------|
 | **P1** | DB migration + Model 变更 + pipeline/ 目录 + BaseStrategy + _shared.py + PipelineEngine 骨架 | 现有测试全部通过（不改 core.py，不改任何行为） | 低 |
-| **P2** | RandomWeightsStrategy + core.py **非流式**接入 | test_router.py 纯函数不变；新增 test_strategy_random_weights.py；非流式路径改用 PipelineEngine；流式路径**暂不改** | 低 |
+| **P2** | RandomWeightsStrategy + core.py **非流式**接入 | test_router.py 纯函数不变；新增 tests/test_pipeline_strategies.py；非流式路径改用 PipelineEngine；流式路径**暂不改** | 低 |
 | **P3** | core.py **流式**路径迁移到 PipelineEngine | 所有 streaming 测试通过；_stream_common 不再直接引用 GroupRouter | 中 |
 | **P4** | RoundRobinStrategy + SequentialStrategy | 新增测试覆盖轮询、顺序降级、部分失败 | 低 |
 | **P5** | Admin API 支持 type/params + /admin/strategies | 创建 round_robin group → 路由成功；修改 group type 热切换生效 | 低 |
 | **P6** | LangGraphStrategy | 依赖 langgraph 的集成测试 | 中 |
-| **P7** | 清理 GroupRouter（标记 deprecated，保留兼容） | 所有测试通过 | 低 |
+| **P7** | 清理 GroupRouter（已完成：类删除，`router.py` 仅剩基础设施） | 所有测试通过 | 低 |
 
 **P1-P5 为第一期**，不引入任何新依赖，只重构内部结构。
-**P6 为第二期**，按需引入 langgraph。
-**P7 为清理期**，在第二期稳定后执行。
+**P6 为第二期**，引入 langgraph（hard 依赖）。
+**P7 为清理期**（已完成），在第二期稳定后执行。
 
 ---
 
@@ -769,8 +727,8 @@ src/botflow/storage/models.py            # ModelGroup 加 type, params
 src/botflow/storage/db.py                # migration + CRUD 支持新字段（7 处改动）
 src/botflow/core.py                      # _get_router → PipelineEngine（非流式 P2，流式 P3）
 src/botflow/admin_api.py                 # group CRUD 支持 type/params + /admin/strategies
-src/botflow/router.py                    # GroupRouter 标记 @deprecated（P7）
-pyproject.toml                           # optional-dependencies pipeline
+src/botflow/router.py                    # 删除 GroupRouter，仅保留基础设施（P7）
+pyproject.toml                           # 新增 langgraph 硬依赖
 ```
 
 ### 不变文件
@@ -792,17 +750,16 @@ src/botflow/providers/*.py               # Provider 实现
 | 测试文件 | 覆盖 |
 |---------|------|
 | `tests/test_pipeline_engine.py` | PipelineEngine 分发逻辑、strategy 注册、未知 type 报错、fallback 循环检测 |
-| `tests/test_strategy_random_weights.py` | 行为与现有 `test_router.py` 完全一致 |
-| `tests/test_strategy_round_robin.py` | 顺序轮询、计数器溢出、单模型 group |
-| `tests/test_strategy_sequential.py` | 顺序降级、部分失败、全部失败 |
+| `tests/test_pipeline_strategies.py` | 三个内建策略：random_weights 行为与原 `test_router.py` 一致、顺序轮询与计数器溢出、顺序降级与部分/全部失败 |
 | `tests/test_pipeline_migration.py` | DB migration 正确性、旧数据兼容、params JSON 解析 |
-| `tests/test_shared.py` | call_llm、load_endpoints、filter_available 独立测试 |
+| `tests/test_pipeline_base.py` | BaseStrategy、call_llm、load_endpoints、filter_available 独立测试 |
+| `tests/test_router_full.py` | 纯函数与基础设施（endpoint cache、retry 等），见 8.2 |
 
 ### 第二期测试（P6）
 
 | 测试文件 | 覆盖 |
 |---------|------|
-| `tests/test_pipeline_langgraph.py` | LangGraph 集成（需安装 langgraph） |
+| `tests/test_langgraph_engine.py` | LangGraphEngine 非流式/流式路由、fallback 循环检测、kwargs 透传 |
 
 ---
 
@@ -821,12 +778,12 @@ src/botflow/providers/*.py               # Provider 实现
 - `create_group` INSERT 必须包含新列
 - `CREATE_TABLES_SQL` 必须同步更新
 - `_GROUP_UPDATE_COLUMNS` 白名单必须扩展
-- Admin API `params` 用 JSON 字符串传递（与现有 query param 风格一致）
+- Admin API `params` 用 JSON 字符串传递（与现有 query param 风格一致）（实施时改为 Pydantic body 模型，见 7.1）
 - Fallback 需检测循环（visited set）
 - langgraph group 在 `find_groups_by_model_name` 中不可见（预期行为）
 
 ### 实现审查关键发现
-- provider 信号量 `_provider_semaphores` 必须在 `_shared.py`（跨 group 共享）
+- provider 信号量 `_provider_semaphores` 必须在 `_shared.py`（跨 group 共享）（实施时保留在 `router.py`，由 `_shared.py` re-export，见第 5 节）
 - context_window 截断放在 `_shared.py` 的 `truncate_messages()` 函数中
 - PipelineEngine 用 db_factory 而非 db 实例（避免重连失效）
 - Streaming 路径分两阶段迁移（P2 非流式，P3 流式）

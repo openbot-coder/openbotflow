@@ -130,28 +130,37 @@ botflow/
 ├── AGENTS.md              # AI 助手行为规范（本文件）
 ├── README.md              # 项目介绍
 ├── pyproject.toml         # Python 包配置（依赖、构建、CLI 入口）
-├── .python-version        # Python 版本锁定
+├── .gitignore / .dockerignore
 │
 ├── scripts/               # 存放各种脚本
-│
+├── tests/                 # 测试（pytest testpaths）
 ├── docs/
-│   └── design.md          # 系统设计文档（架构、数据模型、API 定义）
+│   ├── design.md          # 系统设计文档（架构、数据模型、API 定义）
+│   ├── pipeline_router_design.md  # Pipeline/策略设计规格
+│   ├── tasks/             # 各任务的功能点/测试用例/审核报告
+│   ├── security_audit/    # 安全审计报告
+│   └── archive/           # 已归档的历史文档
 │
 └── src/botflow/           # 源码根包
     ├── __init__.py        # 包入口
-    ├── cli.py             # CLI 命令行
-    ├── config.py          # 全局配置 + .env 加载
-    ├── workspace.py       # Workspace 路径管理
-    ├── core.py            # FastAPI 主服务
-    ├── router.py          # 核心路由引擎
-    ├── protocol_adapter.py# 协议适配层
-    ├── auth.py            # 鉴权中间件
+    ├── core.py            # FastAPI 主服务 + 路由注册/流式/后台任务/限流中间件
+    ├── router.py          # 路由基础设施（端点缓存、CooldownManager）
+    ├── protocol_adapter.py# 协议适配层（客户端 4 种格式 ↔ 内部表示）
+    ├── auth.py            # 鉴权（客户端 Key + Admin Key）
     ├── admin_api.py       # REST 管理接口
-    ├── daily_summary.py   # 每日摘要定时任务
-    ├── rate_limit.py      # IP 级速率限制
-    ├── common/            # 通用工具
+    ├── admin_dashboard.py # /admin/ 内置管理面板
+    ├── config.py          # pydantic-settings 配置
+    ├── workspace.py       # Workspace 路径管理
+    ├── cli/
+    │   ├── main.py        # CLI 入口
+    │   └── service.py     # start/stop/status/logs（PID 文件管理）
+    ├── pipeline/          # LangGraph 工作流引擎 + 策略系统
     ├── providers/         # LLM 供应商适配
-    └── storage/           # 数据库层
+    ├── common/            # 通用工具（logger/exceptions/context/content_converters）
+    └── storage/
+        ├── db.py          # 数据库层
+        ├── models.py      # Pydantic 数据模型
+        └── daily_summary.py  # 每日摘要定时任务
 ```
 
 ### 仓根纪律

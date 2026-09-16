@@ -6,6 +6,25 @@
 
 ---
 
+> ## 后续状态补注（2026-09-16 复核，针对 v3.0.0）
+>
+> 本报告是 2026-07-03 的**时间点快照**（当时 v0.1.0）。经逐项复核，4 项发现中 **3 项已修复**：
+>
+> | 原发现 | 当前状态 |
+> |---|---|
+> | Medium #1 时序攻击（`!=` 比对） | ✅ 已修复 — 改用 `secrets.compare_digest`（`auth.py`） |
+> | Medium #2 CORS `*` + `allow_credentials` | ✅ 已修复 — 由 `BOTFLOW_CORS_ORIGINS` 控制，为 `*` 时自动关闭 credentials（`core.py`） |
+> | Medium #3 缺少速率限制 | ✅ 已修复 — `RateLimitMiddleware`，300 次/分钟（`core.py`） |
+> | Low #4 provider `api_key` 明文存储 | ❌ **仍未处理** — 现仍为 `api_key TEXT NOT NULL DEFAULT ''`（`db.py`） |
+>
+> 另有两处结论已不再成立：
+> - 原报告称"未发现 subprocess、无命令注入风险"——现 `cli/service.py` 存在 `subprocess.Popen` 调用，该结论需重新评估。
+> - 报告中的 MCP Key 掩码代码片段已随 MCP 模块一并移除，不再适用。
+>
+> **以下为原始报告内容，未作任何修改。**
+
+---
+
 ## 审计摘要
 
 | 严重度 | 数量 |
