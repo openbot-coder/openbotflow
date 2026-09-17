@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any
+
+import tiktoken
+
+# 上游 DeepSeek 未公开 tiktoken 词表；o200k_base 是实测误差最小的代理
+# （真实 agent 载荷 −17.5%，旧启发式为 −51% ~ +34%）。可宣称"更准"不可宣称"精确"。
+_ENCODING_NAME = "o200k_base"
+
+# 每条消息的固定开销（role 与内容之间的分隔）。
+_MESSAGE_OVERHEAD = 1
 
 
 def _extract_text(content: Any) -> str:
@@ -22,24 +32,51 @@ def _extract_text(content: Any) -> str:
     return str(content) if content else ""
 
 
-def estimate_tokens(messages: list[dict[str, Any]]) -> int:
-    """Estimate token count for a list of messages.
+@lru_cache(maxsize=1)
+def _encoding() -> "tiktoken.Encoding":
+    """返回共享的 BPE 编码器，词表在首次调用时才加载。
 
-    Uses a simple heuristic: ~4 characters per token for English text,
-    ~2 characters per token for CJK text. This is intentionally rough;
-    it's meant to prevent context-length explosions, not replace a real
-    tokenizer.
+    用 lru_cache 惰性单例（标准库），避免手写全局变量；首次调用会联网下载
+    词表并缓存于 TIKTOKEN_CACHE_DIR，离线环境需预置。
+    """
+    return tiktoken.get_encoding(_ENCODING_NAME)
+
+
+def _token_upper_bound(messages: list[dict[str, Any]]) -> int:
+    """`estimate_tokens()` 的严格上界。
+
+    每个 token 至少覆盖 1 字节 ⇒ BPE 结果 ≤ UTF-8 字节数；再加上每条消息的
+    固定开销。**两条都要算**：只算字节数时，若 role 与 content 同时为空
+    （客户端漏发 role），字节数为 0 而估算值仍为 1/条，上界就不成立了。
+
+    用作快路径短路：上界 ≤ limit ⇒ 真实 token 数必不超限，可原样返回。
     """
     total = 0
     for msg in messages:
+        role = msg.get("role", "")
         raw_content = msg.get("content", "") or ""
         text = _extract_text(raw_content)
+        total += len(role.encode("utf-8")) + len(text.encode("utf-8")) + _MESSAGE_OVERHEAD
+    return total
+
+
+def estimate_tokens(messages: list[dict[str, Any]]) -> int:
+    """用真正的 BPE 分词器统计 token 数。
+
+    用 encode_ordinary 而非 encode：后者遇到 <|endoftext|> 这类特殊 token
+    字面量会抛 ValueError；encode_ordinary 把它们当普通文本处理，正文安全。
+    """
+    enc = _encoding()
+    total = 0
+    for msg in messages:
         role = msg.get("role", "")
-        # ~4 chars per token for English, ~2 for CJK
-        char_count = len(role) + len(text)
-        cjk_ratio = _cjk_ratio(text)
-        chars_per_token = 4.0 - (cjk_ratio * 2.0)
-        total += int(char_count / max(chars_per_token, 1.0)) + 1
+        raw_content = msg.get("content", "") or ""
+        text = _extract_text(raw_content)
+        total += (
+            len(enc.encode_ordinary(role))
+            + len(enc.encode_ordinary(text))
+            + _MESSAGE_OVERHEAD
+        )
     return total
 
 
@@ -66,9 +103,9 @@ def truncate_to_context_window(
     reserve = max_tokens or 1024
     limit = max(context_window - reserve, 1)
 
-    # Fast path
-    estimated = estimate_tokens(messages)
-    if estimated <= limit:
+    # 上界短路：token 数 ≤ 字节数 + 每条固定开销，上界达标即必不超限。
+    # 边界：上界 == limit 走短路，上界 == limit + 1 才进编码路径。
+    if _token_upper_bound(messages) <= limit:
         return messages
 
     # Keep system + last N messages
@@ -93,11 +130,3 @@ def truncate_to_context_window(
         return messages[-1:] if messages else messages
 
     return system + history[len(history) - best:]
-
-
-def _cjk_ratio(text: str) -> float:
-    """Return ratio of CJK characters in text."""
-    if not text:
-        return 0.0
-    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff" or "\u3000" <= ch <= "\u303f" or "\u3040" <= ch <= "\u309f" or "\u30a0" <= ch <= "\u30ff")
-    return cjk / len(text)

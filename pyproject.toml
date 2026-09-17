@@ -22,6 +22,10 @@ dependencies = [
     # LLM 工作流升级（P6 LangGraphStrategy）：按决策走 hard 依赖，
     # 使 langgraph 策略始终可用，不再"未安装则静默跳过"。
     "langgraph>=0.2.0",
+    # P9-6：用真正的 BPE 分词器替换 _cjk_ratio 启发式估算 token。
+    # 同 P6 的 langgraph：若降级回旧启发式 = 精度无声退化，不可接受，故走硬依赖
+    # （不再"未安装则静默跳过"）。o200k_base 是 DeepSeek 未公开词表的实测最小误差代理。
+    "tiktoken>=0.14.0",
 ]
 
 [project.optional-dependencies]
