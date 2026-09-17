@@ -311,21 +311,26 @@ class TestPipelineEngineRouting:
         assert [ep.model_id for ep in result["endpoints"]] == [1]
 
     @pytest.mark.asyncio
-    async def test_route_stream_all_on_cooldown_fallback(self, engine, mock_db):
+    async def test_route_stream_all_on_cooldown_raises_typed_error(self, engine, mock_db):
+        """design.md §3.5: the streaming path only selects endpoints.
+
+        Group-level fallback is owned by the caller (``core._stream_common``,
+        attempted once via ``fallback_group_id``), so a fully cooled-down group
+        must surface as a typed ``AllModelsCooldownError`` rather than being
+        silently resolved inside ``route_stream()``.
+        """
         cm = engine.cooldown
         cm.record_failure(1, 1, 1, 60)
         group = self._make_group(group_id=1, fallback_group_id=4)
-        group4 = self._make_group(group_id=4, name="fallback")
-
-        mock_db.get_group.side_effect = lambda gid: group if gid == 1 else group4
         mock_db.get_group_models.side_effect = (
-            lambda gid, enabled_only=True: [_make_model_detail(1, 1.0)] if gid == 1 else [_make_model_detail(2, 1.0)]
+            lambda gid, enabled_only=True: [_make_model_detail(1, 1.0)]
         )
         mock_db.get_provider.return_value = Provider(id=1, name="p", provider_type="openai")
 
-        result = await engine.route_stream(group=group, messages=[{"role": "user", "content": "hi"}])
-        assert result["group_id"] == 4
-        assert [ep.model_id for ep in result["endpoints"]] == [2]
+        # fallback_group_id is still handed to the caller on the success path,
+        # so core.py can fall back when the *stream* itself fails.
+        with pytest.raises(AllModelsCooldownError):
+            await engine.route_stream(group=group, messages=[{"role": "user", "content": "hi"}])
 
 
 # ---------------------------------------------------------------------------

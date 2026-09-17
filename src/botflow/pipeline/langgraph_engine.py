@@ -22,12 +22,13 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, TypedDict
+from typing import Any, Callable, Literal, NoReturn, TypedDict
 
 from langgraph.graph import END, StateGraph
 from langgraph.config import get_config
 
 from botflow.common.exceptions import (
+    BotflowError,
     ConfigurationError,
     NoAvailableModelError,
     ProviderError,
@@ -89,7 +90,10 @@ class RouteState(TypedDict, total=False):
 
     # ── Result ────────────────────────────────────────────
     result: dict[str, Any] | None
-    error: str | None        # recoverable (endpoint failed → fallback)
+    # Recoverable (endpoint failed → fallback). Holds the *exception object*
+    # captured by `_load_and_select` so its type survives (see
+    # `_raise_routing_error`); `_try_call` stores a plain string instead.
+    error: Any
     fatal_error: str | None  # unrecoverable (cycle, depth, config → no fallback)
     used_model_id: int | None
     used_provider_id: int | None
@@ -102,6 +106,31 @@ class RouteState(TypedDict, total=False):
 # ---------------------------------------------------------------------------
 # Graph nodes (ALL ASYNC — run under uvicorn's event loop via ainvoke)
 # ---------------------------------------------------------------------------
+
+
+def _raise_routing_error(raw: Any, default_exc: BotflowError) -> NoReturn:
+    """Re-raise a routing failure, preferring its original exception type.
+
+    ``_load_and_select`` deliberately stores recoverable exceptions in
+    ``state["error"]`` (instead of failing the node) so the graph can still
+    try a fallback group, and ``_finalize_error`` then flattens that — plus
+    ``fatal_error`` — into a human-readable message.
+
+    Reporting *everything* as ``ProviderError`` / a generic
+    ``NoAvailableModelError`` would erase why routing failed:
+    ``NoAvailableModelError`` means "nothing to route to at all", while
+    ``AllModelsCooldownError`` means "everything is cooling down, retry
+    later". ``core.py`` records ``type(e).__name__`` in ``call_logs``, so the
+    distinction is operationally load-bearing.
+
+    Only exceptions captured by a node can be re-raised with their own type;
+    anything that was already flattened to a message can only surface as
+    ``default_exc``.
+    """
+    if isinstance(raw, BotflowError):
+        raise raw
+    raise default_exc
+
 
 async def _resolve_group(state: RouteState) -> dict:
     """Resolve the active ModelGroup.
@@ -200,8 +229,11 @@ async def _load_and_select(state: RouteState) -> dict:
             **state.get("extra_kwargs", {}),
         )
     except Exception as exc:
-        # Recoverable — store in error (not fatal) so graph can try fallback
-        return {"error": str(exc)}
+        # Recoverable — keep the *exception object* in `error` (not just its
+        # message) so the graph can try a fallback group **and** the original
+        # type (NoAvailableModelError / AllModelsCooldownError) still reaches
+        # the caller. See `_raise_routing_error`.
+        return {"error": exc}
 
     return {
         "endpoints": result.endpoints,
@@ -250,10 +282,13 @@ async def _try_call(state: RouteState) -> dict:
         idx += 1
 
     # All endpoints failed — clear so graph routes to fallback/error.
-    # Preserve any pre-existing fatal_error (e.g. from _resolve_group cycle/depth check).
-    if not state.get("fatal_error"):
-        return {"endpoints": [], "current_ep_idx": 0, "error": "All endpoints in group failed"}
-    return {"endpoints": [], "current_ep_idx": 0}
+    # Never clobber a pre-existing cause: `error` may already hold the typed
+    # exception captured by `_load_and_select` (and `fatal_error` a cycle/depth
+    # verdict from `_resolve_group`). Overwriting it with this generic string
+    # would erase *why* routing failed. See `_raise_routing_error`.
+    if state.get("fatal_error") or state.get("error"):
+        return {"endpoints": [], "current_ep_idx": 0}
+    return {"endpoints": [], "current_ep_idx": 0, "error": "All endpoints in group failed"}
 
 
 async def _finalize_error(state: RouteState) -> dict:
@@ -466,14 +501,16 @@ class LangGraphEngine:
             if isinstance(result_dict, dict) and "error" in result_dict:
                 err = result_dict["error"]
                 msg = err.get("message", "Routing failed") if isinstance(err, dict) else str(err)
-                raise ProviderError(msg)
+                # state["error"] may still hold the original typed exception —
+                # prefer it over the flattened message.
+                _raise_routing_error(result.get("error"), ProviderError(msg))
             return result_dict
 
         # graph ended without setting result — treat state["error"] as failure
         err = result.get("error")
-        if err:
+        if err is not None:
             msg = err.get("message", "Routing failed") if isinstance(err, dict) else str(err)
-            raise ProviderError(msg)
+            _raise_routing_error(err, ProviderError(msg))
         raise ProviderError("Routing failed with no result")
 
     async def route_stream(
@@ -511,8 +548,16 @@ class LangGraphEngine:
 
         endpoints = result.get("endpoints", [])
         if not endpoints:
-            raise NoAvailableModelError(
-                f"Group {group.id} has no available models for streaming"
+            # Prefer the original cause (e.g. AllModelsCooldownError) so callers
+            # can tell "everything is cooling down" from "nothing to route to".
+            # Group-level fallback is *not* done here: per design.md §3.5 the
+            # streaming path only selects endpoints and `core._stream_common`
+            # owns retry/fallback (once, via this call's `fallback_group_id`).
+            _raise_routing_error(
+                result.get("error"),
+                NoAvailableModelError(
+                    f"Group {group.id} has no available models for streaming"
+                ),
             )
 
         return {

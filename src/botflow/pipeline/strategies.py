@@ -85,7 +85,10 @@ class RoundRobinStrategy(BaseStrategy):
         selected_idx = idx % len(available)
 
         next_idx = idx + 1
-        self._counters[group_id] = next_idx
+        # Wrap at len(available) * 1000 (see docs/tasks/P1-3_features.md §3.2):
+        # keeps the counter bounded without changing the selection sequence,
+        # because the base is a multiple of len(available).
+        self._counters[group_id] = next_idx % (len(available) * 1000)
 
         primary = available[selected_idx]
         fallback = [available[i] for i in range(len(available)) if i != selected_idx]
