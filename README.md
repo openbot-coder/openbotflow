@@ -14,7 +14,7 @@ botflow 是一个单机版 LLM 网关，在 FastAPI 之上把多个上游 LLM �
 2. **调用审计** - 全链路调用日志、统计、成本追踪，每日生成对话摘要
 3. **客户端 Key 管理** - 多租户 API Key（sha256 哈希存储），调用日志按 Key 隔离
 
-当前版本：**v3.0.0 — LangGraph 工作流引擎（PipelineEngine + 策略系统）**
+当前版本：**v3.1.0 — LangGraph 工作流引擎（PipelineEngine + 策略系统）**
 
 > 规划中但**当前代码未实现**：独立的 LLM-Wiki 知识库（仅有每日摘要）、IM Bridge 多平台接入。README 不把它们列为现有能力。
 

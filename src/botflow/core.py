@@ -459,7 +459,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="botflow",
     description="AI Middleware Platform",
-    version="3.0.0",
+    version="3.1.0",
     lifespan=lifespan,
 )
 
