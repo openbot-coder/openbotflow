@@ -111,41 +111,54 @@ def restart_service(
     host: str = "0.0.0.0",
     port: int = 8080,
     config_path: Optional[str] = None,
+    startup_grace: float = 2.0,
 ) -> dict:
     """Restart: stop then start as a detached background process."""
-    stop_result = stop_service(workspace)
-    if not stop_result["ok"] and "not running" not in stop_result["message"].lower():
-        return stop_result
+    # No guard on stop_service() result: every ok=False path (only "no PID file")
+    # means the service isn't running — the whole point of restart is to start it.
+    # Real stop failures (e.g. PermissionError from os.kill) raise, not return ok=False.
+    stop_service(workspace)
 
-    # Start as background process
-    cmd = [sys.executable, "-m", "botflow", "run",
-           "--host", host, "--port", str(port), "--workspace", str(workspace)]
+    # --workspace must precede the subcommand for argparse to accept it
+    cmd = [sys.executable, "-m", "botflow", "--workspace", str(workspace),
+           "run", "--host", host, "--port", str(port)]
     if config_path:
         cmd.extend(["--config", config_path])
 
-    # Windows needs CREATE_NEW_PROCESS_GROUP; Unix uses start_new_session (setsid)
+    err_log = workspace / "logs" / "botflow.err.log"
+    err_log.parent.mkdir(parents=True, exist_ok=True)
+
     if sys.platform == "win32":
-        creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creation_flags,
+            stderr=open(err_log, "ab"),
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
     else:
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=open(err_log, "ab"),
             start_new_session=True,
         )
-    write_pid(workspace, proc.pid)
 
-    return {
-        "ok": True,
-        "message": f"Service restarted (PID {proc.pid}).",
-        "pid": proc.pid,
-    }
+    try:
+        proc.wait(timeout=startup_grace)
+    except subprocess.TimeoutExpired:
+        write_pid(workspace, proc.pid)
+        return {
+            "ok": True,
+            "message": f"Service restarted (PID {proc.pid}).",
+            "pid": proc.pid,
+        }
+
+    # Subprocess exited before grace period — it failed to start
+    msg = (
+        f"Service failed to start (exit code {proc.returncode}). "
+        f"Check logs: {err_log}"
+    )
+    return {"ok": False, "message": msg}
 
 
 def tail_logs(workspace: Path, lines: int = 50) -> str:

@@ -437,7 +437,7 @@ src/botflow/
 
 | 严重度 | 位置 | 问题 |
 |---|---|---|
-| **高** | `cli/service.py` | `restart` 先停止服务，再用 `python -m botflow run --workspace ...` 启动。但 ① `src/botflow/` **没有 `__main__.py`**，`python -m botflow` 直接报错；② `--workspace` 被放在子命令 `run` **之后**，argparse 报 `unrecognized arguments`。**结果是服务被停掉且无法自动恢复，函数却仍写入 PID 并返回 `ok: True`** |
+| ~~高~~ **已修复** | `cli/service.py` | `restart` 先停止服务，再用 `python -m botflow run --workspace ...` 启动。但 ① `src/botflow/` **没有 `__main__.py`**，`python -m botflow` 直接报错；② `--workspace` 被放在子命令 `run` **之后**，argparse 报 `unrecognized arguments`。**结果是服务被停掉且无法自动恢复，函数却仍写入 PID 并返回 `ok: True`**。**已修复**（详见 `docs/tasks/fix-restart_features.md`）：新建 `__main__.py`、`--workspace` 前移到子命令之前、子进程 stderr 追加落 `logs/botflow.err.log`、新增 `startup_grace=2.0` 有界存活校验（秒死不再报成功）、删除基于消息文本的 stop 守卫（无 PID 文件时不再提前放弃）。另：无 PID 文件时 `restart` 的行为由「不干活 + 退出码 1」变为「直接启动服务」 |
 | 中 | `config.py` | `api_keys` 字段声明后**从未被读取**，属死配置 |
 | 低 | `workspace.py` | 未传 `--workspace` 时实际回退到**当前目录**，与 help 文本宣称的 `~/.botflow` 及 `config.py` 默认值不一致 |
 | 低 | `cli/main.py` | `run` 的 argparse 默认值非 `None`，导致 `BOTFLOW_HOST` / `BOTFLOW_PORT` 环境变量总被 CLI 默认值覆盖 |

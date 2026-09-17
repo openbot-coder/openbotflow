@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+import subprocess
 
 import botflow.cli.service as svc
 
@@ -99,6 +100,7 @@ def test_stop_running_term_then_exit(tmp_path, monkeypatch):
 def test_restart(tmp_path, monkeypatch):
     fake_proc = MagicMock()
     fake_proc.pid = 4242
+    fake_proc.wait.side_effect = subprocess.TimeoutExpired(cmd="x", timeout=2.0)
     monkeypatch.setattr(svc.subprocess, "Popen", lambda *a, **k: fake_proc)
     monkeypatch.setattr(svc, "stop_service", lambda ws: {"ok": True, "message": "x"})
     res = svc.restart_service(tmp_path, host="h", port=1)
@@ -120,11 +122,17 @@ def test_stop_process_lookup_error(tmp_path, monkeypatch):
     assert res["ok"] is True
 
 
-def test_restart_when_stop_fails(tmp_path, monkeypatch):
-    monkeypatch.setattr(svc.subprocess, "Popen", lambda *a, **k: MagicMock(pid=1))
-    monkeypatch.setattr(svc, "stop_service", lambda ws: {"ok": False, "message": "denied"})
+def test_restart_ignores_stop_result_and_spawns(tmp_path, monkeypatch):
+    """After F9 fix, restart always spawns regardless of stop_service result."""
+    stop_calls = []
+    fake_proc = MagicMock()
+    fake_proc.pid = 100
+    fake_proc.wait.side_effect = subprocess.TimeoutExpired(cmd="x", timeout=2.0)
+    monkeypatch.setattr(svc.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(svc, "stop_service", lambda ws: stop_calls.append(ws) or {"ok": False, "message": "No PID file found — service may not be running."})
     res = svc.restart_service(tmp_path)
-    assert res["ok"] is False
+    assert res["ok"] is True
+    assert len(stop_calls) == 1  # stop_service still called for its side effect
 
 
 def test_tail_logs_error(tmp_path):
