@@ -153,3 +153,73 @@ def test_tail_logs_reads(tmp_path, monkeypatch):
     fake.stdout = "line1\nline2\n"
     monkeypatch.setattr(svc.subprocess, "run", lambda *a, **k: fake)
     assert "line2" in svc.tail_logs(tmp_path, 10)
+
+
+def test_stop_process_lookup_error_after_term(tmp_path, monkeypatch):
+    # Covers service.py:83-85 — SIGTERM is delivered, then os.kill raises
+    # ProcessLookupError (process vanished between the liveness check and the kill).
+    # NOTE: the name-sake test_stop_process_lookup_error does NOT cover this branch
+    # because it makes `os.kill` unconditionally raise, so `is_running` returns False
+    # and the code returns early at the stale-PID branch.
+    svc.write_pid(tmp_path, 555)
+    monkeypatch.setattr(svc, "is_running", lambda pid: True)
+    import errno
+
+    def _boom(pid, sig):
+        raise ProcessLookupError(errno.ESRCH, "gone")
+
+    monkeypatch.setattr(svc.os, "kill", _boom)
+    res = svc.stop_service(tmp_path)
+    assert res["ok"] is True
+    assert svc.read_pid(tmp_path) is None
+
+
+def _force_kill_test(tmp_path, monkeypatch, platform, sigkill_value):
+    """Drive stop_service past its deadline so the force-kill branch executes."""
+    svc.write_pid(tmp_path, 555)
+    monkeypatch.setattr(svc, "is_running", lambda pid: True)
+    # signal.SIGKILL is undefined on Windows; shim it so the posix branch is runnable.
+    if sigkill_value is not None:
+        monkeypatch.setattr(svc.signal, "SIGKILL", sigkill_value, raising=False)
+    import errno
+
+    calls = []
+
+    def _kill(pid, sig):
+        calls.append((pid, sig))
+        # The 2nd (force-kill) call raises ProcessLookupError -> caught at except.
+        if len(calls) >= 2:
+            raise ProcessLookupError(errno.ESRCH, "gone")
+
+    monkeypatch.setattr(svc.os, "kill", _kill)
+    times = [1000, 1000, 2000, 2000]
+    it = iter(times)
+    time_mod = __import__("time")
+    monkeypatch.setattr(time_mod, "time", lambda: next(it))
+    monkeypatch.setattr(time_mod, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(svc.sys, "platform", platform)
+    res = svc.stop_service(tmp_path, timeout=1)
+    assert res["ok"] is True
+    assert svc.read_pid(tmp_path) is None
+    # force-kill call present (SIGTERM=15 on win32, SIGKILL=9 on posix)
+    return calls
+
+
+def test_stop_force_kill_win32(tmp_path, monkeypatch):
+    calls = _force_kill_test(tmp_path, monkeypatch, "win32", None)
+    assert (555, 15) in calls  # os.kill(pid, SIGTERM) in the win32 force branch
+
+
+def test_stop_force_kill_posix(tmp_path, monkeypatch):
+    calls = _force_kill_test(tmp_path, monkeypatch, "linux", 9)
+    assert (555, 9) in calls  # os.kill(pid, SIGKILL) in the posix force branch
+
+
+def test_tail_logs_read_error(tmp_path):
+    # Covers service.py:183-184 — the read raises, the except branch returns an
+    # error string instead of crashing.
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "botflow.err.log").mkdir()  # path is a directory -> open() raises
+    result = svc.tail_logs(tmp_path, 10)
+    assert "Error reading log" in result

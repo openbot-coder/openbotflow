@@ -94,13 +94,13 @@ def stop_service(workspace: Path, timeout: int = 10) -> dict:
         time.sleep(0.5)
 
     # Force kill (SIGKILL is Unix-only; on Windows use os.kill with SIGTERM or taskkill)
-    try:  # UNCOVERED: 仅在真实进程未在超时内退出时触发，单元测试无法构造真实存活进程到超时
+    try:
         if sys.platform == "win32":
             # On Windows, os.kill with SIGTERM calls TerminateProcess (irrevocable)
             os.kill(pid, signal.SIGTERM)
         else:
             os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:  # UNCOVERED
+    except ProcessLookupError:
         pass
     clear_pid(workspace)
     return {"ok": True, "message": f"Service (PID {pid}) killed after timeout."}
