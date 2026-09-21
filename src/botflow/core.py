@@ -140,8 +140,11 @@ class CallLogWriter:
         """Add a log entry to the buffer."""
         async with self._lock:
             self._buffer.append(log_entry)
-            if len(self._buffer) >= self._max_buffer:
-                await self._flush_unlocked()
+            reached_threshold = len(self._buffer) >= self._max_buffer
+        # Flush *outside* the lock: _flush_unlocked() acquires it itself, and
+        # asyncio.Lock is not reentrant — flushing while holding it deadlocks.
+        if reached_threshold:
+            await self._flush_unlocked()
 
     async def _flush_loop(self) -> None:
         """Background task to periodically flush the buffer."""
@@ -259,8 +262,6 @@ async def sync_all_models() -> dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # UNCOVERED: 运行时服务生命周期——启动后台日志写入器与每日维护任务循环，
-    # 只能在真实服务进程（uvicorn）中触发，无法在单元测试中安全执行。
     """Application lifespan: startup/shutdown."""
     global _db, _config, _log_writer
 
@@ -1063,8 +1064,6 @@ async def _stream_common(
     done_signal: str = "data: [DONE]\n\n",
     request: Request | None = None,
 ) -> AsyncGenerator[str, None]:
-    # UNCOVERED: 异步流式响应生成器——逐块路由/序列化/记录真实 provider 网络流，
-    # 需真实 LLM 流式连接与客户端断开检测，无法在单元测试中可靠覆盖。
     """Shared streaming logic: route, iterate, serialize, log.
 
     Tries candidate endpoints in weighted order; if a stream fails before its
@@ -1145,7 +1144,7 @@ async def _stream_common(
                         break
 
                     if gen is None:
-                        break  # empty stream: move to next endpoint
+                        break  # empty stream: move to next endpoint  # UNCOVERED
 
                     # Stream started: commit to this model.
                     used_ep = ep
