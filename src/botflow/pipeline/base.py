@@ -52,7 +52,7 @@ class BaseStrategy(ABC):
         返回 RouteResult，包含按优先级排序的 endpoints 列表和截断后的 messages。
         strategy 不调用 LLM，只做选择。
         """
-        ...
+        ...  # UNCOVERED: 抽象方法占位语句——所有具体策略均覆写本方法，基类体永不执行
 
     async def execute(
         self,

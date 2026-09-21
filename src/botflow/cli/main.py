@@ -60,8 +60,6 @@ def _init_workspace_db(args):
 
 
 def cmd_run(args):
-    # UNCOVERED: 前台阻塞式服务启动（asyncio.run(uvicorn.serve)）——只能在真实服务进程触发，
-    # 单元测试中调用会阻塞测试进程，故不可覆盖。
     """Start the botflow HTTP LLM Proxy service."""
     from botflow.common.logger import setup_logging
     from botflow.config import load_config

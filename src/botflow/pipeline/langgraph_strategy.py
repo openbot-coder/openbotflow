@@ -109,7 +109,7 @@ class LangGraphStrategy(BaseStrategy):
             visited += 1
 
             node_cfg = nodes_cfg.get(current)
-            if node_cfg is None:
+            if node_cfg is None:  # UNCOVERED: current 只可能来自已校验的 entry 或 edge 目标，此分支不可达
                 raise ConfigurationError(f"Node '{current}' not found in nodes config")
 
             # 解析 group_id
