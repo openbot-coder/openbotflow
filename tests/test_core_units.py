@@ -120,9 +120,13 @@ def _fake_call_log_entry():
 class _FakeDB:
     def __init__(self):
         self.written = []
+        self.attempts_written = []
         self.closed = False
     async def create_call_log(self, entry):
         self.written.append(entry)
+    async def create_call_attempts(self, entries):
+        self.attempts_written.extend(entries)
+        return len(entries)
     async def close(self):
         self.closed = True
 
@@ -140,6 +144,49 @@ async def test_call_log_writer_flush_error_logged(caplog):
     w = core.CallLogWriter(db, flush_interval=0.01)
     w._buffer.append(_fake_call_log_entry())
     await w._flush()  # swallow exception
+
+
+def _fake_call_attempt():
+    from botflow.storage.models import CallAttempt
+    return CallAttempt(request_id="req-1", stage="non_stream",
+                       error_type="ProviderError", error_message="boom")
+
+
+async def test_call_log_writer_log_attempt_buffers_then_flushes():
+    # SG-0：`CallLogWriter.log_attempt` 的**真实**生产路径。
+    # 此前无人覆盖 —— 守卫用例与 T5.5 都把它整个打桩掉了，这正是"漏 await"
+    # 这类缺陷能溜过去的那一层。
+    db = _FakeDB()
+    w = core.CallLogWriter(db, flush_interval=0.01)
+    await w.log_attempt(_fake_call_attempt())
+    assert len(w._attempts_buffer) == 1
+    await w._flush()
+    assert len(db.attempts_written) == 1
+    assert db.attempts_written[0].stage == "non_stream"
+    assert w._attempts_buffer == []
+
+
+async def test_call_log_writer_log_attempt_threshold_triggers_flush():
+    # 满缓冲自动刷盘（与 `log()` 同构，且必须在锁外 flush 以免死锁）。
+    db = _FakeDB()
+    w = core.CallLogWriter(db, flush_interval=0.01, max_buffer=1)
+    await w.log_attempt(_fake_call_attempt())
+    assert len(db.attempts_written) == 1
+    assert w._attempts_buffer == []
+
+
+async def test_call_log_writer_flush_attempts_error_logged():
+    # 留痕刷盘失败只记日志、不上抛（SG-0 硬约束 3）。
+    db = _FakeDB()
+
+    async def _boom(entries):
+        raise RuntimeError("attempts boom")
+
+    db.create_call_attempts = _boom
+    w = core.CallLogWriter(db, flush_interval=0.01)
+    w._attempts_buffer.append(_fake_call_attempt())
+    await w._flush()  # 必须吞掉异常
+    assert w._attempts_buffer == []
 
 
 # ---------------------------------------------------------------------------

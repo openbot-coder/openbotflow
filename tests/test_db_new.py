@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from botflow.storage.db import Database
-from botflow.storage.models import CallLog, Provider
+from botflow.storage.models import CallAttempt, CallLog, Provider
 
 
 @pytest.fixture
@@ -218,3 +218,149 @@ class TestGetCallLogsForDay:
         assert len(logs) >= 1
         # future -> empty
         assert await db.get_call_logs_for_day("2999-01-01") == []
+
+
+# ===========================================================================
+# SG-0 F1 / F2：call_attempts 建表、索引、批量写入
+# ===========================================================================
+
+
+class TestCallAttempts:
+    # T1.1 正例：初始化后 call_attempts 表存在且列齐全
+    async def test_call_attempts_table_created(self, db):
+        rows = await db.execute_read(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='call_attempts'"
+        )
+        assert len(rows) == 1
+        cols = await db.execute_read("PRAGMA table_info(call_attempts)")
+        col_names = {r["name"] for r in cols}
+        # `id INTEGER PRIMARY KEY AUTOINCREMENT` is the house convention (same
+        # as call_logs), so assert the required columns are a subset instead of
+        # exact set equality.
+        required = {
+            "request_id", "group_id", "model_id", "provider_id", "stage",
+            "endpoint_idx", "attempt_no", "error_type", "error_message",
+            "duration_ms", "created_at",
+        }
+        assert required <= col_names
+        assert "id" in col_names
+
+    # T1.2 正例：索引 idx_call_attempts_request 存在
+    async def test_call_attempts_index_created(self, db):
+        rows = await db.execute_read(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_call_attempts_request'"
+        )
+        assert len(rows) == 1
+
+    # T1.3 边界：旧库（只有 call_logs，没有 call_attempts）升级后建表且不破坏既有数据
+    async def test_legacy_db_upgrade_creates_table_and_keeps_data(self, tmp_path):
+        p = tmp_path / "legacy.db"
+        legacy = Database(str(p))
+        await legacy.initialize()
+        # Simulate a pre-SG-0 database: drop the new table, insert a call_logs row.
+        await legacy.execute_write("DROP TABLE call_attempts")
+        await legacy.execute_write("INSERT INTO call_logs (status) VALUES ('success')")
+        await legacy.close()
+
+        upgraded = Database(str(p))
+        await upgraded.initialize()
+        logs = await upgraded.execute_read("SELECT * FROM call_logs")
+        assert len(logs) == 1 and logs[0]["status"] == "success"
+        tbl = await upgraded.execute_read(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='call_attempts'"
+        )
+        assert len(tbl) == 1
+        await upgraded.close()
+
+    # T2.1 正例：批量写入 3 行（一次 executemany，而非逐行 round-trip）
+    async def test_create_call_attempts_batch_insert(self, db, monkeypatch):
+        a1 = CallAttempt(request_id="r1", group_id=1, model_id=10, provider_id=1,
+                         stage="select", endpoint_idx=0, attempt_no=1,
+                         error_type="ProviderError", error_message="boom", duration_ms=5)
+        a2 = CallAttempt(request_id="r1", group_id=1, model_id=11, provider_id=1,
+                         stage="stream", endpoint_idx=0, attempt_no=1,
+                         error_type="TimeoutError", error_message="timeout", duration_ms=7)
+        a3 = CallAttempt(request_id="r1", group_id=2, model_id=20, provider_id=2,
+                         stage="select", endpoint_idx=1, attempt_no=2,
+                         error_type="ValueError", error_message="bad", duration_ms=3)
+
+        # create_call_attempts writes via `conn.executemany` directly (not
+        # `db.execute_write`), so spy on the connection to prove batching.
+        class _ConnSpy:
+            def __init__(self, real):
+                self._real = real
+                self.executemany_calls = 0
+                self.rows_per_call = []
+
+            async def executemany(self, sql, rows):
+                self.executemany_calls += 1
+                self.rows_per_call.append(len(list(rows)))
+                return await self._real.executemany(sql, rows)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        spy = _ConnSpy(await db._ensure_connection())
+
+        async def _ensure():
+            return spy
+
+        monkeypatch.setattr(db, "_ensure_connection", _ensure)
+        await db.create_call_attempts([a1, a2, a3])
+
+        rows = await db.execute_read("SELECT * FROM call_attempts ORDER BY id")
+        assert len(rows) == 3
+        assert {r["model_id"] for r in rows} == {10, 11, 20}
+        assert {r["group_id"] for r in rows} == {1, 2}
+        # 一次批量调用，证明走 executemany（不是逐行 INSERT）。
+        assert spy.executemany_calls == 1
+        assert spy.rows_per_call == [3]
+
+    # T2.2 边界：空列表不报错、不写行、连连接都不开
+    async def test_create_call_attempts_empty_list(self, db, monkeypatch):
+        opened = []
+        real_ensure = db._ensure_connection
+
+        async def _ensure():
+            opened.append(1)
+            return await real_ensure()
+
+        monkeypatch.setattr(db, "_ensure_connection", _ensure)
+        written = await db.create_call_attempts([])
+        # 空列表在开连接之前就短路返回（快照必须取在此刻 —— 下面读表本身也会开连接）。
+        assert written == 0
+        assert opened == []
+        rows = await db.execute_read("SELECT * FROM call_attempts")
+        assert rows == []
+
+    # T2.4 正例（覆盖率）：query_call_attempts 的 provider_id / group_id /
+    # error_type 三个过滤分支（T8.x 只有 request_id / model_id 走过）。
+    async def test_query_call_attempts_extra_filters(self, db):
+        await db.create_call_attempts([
+            CallAttempt(request_id="r1", group_id=1, model_id=10, provider_id=1,
+                        stage="select", endpoint_idx=0, attempt_no=1,
+                        error_type="ProviderError", error_message="a", duration_ms=1),
+            CallAttempt(request_id="r2", group_id=2, model_id=20, provider_id=2,
+                        stage="stream", endpoint_idx=1, attempt_no=1,
+                        error_type="TimeoutError", error_message="b", duration_ms=2),
+        ])
+        by_provider = await db.query_call_attempts(provider_id=2)
+        assert [r.request_id for r in by_provider] == ["r2"]
+        by_group = await db.query_call_attempts(group_id=1)
+        assert [r.request_id for r in by_group] == ["r1"]
+        by_err = await db.query_call_attempts(error_type="TimeoutError")
+        assert [r.request_id for r in by_err] == ["r2"]
+        # 组合过滤 + 分页参数仍然可用。
+        both = await db.query_call_attempts(provider_id=1, group_id=1, limit=10, offset=0)
+        assert [r.request_id for r in both] == ["r1"]
+
+    # T2.3 反例：select 阶段失败（model_id/provider_id 为 None）也可写入
+    async def test_create_call_attempts_allows_null_attribution(self, db):
+        a = CallAttempt(request_id="r", group_id=1, model_id=None, provider_id=None,
+                        stage="select", endpoint_idx=0, attempt_no=1,
+                        error_type="AllModelsCooldownError", error_message="all cooldown")
+        await db.create_call_attempts([a])
+        rows = await db.execute_read("SELECT model_id, provider_id FROM call_attempts")
+        assert len(rows) == 1
+        assert rows[0]["model_id"] is None
+        assert rows[0]["provider_id"] is None

@@ -26,9 +26,11 @@ from fastapi.testclient import TestClient
 
 import botflow.core as core
 from botflow.config import BotflowSettings, set_config
+from botflow.common.exceptions import ProviderError
 from botflow.router import CooldownManager, ModelEndpoint
 from botflow.storage.db import Database
 from botflow.storage.models import (
+    CallAttempt,
     CallLog,
     GroupModelWithDetails,
     Model,
@@ -752,6 +754,307 @@ class TestEndpointBranches:
         body = r.json()
         assert "data" in body
         assert body["data"][0]["type"] == "model"
+
+
+# ===========================================================================
+# 6b. SG-0 F5/F6 非流式驱动：失败留痕 + 错误行归属修正
+# ===========================================================================
+
+
+def _make_attempt(ep, error_type: str, error_message: str, *, endpoint_idx: int = 0,
+                  attempt_no: int = 1, stage: str = "non_stream",
+                  model_id=None, provider_id=None, group_id=None) -> dict:
+    """Build a RouteState.attempts row (shape per docs/pipeline-single-graph-design.md §3.6)."""
+    return {
+        "request_id": "req-sg0",
+        "group_id": ep.detail.group_id if group_id is None else group_id,
+        "model_id": ep.model_id if model_id is None else model_id,
+        "provider_id": ep.detail.provider_id if provider_id is None else provider_id,
+        "stage": stage,
+        "endpoint_idx": endpoint_idx,
+        "attempt_no": attempt_no,
+        "error_type": error_type,
+        "error_message": error_message,
+        "duration_ms": 12,
+        "created_at": "2026-01-01T00:00:00Z",
+    }
+
+
+class _AttemptEngine:
+    """Stub engine whose route() returns a response plus collected attempts.
+
+    Mirrors SG-0_features.md F4/F5: the graph collects ``attempts`` into the
+    RouteState and the driver forwards them to ``core._log_attempts``. The real
+    engine populates these from failed ``call_llm`` attempts; here we inject
+    them directly so the driver-wiring (not the graph) is what's under test.
+    """
+
+    def __init__(self, response, attempts, status="success"):
+        self.cooldown = CooldownManager()
+        self._response = response
+        self._attempts = attempts
+        self._status = status
+
+    async def route(self, group, messages, temperature=None, max_tokens=None, **kwargs):
+        if self._status == "error":
+            # Mirror LangGraphEngine: a routing failure *raises*, smuggling the
+            # attempt trail + last attempted endpoint onto the exception (see
+            # langgraph_engine._raise_routing_error). The driver reads them via
+            # getattr(e, "attempts" / "used_model_id" / "used_provider_id").
+            exc = ProviderError("all endpoints failed")
+            exc.attempts = self._attempts
+            exc.used_model_id = self._attempts[-1]["model_id"] if self._attempts else None
+            exc.used_provider_id = self._attempts[-1]["provider_id"] if self._attempts else None
+            raise exc
+        result = dict(self._response)
+        # Attempts ride out under "_attempts" (internal, "_"-prefixed like
+        # `_routing`) and are popped by the driver before serialisation.
+        result["_attempts"] = self._attempts
+        return result
+
+    async def route_stream(self, group, messages, temperature=None, max_tokens=None, **kwargs):
+        return {
+            "endpoints": [_endpoint(1)],
+            "group_id": 1, "messages": messages,
+            "temperature": temperature, "max_tokens": max_tokens,
+            "kwargs": kwargs, "fallback_group_id": None,
+        }
+
+
+class TestAttemptLogging:
+    """F5 (驱动落库) + F6 (归属修正) —— 非流式路径。
+
+    守卫点：T5.1+T5.5 组合、T6.1 反例守卫（归属不为 None）。
+    """
+
+    def _drive(self, client, monkeypatch, engine, captured):
+        async def _capture(rows):
+            captured.extend(rows)
+
+        # Must be async: the driver does `await _log_attempts(...)`, so a sync
+        # stub would raise TypeError and be swallowed by the error path.
+        monkeypatch.setattr(core, "_log_attempts", _capture, raising=False)
+        monkeypatch.setattr(core, "_get_engine", lambda: engine)
+        return client.post(
+            "/v1/chat/completions",
+            json={"model": "default", "messages": [{"role": "user", "content": "hi"}]},
+            headers=AUTH,
+        )
+
+    def _logged_statuses(self):
+        # `_log_call` is invoked with keyword arguments (core.py:1053 / :1077),
+        # so `call.args` is always empty -- read `call.kwargs` instead.
+        return [
+            call.kwargs["status"]
+            for call in core._log_call.call_args_list
+            if call.kwargs.get("status")
+        ]
+
+    def test_retry_success_writes_attempts_row(self, client, monkeypatch):
+        # T5.1 (G1 关键)：首端点失败 → 次端点成功，仍记录失败尝试
+        captured = []
+        ep1 = _endpoint(1)
+        attempts = [_make_attempt(ep1, "ProviderError", "HTTP 500")]
+        engine = _AttemptEngine(
+            response={"choices": [{"message": {"content": "ok"}}],
+                      "id": "c1", "_routing": {"model_id": 1, "provider_id": 1}},
+            attempts=attempts, status="success",
+        )
+        r = self._drive(client, monkeypatch, engine, captured)
+        assert r.status_code == 200
+        assert "success" in self._logged_statuses()  # 一次请求一行 success 语义不变
+        assert len(captured) >= 1
+        row = captured[0]
+        assert row["model_id"] == ep1.model_id
+        assert row["provider_id"] == ep1.detail.provider_id
+        assert row["error_type"]
+
+    def test_backup_group_attempts_recorded(self, client, monkeypatch):
+        # T5.2 (G3 关键)：主组 + backup 组都尝试过，attempts 跨组累加
+        captured = []
+        ep_primary = _endpoint(1)
+        ep_backup = _endpoint(2)
+        attempts = [
+            _make_attempt(ep_primary, "ProviderError", "primary down", group_id=10),
+            _make_attempt(ep_backup, "TimeoutError", "backup down", group_id=20),
+        ]
+        engine = _AttemptEngine(
+            response={"choices": [{"message": {"content": "ok"}}],
+                      "id": "c1", "_routing": {"model_id": 1, "provider_id": 1}},
+            attempts=attempts, status="success",
+        )
+        r = self._drive(client, monkeypatch, engine, captured)
+        assert r.status_code == 200
+        assert {a["group_id"] for a in captured} == {10, 20}
+
+    def test_all_fail_records_every_attempt(self, client, monkeypatch):
+        # T5.3：全失败，attempts 覆盖每个端点的每次实际尝试
+        captured = []
+        ep1 = _endpoint(1, max_retries=2)
+        attempts = [
+            _make_attempt(ep1, "ProviderError", "try 1", endpoint_idx=0, attempt_no=1),
+            _make_attempt(ep1, "ProviderError", "try 2", endpoint_idx=0, attempt_no=2),
+        ]
+        engine = _AttemptEngine(
+            response={"choices": [{"message": {"content": "x"}}],
+                      "id": "c1", "_routing": {"model_id": 1, "provider_id": 1}},
+            attempts=attempts, status="error",
+        )
+        r = self._drive(client, monkeypatch, engine, captured)
+        assert r.status_code == 502  # 全失败 -> HTTPException(502)
+        assert "error" in self._logged_statuses()
+        assert {(a["endpoint_idx"], a["attempt_no"]) for a in captured} == {(0, 1), (0, 2)}
+
+    def test_no_failed_attempt_writes_no_rows(self, client, monkeypatch):
+        # T5.4 (边界)：首端点一次成功、全程无失败 → 不写噪音行
+        captured = []
+        engine = _AttemptEngine(
+            response={"choices": [{"message": {"content": "ok"}}],
+                      "id": "c1", "_routing": {"model_id": 1, "provider_id": 1}},
+            attempts=[], status="success",
+        )
+        r = self._drive(client, monkeypatch, engine, captured)
+        assert r.status_code == 200
+        assert captured == []
+
+    def test_attempts_write_failure_does_not_break_request(self, client, monkeypatch):
+        # T5.5 (反例)：留痕的**底层写入**抛错 → 主链路仍正常返回，只 log.error。
+        # 打桩在底层 writer（而不是 `_log_attempts` 本身）：按 SG-0_tests.md §2，
+        # 吞错必须发生在 `_log_attempts` 内部，驱动不再包第二层 try。
+        class _BoomWriter:
+            async def log_attempt(self, entry):
+                raise RuntimeError("writer down")
+
+        fake_log = MagicMock()
+        monkeypatch.setattr(core, "_log_writer", _BoomWriter(), raising=False)
+        # loguru 不向 stdlib logging 传播，caplog 看不到 —— 直接替换 core.log。
+        monkeypatch.setattr(core, "log", fake_log, raising=False)
+        monkeypatch.setattr(core, "_get_engine", lambda: _AttemptEngine(
+            response={"choices": [{"message": {"content": "ok"}}],
+                      "id": "c1", "_routing": {"model_id": 1, "provider_id": 1}},
+            attempts=[_make_attempt(_endpoint(1), "ProviderError", "x")], status="success",
+        ))
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "default", "messages": [{"role": "user", "content": "hi"}]},
+            headers=AUTH,
+        )
+        assert r.status_code == 200
+        assert fake_log.error.called
+
+    def test_non_stream_error_row_has_attribution(self, client, monkeypatch):
+        # T6.1 (G2 关键)：非流式全失败 → 错误行 model_id/provider_id 非 None，= 最后尝试端点
+        captured = []
+        ep_last = _endpoint(3)
+        attempts = [
+            _make_attempt(_endpoint(1), "ProviderError", "first down", endpoint_idx=0),
+            _make_attempt(ep_last, "ProviderError", "last down", endpoint_idx=1),
+        ]
+        engine = _AttemptEngine(
+            response={"choices": [{"message": {"content": "x"}}],
+                      "id": "c1", "_routing": {"model_id": 3, "provider_id": 1}},
+            attempts=attempts, status="error",
+        )
+        r = self._drive(client, monkeypatch, engine, captured)
+        assert r.status_code == 502
+        # `_log_call` receives keyword arguments (not a CallLog object), so the
+        # row is the kwargs dict itself.
+        error_rows = [
+            c.kwargs for c in core._log_call.call_args_list
+            if c.kwargs.get("status") == "error"
+        ]
+        assert error_rows, "must log an error row"
+        err_row = error_rows[-1]
+        assert err_row["model_id"] == ep_last.model_id
+        assert err_row["provider_id"] == ep_last.detail.provider_id
+
+    # ---- T5.1 加固：真实执行 `_log_attempts`（不是打桩它）----------------
+    async def test_log_attempts_actually_reaches_writer(self, monkeypatch):
+        # 回归守卫：只断言「`_log_attempts` 被调用过」抓不到漏 `await` ——
+        # 漏了的话协程永不执行，主链路照常返回，缺陷静默溜过（本轮真发生过）。
+        seen = []
+
+        class _RecordingWriter:
+            async def log_attempt(self, entry):
+                seen.append(entry)
+
+        monkeypatch.setattr(core, "_log_writer", _RecordingWriter(), raising=False)
+        token = core._request_ctx.set({"request_id": "req-guard"})
+        try:
+            await core._log_attempts([
+                {
+                    "group_id": 1, "model_id": 7, "provider_id": 2,
+                    "stage": "non_stream", "endpoint_idx": 0, "attempt_no": 1,
+                    "error_type": "ProviderError", "error_message": "boom",
+                    "duration_ms": 11,
+                }
+            ])
+        finally:
+            core._request_ctx.reset(token)
+
+        assert len(seen) == 1
+        assert isinstance(seen[0], CallAttempt)
+        assert seen[0].request_id == "req-guard"
+        assert seen[0].model_id == 7
+        assert seen[0].provider_id == 2
+        assert seen[0].error_type == "ProviderError"
+        assert seen[0].stage == "non_stream"
+
+    async def test_log_attempts_falls_back_to_direct_db_write(self, monkeypatch):
+        # `_log_writer` 未初始化（如 CLI 路径）时的直写兜底分支。
+        written = []
+
+        class _FakeDB:
+            async def create_call_attempts(self, entries):
+                written.extend(entries)
+                return len(entries)
+
+        monkeypatch.setattr(core, "_log_writer", None, raising=False)
+        monkeypatch.setattr(core, "_get_db", lambda: _FakeDB(), raising=False)
+        token = core._request_ctx.set({"request_id": "req-fallback"})
+        try:
+            await core._log_attempts([
+                {
+                    "group_id": None, "model_id": None, "provider_id": None,
+                    "stage": "select", "endpoint_idx": 0, "attempt_no": 1,
+                    "error_type": "AllModelsCooldownError", "error_message": "cold",
+                    "duration_ms": 1,
+                }
+            ])
+        finally:
+            core._request_ctx.reset(token)
+
+        assert len(written) == 1
+        assert isinstance(written[0], CallAttempt)
+        assert written[0].request_id == "req-fallback"
+        assert written[0].model_id is None
+
+    async def test_log_attempts_empty_list_is_noop(self, monkeypatch):
+        # 边界：空列表直接短路，不碰 writer、不碰 DB。
+        touched = []
+
+        class _RecordingWriter:
+            async def log_attempt(self, entry):
+                touched.append(entry)
+
+        monkeypatch.setattr(core, "_log_writer", _RecordingWriter(), raising=False)
+        await core._log_attempts([])
+        assert touched == []
+
+    async def test_log_attempts_swallows_writer_failure(self, monkeypatch):
+        # T5.5 的可观测补充：留痕失败绝不上抛（已在此断言直接抛错被吞）。
+        class _BoomWriter:
+            async def log_attempt(self, entry):
+                raise RuntimeError("writer down")
+
+        fake_log = MagicMock()
+        monkeypatch.setattr(core, "_log_writer", _BoomWriter(), raising=False)
+        monkeypatch.setattr(core, "log", fake_log, raising=False)
+        await core._log_attempts([
+            {"stage": "non_stream", "error_type": "ProviderError",
+             "error_message": "x", "duration_ms": 1},
+        ])
+        assert fake_log.error.called
 
 
 # ===========================================================================

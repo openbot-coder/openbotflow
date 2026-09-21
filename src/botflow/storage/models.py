@@ -112,6 +112,29 @@ class CallLog(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class CallAttempt(BaseModel):
+    """One failed upstream call attempt (append-only audit row).
+
+    Complements ``CallLog``: ``call_logs`` keeps one row per request (success or
+    final error), while ``call_attempts`` keeps one row per *failed attempt* so
+    retries that eventually succeed are still observable. ``model_id`` /
+    ``provider_id`` are nullable because a select-stage failure has no endpoint
+    to attribute to.
+    """
+
+    request_id: Optional[str] = None
+    group_id: Optional[int] = None
+    model_id: Optional[int] = None
+    provider_id: Optional[int] = None
+    stage: str = ""  # 'select' | 'call' | 'stream'
+    endpoint_idx: Optional[int] = None
+    attempt_no: Optional[int] = None
+    error_type: Optional[str] = None
+    error_message: Optional[str] = None
+    duration_ms: Optional[int] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class ApiKey(BaseModel):
     """Client API key. Calls authenticated by these keys are logged separately."""
 

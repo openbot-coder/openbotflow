@@ -24,6 +24,7 @@ from typing import Any, Optional
 import aiosqlite
 from botflow.storage.models import (
     ApiKey,
+    CallAttempt,
     CallLog,
     DailySummary,
     GroupModel,
@@ -161,6 +162,24 @@ CREATE INDEX IF NOT EXISTS idx_models_provider_id ON models(provider_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash);
 CREATE INDEX IF NOT EXISTS idx_daily_summaries_day ON daily_summaries(day);
 CREATE INDEX IF NOT EXISTS idx_raw_sessions_day ON raw_sessions(day);
+
+-- Failed upstream call attempts (append-only, one row per failed attempt)
+CREATE TABLE IF NOT EXISTS call_attempts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id  TEXT,                       -- 关联 call_logs.request_id
+    group_id    INTEGER,
+    model_id    INTEGER,
+    provider_id INTEGER,
+    stage       TEXT NOT NULL,              -- 'select' | 'call' | 'stream'
+    endpoint_idx INTEGER,                   -- 端点在该组候选列表中的序号
+    attempt_no  INTEGER,                    -- 该端点内的第几次尝试
+    error_type  TEXT,
+    error_message TEXT,
+    duration_ms INTEGER,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_call_attempts_request ON call_attempts(request_id);
 """
 
 # New call_logs columns added via migration (see initialize)
@@ -781,6 +800,40 @@ class Database:
         await conn.commit()
         return cursor.lastrowid  # type: ignore[return-value]
 
+    async def create_call_attempts(self, attempts: list[CallAttempt]) -> int:
+        """Batch-insert failed-attempt rows via a single ``executemany``.
+
+        Returns the number of rows written. An empty list is a no-op (no rows,
+        no error) — callers therefore never need to special-case "no attempts".
+        """
+        if not attempts:
+            return 0
+        conn = await self._ensure_connection()
+        rows = [
+            (
+                a.request_id,
+                a.group_id,
+                a.model_id,
+                a.provider_id,
+                a.stage,
+                a.endpoint_idx,
+                a.attempt_no,
+                a.error_type,
+                a.error_message,
+                a.duration_ms,
+            )
+            for a in attempts
+        ]
+        await conn.executemany(
+            """INSERT INTO call_attempts
+               (request_id, group_id, model_id, provider_id, stage, endpoint_idx,
+                attempt_no, error_type, error_message, duration_ms)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+        await conn.commit()
+        return len(rows)
+
     async def delete_old_call_logs(self, cutoff_iso: str) -> int:
         """Delete call logs older than the given cutoff date."""
         conn = await self._ensure_connection()
@@ -851,6 +904,58 @@ class Database:
             total_tokens=row["total_tokens"],
             tool_calls=row["tool_calls"],
             cost=row["cost"],
+            created_at=row["created_at"],
+        )
+
+    async def query_call_attempts(
+        self,
+        request_id: Optional[str] = None,
+        model_id: Optional[int] = None,
+        provider_id: Optional[int] = None,
+        group_id: Optional[int] = None,
+        error_type: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[CallAttempt]:
+        """Read-only query of failed-attempt rows (admin endpoint backing)."""
+        conn = await self._ensure_connection()
+        conditions = []
+        params: list[Any] = []
+        if request_id is not None:
+            conditions.append("request_id = ?")
+            params.append(request_id)
+        if model_id is not None:
+            conditions.append("model_id = ?")
+            params.append(model_id)
+        if provider_id is not None:
+            conditions.append("provider_id = ?")
+            params.append(provider_id)
+        if group_id is not None:
+            conditions.append("group_id = ?")
+            params.append(group_id)
+        if error_type is not None:
+            conditions.append("error_type = ?")
+            params.append(error_type)
+        where = " AND ".join(conditions) if conditions else "1=1"
+        cursor = await conn.execute(
+            f"SELECT * FROM call_attempts WHERE {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            params + [limit, offset],
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_call_attempt(r) for r in rows]
+
+    def _row_to_call_attempt(self, row: sqlite3.Row) -> CallAttempt:
+        return CallAttempt(
+            request_id=row["request_id"],
+            group_id=row["group_id"],
+            model_id=row["model_id"],
+            provider_id=row["provider_id"],
+            stage=row["stage"],
+            endpoint_idx=row["endpoint_idx"],
+            attempt_no=row["attempt_no"],
+            error_type=row["error_type"],
+            error_message=row["error_message"],
+            duration_ms=row["duration_ms"],
             created_at=row["created_at"],
         )
 

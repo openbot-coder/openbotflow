@@ -141,7 +141,7 @@ class LangGraphStrategy(BaseStrategy):
             truncated = truncate_messages(node_messages, available, max_tokens)
 
             ep = available[0]
-            resp = await call_llm(
+            resp, _err = await call_llm(
                 ep,
                 truncated,
                 node_gid,

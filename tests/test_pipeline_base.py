@@ -222,7 +222,7 @@ async def test_execute_returns_first_success():
 
     # call_llm: ep1 成功，ep2 不应被调用
     with patch("botflow.pipeline._shared.call_llm", new_callable=AsyncMock) as mock_call:
-        mock_call.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        mock_call.return_value = ({"choices": [{"message": {"content": "ok"}}]}, None)
         result = await strategy.execute(
             messages=[{"role": "user", "content": "hi"}],
             db=mock_db, cooldown=cooldown, group_id=1,
@@ -238,7 +238,7 @@ async def test_execute_all_fail_raises():
     strategy._eps = [MagicMock(), MagicMock()]
 
     with patch("botflow.pipeline._shared.call_llm", new_callable=AsyncMock) as mock_call:
-        mock_call.return_value = None
+        mock_call.return_value = (None, ProviderError("All endpoints failed"))
         with pytest.raises(ProviderError, match="All endpoints failed"):
             await strategy.execute(
                 messages=[], db=MagicMock(),
@@ -453,7 +453,7 @@ async def test_call_llm_success(sample_endpoint, cooldown):
 
     with patch("botflow.pipeline._shared.get_config") as mock_cfg:
         mock_cfg.return_value = MagicMock(upstream_semaphore_size=0)
-        result = await call_llm(
+        result, err = await call_llm(
             sample_endpoint,
             messages=[{"role": "user", "content": "hi"}],
             group_id=1,
@@ -463,6 +463,7 @@ async def test_call_llm_success(sample_endpoint, cooldown):
         )
 
     assert result == expected
+    assert err is None
     assert cooldown.get_failure_count(group_id=1, model_id=100) == 0
 
 
@@ -479,7 +480,7 @@ async def test_call_llm_retry_success(sample_endpoint, cooldown):
     with patch("botflow.pipeline._shared.get_config") as mock_cfg, \
          patch("botflow.pipeline._shared.exponential_backoff", new_callable=AsyncMock):
         mock_cfg.return_value = MagicMock(upstream_semaphore_size=0)
-        result = await call_llm(
+        result, err = await call_llm(
             sample_endpoint,
             messages=[],
             group_id=1,
@@ -487,6 +488,7 @@ async def test_call_llm_retry_success(sample_endpoint, cooldown):
         )
 
     assert result["choices"] == []
+    assert err is None
     assert result["_routing"] == {"model_id": 100, "provider_id": 1}
     assert sample_endpoint.provider.chat.call_count == 2
 
@@ -500,7 +502,7 @@ async def test_call_llm_retries_exhausted(sample_endpoint, cooldown):
     with patch("botflow.pipeline._shared.get_config") as mock_cfg, \
          patch("botflow.pipeline._shared.exponential_backoff", new_callable=AsyncMock):
         mock_cfg.return_value = MagicMock(upstream_semaphore_size=0)
-        result = await call_llm(
+        result, err = await call_llm(
             sample_endpoint,
             messages=[],
             group_id=1,
@@ -508,6 +510,7 @@ async def test_call_llm_retries_exhausted(sample_endpoint, cooldown):
         )
 
     assert result is None
+    assert err is not None
     assert cooldown.get_failure_count(group_id=1, model_id=100) >= 1
 
 
@@ -521,15 +524,17 @@ async def test_call_llm_cooldown_recording(sample_endpoint, cooldown):
     with patch("botflow.pipeline._shared.get_config") as mock_cfg, \
          patch("botflow.pipeline._shared.exponential_backoff", new_callable=AsyncMock):
         mock_cfg.return_value = MagicMock(upstream_semaphore_size=0)
-        await call_llm(sample_endpoint, messages=[], group_id=1, cooldown=cooldown)
+        _, err = await call_llm(sample_endpoint, messages=[], group_id=1, cooldown=cooldown)
 
+    assert err is not None
     assert cooldown.get_failure_count(group_id=1, model_id=100) >= 1
 
     # 现在成功调用
     sample_endpoint.provider.chat = AsyncMock(return_value={"ok": True})
     with patch("botflow.pipeline._shared.get_config") as mock_cfg:
         mock_cfg.return_value = MagicMock(upstream_semaphore_size=0)
-        await call_llm(sample_endpoint, messages=[], group_id=1, cooldown=cooldown)
+        _, err = await call_llm(sample_endpoint, messages=[], group_id=1, cooldown=cooldown)
+    assert err is None
 
     assert cooldown.get_failure_count(group_id=1, model_id=100) == 0
 
@@ -542,10 +547,11 @@ async def test_call_llm_with_semaphore(sample_endpoint, cooldown):
 
     with patch("botflow.pipeline._shared.get_config") as mock_cfg, \
          patch("botflow.pipeline._shared._ensure_provider_semaphore", return_value=sem):
-        result = await call_llm(
+        result, err = await call_llm(
             sample_endpoint, messages=[], group_id=1, cooldown=cooldown,
         )
 
+    assert err is None
     assert result["ok"] is True
     assert result["_routing"] == {"model_id": 100, "provider_id": 1}
 
@@ -558,10 +564,92 @@ async def test_call_llm_non_retryable_error_no_retry(sample_endpoint, cooldown):
 
     with patch("botflow.pipeline._shared.get_config") as mock_cfg:
         mock_cfg.return_value = MagicMock(upstream_semaphore_size=0)
-        result = await call_llm(sample_endpoint, messages=[], group_id=1, cooldown=cooldown)
+        result, err = await call_llm(sample_endpoint, messages=[], group_id=1, cooldown=cooldown)
 
     assert result is None
+    assert err is not None
     assert sample_endpoint.provider.chat.call_count == 1  # 没有重试
+
+
+# ---------------------------------------------------------------------------
+# 七（续）、SG-0 F3：call_llm 暴露 last_error（返回 tuple[dict|None, Exception|None]）
+# ---------------------------------------------------------------------------
+
+
+# T3.1 正例：成功路径返回 (result, None)，且 _routing 注入点未被搬迁
+async def test_call_llm_returns_result_and_none_error(sample_endpoint, cooldown):
+    expected = {"choices": [{"message": {"content": "ok"}}]}
+    sample_endpoint.provider.chat = AsyncMock(return_value=expected)
+
+    with patch("botflow.pipeline._shared.get_config") as mock_cfg:
+        mock_cfg.return_value = MagicMock(upstream_semaphore_size=0)
+        result, err = await call_llm(
+            sample_endpoint, messages=[{"role": "user", "content": "hi"}],
+            group_id=1, cooldown=cooldown,
+        )
+
+    assert err is None
+    assert result is expected
+    assert result["_routing"] == {"model_id": 100, "provider_id": 1}
+
+
+# T3.2 反例（关键）：失败路径返回 (None, err)，异常不再被吞
+async def test_call_llm_returns_error_instead_of_swallowing(sample_endpoint, cooldown):
+    raised = ProviderError("OpenAICompat request failed: HTTP 500")
+    sample_endpoint.provider.chat = AsyncMock(side_effect=raised)
+
+    with patch("botflow.pipeline._shared.get_config") as mock_cfg:
+        mock_cfg.return_value = MagicMock(upstream_semaphore_size=0)
+        result, err = await call_llm(
+            sample_endpoint, messages=[], group_id=1, cooldown=cooldown,
+        )
+
+    assert result is None
+    assert err is not None
+    # 不假定 err 有 status_code 属性；只验证它是同一异常实例且文本一致。
+    assert isinstance(err, ProviderError)
+    assert "HTTP 500" in str(err)
+
+
+# T3.3 边界：max_retries=1 且失败 → 只调用上游 1 次，err 非空
+async def test_call_llm_max_retries_one_calls_upstream_once(cooldown):
+    detail = GroupModelWithDetails(
+        id=1, group_id=1, model_id=100, weight=1.0, is_enabled=True,
+        model_name="gpt-4o", display_name="GPT-4o", api_format="",
+        provider_id=1, provider_name="openai-main", provider_type="openai",
+        max_retries=1, cooldown_seconds=60, cooldown_failure_threshold=3,
+        context_window=128000, proxy="", extra_config={},
+    )
+    ep = ModelEndpoint(detail, MagicMock())
+    ep.provider.chat = AsyncMock(side_effect=ProviderError("HTTP 500"))
+
+    with patch("botflow.pipeline._shared.get_config") as mock_cfg:
+        mock_cfg.return_value = MagicMock(upstream_semaphore_size=0)
+        result, err = await call_llm(ep, messages=[], group_id=1, cooldown=cooldown)
+
+    assert result is None
+    assert err is not None
+    assert ep.provider.chat.call_count == 1  # max_retries=1 → 不重试
+
+
+# T3.4 正例：第 2 次尝试成功 → 返回 (result, None)，上游被调用 2 次
+async def test_call_llm_second_attempt_succeeds(sample_endpoint, cooldown):
+    retryable = Exception("HTTP 429 Too Many Requests")
+    retryable.status_code = 429
+    sample_endpoint.provider.chat = AsyncMock(
+        side_effect=[retryable, {"choices": [{"message": {"content": "ok"}}]}]
+    )
+
+    with patch("botflow.pipeline._shared.get_config") as mock_cfg, \
+         patch("botflow.pipeline._shared.exponential_backoff", new_callable=AsyncMock):
+        mock_cfg.return_value = MagicMock(upstream_semaphore_size=0)
+        result, err = await call_llm(
+            sample_endpoint, messages=[], group_id=1, cooldown=cooldown,
+        )
+
+    assert err is None
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert sample_endpoint.provider.chat.call_count == 2
 
 
 # ---------------------------------------------------------------------------

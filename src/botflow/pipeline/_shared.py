@@ -103,11 +103,15 @@ async def call_llm(
     temperature: float | None = None,
     max_tokens: int | None = None,
     **kwargs,
-) -> dict | None:
+) -> tuple[dict | None, Exception | None]:
     """调用单个 endpoint，带 retry + cooldown + 信号量管理。
 
     从 GroupRouter._attempt_call 1:1 搬过来。
     信号量是全局跨 group 共享的——同一个 provider 跨 group 限流。
+
+    返回 ``(result, error)``：成功时 ``(result, None)``，全部重试失败后
+    ``(None, last_error)``。错误不再被静默吞掉——调用方（图节点 / 策略 /
+    SG-0 留痕）需要 ``error_type`` 做白名单判定与失败留痕。
     """
     kwargs = _apply_model_extra_config(kwargs, ep.detail.extra_config)
     sem = _ensure_provider_semaphore(
@@ -130,7 +134,7 @@ async def call_llm(
                 "model_id": ep.model_id,
                 "provider_id": ep.detail.provider_id,
             }
-            return result
+            return result, None
         except Exception as e:
             last_error = e
             log.warning(
@@ -157,7 +161,7 @@ async def call_llm(
         ep.max_retries,
         last_error,
     )
-    return None
+    return None, last_error
 
 
 # ---------------------------------------------------------------------------

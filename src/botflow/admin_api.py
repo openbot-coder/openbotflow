@@ -427,6 +427,35 @@ async def get_summary(day: str, _=Depends(verify_admin_key)):
     return {"success": True, "summary": summary.model_dump()}
 
 
+@admin_router.get("/attempts")
+async def query_attempts(
+    request_id: Optional[str] = None,
+    model_id: Optional[int] = None,
+    provider_id: Optional[int] = None,
+    group_id: Optional[int] = None,
+    error_type: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    _=Depends(verify_admin_key),
+):
+    """Read-only query of failed-attempt rows (SG-0 observability).
+
+    Returns 200 with an (possibly empty) ``attempts`` list on no match — never
+    404, so callers can poll without special-casing "nothing yet".
+    """
+    db = get_db()
+    rows = await db.query_call_attempts(
+        request_id=request_id,
+        model_id=model_id,
+        provider_id=provider_id,
+        group_id=group_id,
+        error_type=error_type,
+        limit=limit,
+        offset=offset,
+    )
+    return {"success": True, "attempts": [a.model_dump() for a in rows]}
+
+
 # ---------------------------------------------------------------------------
 # Client API keys (multi-tenant)
 # ---------------------------------------------------------------------------

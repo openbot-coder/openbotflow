@@ -86,7 +86,7 @@ async def test_route_success():
 
     with patch("botflow.pipeline._shared.load_endpoints", new_callable=AsyncMock, return_value=[ep]), \
          patch("botflow.pipeline._shared.filter_available", new=lambda eps, cd, gid: eps), \
-         patch("botflow.pipeline.langgraph_engine.call_llm", new_callable=AsyncMock, return_value=llm_resp):
+         patch("botflow.pipeline.langgraph_engine.call_llm", new_callable=AsyncMock, return_value=(llm_resp, None)):
         result = await engine.route(group=group, messages=[{"role": "user", "content": "hi"}])
 
     assert result["choices"][0]["message"]["content"] == "hi"
@@ -107,7 +107,7 @@ async def test_route_first_fails_second_succeeds():
 
     with patch("botflow.pipeline._shared.load_endpoints", new_callable=AsyncMock, return_value=[ep_a, ep_b]), \
          patch("botflow.pipeline._shared.filter_available", new=lambda eps, cd, gid: eps), \
-         patch("botflow.pipeline.langgraph_engine.call_llm", new_callable=AsyncMock, side_effect=[None, resp_b]):
+         patch("botflow.pipeline.langgraph_engine.call_llm", new_callable=AsyncMock, side_effect=[(None, ProviderError("primary failed")), (resp_b, None)]):
         result = await engine.route(group=group, messages=[])
 
     assert result["_routing"]["model_id"] == 2
@@ -126,7 +126,7 @@ async def test_route_all_endpoints_fail_finalize_error():
 
     with patch("botflow.pipeline._shared.load_endpoints", new_callable=AsyncMock, return_value=[_ep()]), \
          patch("botflow.pipeline._shared.filter_available", new=lambda eps, cd, gid: eps), \
-         patch("botflow.pipeline.langgraph_engine.call_llm", new_callable=AsyncMock, return_value=None):
+         patch("botflow.pipeline.langgraph_engine.call_llm", new_callable=AsyncMock, return_value=(None, ProviderError("all endpoints failed"))):
         with pytest.raises(ProviderError) as exc_info:
             await engine.route(group=group, messages=[])
 
@@ -158,7 +158,7 @@ async def test_route_fallback_group_succeeds():
 
     # ep_primary call fails (None); ep_fallback call succeeds
     async def fake_call_llm(ep, messages, group_id, cooldown, temperature=None, max_tokens=None, **kwargs):
-        return None if ep.model_id == 1 else resp
+        return (None, ProviderError("primary failed")) if ep.model_id == 1 else (resp, None)
 
     with patch("botflow.pipeline._shared.load_endpoints", new=fake_load_endpoints), \
          patch("botflow.pipeline._shared.filter_available", new=lambda eps, cd, gid: eps), \
@@ -184,7 +184,7 @@ async def test_route_fallback_cycle_detected():
 
     with patch("botflow.pipeline._shared.load_endpoints", new_callable=AsyncMock, return_value=[_ep()]), \
          patch("botflow.pipeline._shared.filter_available", new=lambda eps, cd, gid: eps), \
-         patch("botflow.pipeline.langgraph_engine.call_llm", new_callable=AsyncMock, return_value=None):
+         patch("botflow.pipeline.langgraph_engine.call_llm", new_callable=AsyncMock, return_value=(None, ProviderError("all endpoints failed"))):
         with pytest.raises(ProviderError) as exc_info:
             await engine.route(group=group_a, messages=[])
 
@@ -210,7 +210,7 @@ async def test_route_fallback_depth_limit():
 
     with patch("botflow.pipeline._shared.load_endpoints", new_callable=AsyncMock, return_value=[_ep()]), \
          patch("botflow.pipeline._shared.filter_available", new=lambda eps, cd, gid: eps), \
-         patch("botflow.pipeline.langgraph_engine.call_llm", new_callable=AsyncMock, return_value=None):
+         patch("botflow.pipeline.langgraph_engine.call_llm", new_callable=AsyncMock, return_value=(None, ProviderError("all endpoints failed"))):
         with pytest.raises(ProviderError) as exc_info:
             await engine.route(group=groups[1], messages=[])
 
@@ -267,7 +267,7 @@ async def test_route_forwards_extra_kwargs():
     async def check_call_llm(ep, messages, group_id, cooldown, temperature=None, max_tokens=None, **kwargs):
         assert kwargs.get("reasoning_effort") == "high"
         assert kwargs.get("top_p") == 0.9
-        return resp
+        return (resp, None)
 
     with patch("botflow.pipeline._shared.load_endpoints", new_callable=AsyncMock, return_value=[ep]), \
          patch("botflow.pipeline._shared.filter_available", new=lambda eps, cd, gid: eps), \
@@ -292,7 +292,7 @@ async def test_route_temperature_max_tokens_forwarded():
     async def check_args(ep, messages, group_id, cooldown, temperature=None, max_tokens=None, **kw):
         assert temperature == 0.7
         assert max_tokens == 256
-        return resp
+        return (resp, None)
 
     with patch("botflow.pipeline._shared.load_endpoints", new_callable=AsyncMock, return_value=[ep]), \
          patch("botflow.pipeline._shared.filter_available", new=lambda eps, cd, gid: eps), \

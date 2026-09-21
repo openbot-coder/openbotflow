@@ -191,7 +191,7 @@ class TestExecution:
             patch(_PATCH_LOAD, new_callable=AsyncMock, return_value=[ep]),
             patch(_PATCH_FILTER, return_value=[ep]),
             patch(_PATCH_TRUNCATE, side_effect=lambda m, e, t: m),
-            patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=resp),
+            patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=(resp, None)),
         ):
             result = await strategy.execute(MESSAGES, MagicMock(), cooldown, 1)
 
@@ -208,7 +208,7 @@ class TestExecution:
                 "final": "b",
             }
         )
-        responses = [llm_resp("content-a"), llm_resp("content-b")]
+        responses = [(llm_resp("content-a"), None), (llm_resp("content-b"), None)]
 
         with (
             patch(_PATCH_LOAD, new_callable=AsyncMock, return_value=[ep]),
@@ -237,7 +237,7 @@ class TestExecution:
             patch(_PATCH_LOAD, new_callable=AsyncMock, return_value=[ep]),
             patch(_PATCH_FILTER, return_value=[ep]),
             patch(_PATCH_TRUNCATE, side_effect=lambda m, e, t: m),
-            patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=resp),
+            patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=(resp, None)),
         ):
             result = await strategy.execute(MESSAGES, MagicMock(), cooldown, 1)
 
@@ -253,7 +253,9 @@ class TestExecution:
                 "final": "b",
             }
         )
-        call_mock = AsyncMock(side_effect=[llm_resp("content-a"), llm_resp("content-b")])
+        call_mock = AsyncMock(
+            side_effect=[(llm_resp("content-a"), None), (llm_resp("content-b"), None)]
+        )
 
         with (
             patch(_PATCH_LOAD, new_callable=AsyncMock, return_value=[ep]),
@@ -271,7 +273,7 @@ class TestExecution:
         strategy = LangGraphStrategy(
             params={"nodes": {"a": {"prompt": "user said {messages}"}}, "entry": "a"}
         )
-        call_mock = AsyncMock(return_value=llm_resp("ok"))
+        call_mock = AsyncMock(return_value=(llm_resp("ok"), None))
 
         with (
             patch(_PATCH_LOAD, new_callable=AsyncMock, return_value=[ep]),
@@ -297,7 +299,7 @@ class TestExecution:
             patch(_PATCH_LOAD, load_mock),
             patch(_PATCH_FILTER, return_value=[ep]),
             patch(_PATCH_TRUNCATE, side_effect=lambda m, e, t: m),
-            patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=llm_resp("ok")),
+            patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=(llm_resp("ok"), None)),
         ):
             await strategy.execute(MESSAGES, MagicMock(), cooldown, group_id=1)
 
@@ -321,7 +323,7 @@ class TestExecution:
             patch(
                 _PATCH_CALL_LLM,
                 new_callable=AsyncMock,
-                side_effect=[llm_resp("a"), llm_resp("b")],
+                side_effect=[(llm_resp("a"), None), (llm_resp("b"), None)],
             ),
         ):
             await strategy.execute(MESSAGES, MagicMock(), cooldown, group_id=1)
@@ -358,7 +360,7 @@ class TestExecution:
             patch(_PATCH_LOAD, new_callable=AsyncMock, return_value=[ep]),
             patch(_PATCH_FILTER, return_value=[ep]),
             patch(_PATCH_TRUNCATE, side_effect=lambda m, e, t: m),
-            patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=None),
+            patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=(None, ProviderError("call_llm failed"))),
         ):
             with pytest.raises(NoAvailableModelError, match="LLM call failed"):
                 await strategy.execute(MESSAGES, MagicMock(), cooldown, 1)
@@ -379,7 +381,7 @@ class TestExecution:
                 "final": "c",
             }
         )
-        responses = [llm_resp("go NEED_C now"), llm_resp("content-c")]
+        responses = [(llm_resp("go NEED_C now"), None), (llm_resp("content-c"), None)]
 
         with (
             patch(_PATCH_LOAD, new_callable=AsyncMock, return_value=[ep]),
@@ -405,7 +407,7 @@ class TestExecution:
                 "final": "b",
             }
         )
-        responses = [llm_resp("nothing matches"), llm_resp("content-b")]
+        responses = [(llm_resp("nothing matches"), None), (llm_resp("content-b"), None)]
 
         with (
             patch(_PATCH_LOAD, new_callable=AsyncMock, return_value=[ep]),
@@ -432,7 +434,7 @@ class TestExecution:
             }
         )
         # content 含 NEED_C，但首条无条件边先匹配 → 走 b
-        responses = [llm_resp("NEED_C"), llm_resp("content-b")]
+        responses = [(llm_resp("NEED_C"), None), (llm_resp("content-b"), None)]
 
         with (
             patch(_PATCH_LOAD, new_callable=AsyncMock, return_value=[ep]),
@@ -453,7 +455,7 @@ class TestExecution:
                 "entry": "a",
             }
         )
-        responses = [llm_resp("a"), llm_resp("b")]
+        responses = [(llm_resp("a"), None), (llm_resp("b"), None)]
 
         with (
             patch(_PATCH_LOAD, new_callable=AsyncMock, return_value=[ep]),
@@ -479,7 +481,7 @@ class TestExecution:
             patch(_PATCH_LOAD, new_callable=AsyncMock, return_value=[ep]),
             patch(_PATCH_FILTER, return_value=[ep]),
             patch(_PATCH_TRUNCATE, side_effect=lambda m, e, t: m),
-            patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=llm_resp("x")),
+            patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=(llm_resp("x"), None)),
         ):
             with pytest.raises(StrategyError, match="exceeded max steps"):
                 await strategy.execute(MESSAGES, MagicMock(), cooldown, 1)

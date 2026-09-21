@@ -32,6 +32,17 @@ from botflow.pipeline.strategies import (
 )
 
 
+def _without_attempts(result: dict) -> dict:
+    """Compare a `route()` result ignoring the SG-0 attempt trail.
+
+    `LangGraphEngine.route()` smuggles the failed-attempt list out of the graph
+    under the internal ``_attempts`` key (``_``-prefixed like ``_routing``); the
+    driver pops it before serialisation. Unit tests calling ``route()`` directly
+    must strip it before comparing against an expected response body.
+    """
+    return {k: v for k, v in result.items() if k != "_attempts"}
+
+
 # ===========================================================================
 # 一、PipelineEngine 单元测试 (21 tests)
 # ===========================================================================
@@ -329,7 +340,7 @@ async def test_route_non_stream_success():
     group = ModelGroup(id=1, name="fast", type="random_weights")
     select_fn = await _make_select_side_effect([ep])
     with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
-         patch(PATCH_CALL, new_callable=AsyncMock, return_value=llm_resp):
+         patch(PATCH_CALL, new_callable=AsyncMock, return_value=(llm_resp, None)):
         result = await engine.route(group=group, messages=[{"role": "user", "content": "Hi"}])
     assert result["choices"][0]["message"]["content"] == "Hello"
 
@@ -347,7 +358,7 @@ async def test_route_non_stream_passes_params():
     async def check_call(ep, messages, group_id, cooldown, temperature=None, max_tokens=None, **kw):
         assert temperature == 0.5
         assert max_tokens == 256
-        return llm_resp
+        return (llm_resp, None)
 
     select_fn = await _make_select_side_effect([ep])
     with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
@@ -367,7 +378,7 @@ async def test_route_non_stream_passes_kwargs():
 
     async def check_call(ep, messages, group_id, cooldown, temperature=None, max_tokens=None, **kw):
         assert kw.get("reasoning_effort") == "high"
-        return llm_resp
+        return (llm_resp, None)
 
     select_fn = await _make_select_side_effect([ep])
     with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
@@ -434,15 +445,15 @@ async def test_route_non_stream_fallback_on_provider_error():
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            return None  # primary group fails
-        return fallback_result  # fallback group succeeds
+            return (None, ProviderError("call_llm failed"))  # primary group fails
+        return (fallback_result, None)  # fallback group succeeds
 
     select_fn = _select_factory({1: [ep_a], 2: [ep_b]})
     with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
          patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
         result = await engine.route(group=group_a, messages=[{"role": "user", "content": "Hi"}])
 
-    assert result == fallback_result
+    assert _without_attempts(result) == fallback_result
 
 
 # R-05: call_llm 返回 None（所有 endpoint 失败）→ graph fallback
@@ -465,15 +476,15 @@ async def test_route_non_stream_fallback_on_cooldown_error():
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            return None  # primary group fails
-        return fallback_result  # fallback group succeeds
+            return (None, ProviderError("call_llm failed"))  # primary group fails
+        return (fallback_result, None)  # fallback group succeeds
 
     select_fn = _select_factory({1: [ep_a], 2: [ep_b]})
     with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
          patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
         result = await engine.route(group=group_a, messages=[{"role": "user", "content": "Hi"}])
 
-    assert result == fallback_result
+    assert _without_attempts(result) == fallback_result
 
 
 # R-06: call_llm 返回 None → graph fallback（所有 endpoint 不可用）
@@ -497,15 +508,15 @@ async def test_route_non_stream_fallback_on_no_available_error():
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            return None  # primary group fails
-        return fallback_result  # fallback group succeeds
+            return (None, ProviderError("call_llm failed"))  # primary group fails
+        return (fallback_result, None)  # fallback group succeeds
 
     select_fn = _select_factory({1: [ep_a], 2: [ep_b]})
     with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
          patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
         result = await engine.route(group=group_a, messages=[{"role": "user", "content": "Hi"}])
 
-    assert result == fallback_result
+    assert _without_attempts(result) == fallback_result
 
 
 # R-07a: strategy.select_endpoints 抛异常 → graph fallback
@@ -534,7 +545,7 @@ async def test_route_non_stream_fallback_on_strategy_error():
     async def call_llm_side_effect(*args, **kwargs):
         nonlocal call_count
         call_count += 1
-        return fallback_result
+        return (fallback_result, None)
 
     with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn_a), \
          patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
@@ -556,7 +567,7 @@ async def test_route_non_stream_fallback_on_strategy_error():
          patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
         result = await engine.route(group=group_a, messages=[{"role": "user", "content": "Hi"}])
 
-    assert result == fallback_result
+    assert _without_attempts(result) == fallback_result
 
 
 # R-07b: fallback group 执行成功，返回 fallback 结果
@@ -580,8 +591,8 @@ async def test_route_non_stream_fallback_success():
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            return None  # primary group fails
-        return fallback_result  # fallback group succeeds
+            return (None, ProviderError("call_llm failed"))  # primary group fails
+        return (fallback_result, None)  # fallback group succeeds
 
     # group A → RandomWeightsStrategy; group B → RoundRobinStrategy
     select_rw = _select_factory({1: [ep_a]})
@@ -591,7 +602,7 @@ async def test_route_non_stream_fallback_success():
          patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
         result = await engine.route(group=group_a, messages=[{"role": "user", "content": "Hi"}])
 
-    assert result == fallback_result
+    assert _without_attempts(result) == fallback_result
 
 
 # R-08: fallback_group_id=None 且 call_llm 返回 None → ProviderError
@@ -606,7 +617,7 @@ async def test_route_non_stream_no_fallback_without_id():
 
     select_fn = _select_factory({1: [ep]})
     with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
-         patch(PATCH_CALL, new_callable=AsyncMock, return_value=None):
+         patch(PATCH_CALL, new_callable=AsyncMock, return_value=(None, ProviderError("call_llm failed"))):
         with pytest.raises(ProviderError):
             await engine.route(group=group, messages=[])
 
@@ -631,7 +642,7 @@ async def test_route_fallback_cycle_detected():
 
     select_fn = _select_factory({1: [ep_a], 2: [ep_b]})
     with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
-         patch(PATCH_CALL, new_callable=AsyncMock, return_value=None):
+         patch(PATCH_CALL, new_callable=AsyncMock, return_value=(None, ProviderError("call_llm failed"))):
         with pytest.raises(ProviderError, match="No fallback group available"):
             await engine.route(group=group_a, messages=[])
 
@@ -651,7 +662,7 @@ async def test_route_fallback_cycle_error_message():
 
     select_fn = _select_factory({1: [ep_a], 2: [ep_b]})
     with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
-         patch(PATCH_CALL, new_callable=AsyncMock, return_value=None):
+         patch(PATCH_CALL, new_callable=AsyncMock, return_value=(None, ProviderError("call_llm failed"))):
         with pytest.raises(ProviderError) as exc_info:
             await engine.route(group=group_a, messages=[])
         msg = str(exc_info.value)
@@ -684,7 +695,7 @@ async def test_route_fallback_depth_limit():
 
     select_fn = _select_factory(all_eps)
     with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
-         patch(PATCH_CALL, new_callable=AsyncMock, return_value=None):
+         patch(PATCH_CALL, new_callable=AsyncMock, return_value=(None, ProviderError("call_llm failed"))):
         with pytest.raises(ProviderError, match="Fallback chain too deep"):
             await engine.route(group=groups[1], messages=[])
 
@@ -713,15 +724,15 @@ async def test_route_fallback_depth_exact_limit():
         nonlocal call_count
         call_count += 1
         if call_count <= 2:
-            return None  # groups 1 and 2 fail
-        return success_result  # group 3 succeeds
+            return (None, ProviderError("call_llm failed"))  # groups 1 and 2 fail
+        return (success_result, None)  # group 3 succeeds
 
     select_fn = _select_factory({1: [ep1], 2: [ep2], 3: [ep3]})
     with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
          patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
         result = await engine.route(group=group_a, messages=[])
 
-    assert result == success_result
+    assert _without_attempts(result) == success_result
     assert call_count == 3
 
 

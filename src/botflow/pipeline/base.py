@@ -71,7 +71,7 @@ class BaseStrategy(ABC):
             messages, db, cooldown, group_id, temperature, max_tokens, **kwargs
         )
         for ep in result.endpoints:
-            resp = await call_llm(
+            resp, _err = await call_llm(
                 ep,
                 result.messages,
                 group_id,

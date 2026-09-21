@@ -16,7 +16,7 @@ from botflow.admin_api import admin_router
 from botflow.config import BotflowSettings, set_config
 from botflow.storage import db as dbmod
 from botflow.storage.db import Database
-from botflow.storage.models import CallLog, Model, Provider
+from botflow.storage.models import CallAttempt, CallLog, Model, Provider
 
 
 @pytest.fixture
@@ -390,3 +390,48 @@ class TestAdminDashboard:
         assert "confirmState" in html
         assert "!confirm(" not in html  # no `if(!confirm(...)) return;` dead-button gate
         assert "Promise.allSettled" in html  # one failing endpoint can't freeze every list
+
+
+class TestAttemptQueries:
+    """SG-0 F8：call_attempts 只读查询端点。
+
+    依赖编码子 agent 实现的 ``GET /admin/attempts``（按 request_id / model_id 过滤，
+    返回 ``{"success": True, "attempts": [...]}``；无匹配返回空列表而非 404）。
+    """
+
+    def _seed(self, client, request_id, model_id, provider_id=1, group_id=1):
+        d = client.app.dependency_overrides[dbmod.get_db]()
+        asyncio.new_event_loop().run_until_complete(d.create_call_attempts([
+            CallAttempt(
+                request_id=request_id, group_id=group_id, model_id=model_id,
+                provider_id=provider_id, stage="non_stream", endpoint_idx=0,
+                attempt_no=1, error_type="ProviderError", error_message="boom",
+                duration_ms=5, created_at="2026-01-01T00:00:00Z",
+            ),
+        ]))
+
+    def test_admin_query_attempts_by_request_id(self, client):
+        self._seed(client, "r1", model_id=1)
+        self._seed(client, "r2", model_id=2)
+        r = client.get("/admin/attempts", params={"request_id": "r1"}, headers=AUTH)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["success"] is True
+        assert len(body["attempts"]) == 1
+        assert body["attempts"][0]["request_id"] == "r1"
+
+    def test_admin_query_attempts_by_model_id(self, client):
+        self._seed(client, "r1", model_id=1)
+        self._seed(client, "r2", model_id=2)
+        r = client.get("/admin/attempts", params={"model_id": 2}, headers=AUTH)
+        assert r.status_code == 200
+        body = r.json()
+        assert len(body["attempts"]) == 1
+        assert body["attempts"][0]["model_id"] == 2
+
+    def test_admin_query_attempts_empty_result(self, client):
+        r = client.get("/admin/attempts", params={"request_id": "nope"}, headers=AUTH)
+        assert r.status_code == 200  # 不是 404
+        body = r.json()
+        assert body["success"] is True
+        assert body["attempts"] == []

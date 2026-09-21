@@ -212,7 +212,7 @@ class TestRandomWeightsStrategy:
         with patch(_PATCH_LOAD, new_callable=AsyncMock, return_value=[ep1]), \
              patch(_PATCH_FILTER, return_value=[ep1]), \
              patch(_PATCH_TRUNCATE, return_value=messages), \
-             patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=llm_response) as mock_call:
+             patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=(llm_response, None)) as mock_call:
             result = await strategy.execute(messages, db, cooldown, group_id=1)
 
         assert result == llm_response
@@ -231,7 +231,7 @@ class TestRandomWeightsStrategy:
         with patch(_PATCH_LOAD, new_callable=AsyncMock, return_value=[ep1, ep2]), \
              patch(_PATCH_FILTER, return_value=[ep1, ep2]), \
              patch(_PATCH_TRUNCATE, return_value=messages), \
-             patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=None):
+             patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=(None, ProviderError("call_llm failed"))):
             with pytest.raises(ProviderError, match="All endpoints failed"):
                 await strategy.execute(messages, db, cooldown, group_id=1)
 
@@ -366,7 +366,7 @@ class TestRoundRobinStrategy:
         with patch(_PATCH_LOAD, new_callable=AsyncMock, return_value=[ep1]), \
              patch(_PATCH_FILTER, return_value=[ep1]), \
              patch(_PATCH_TRUNCATE, return_value=messages), \
-             patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=llm_response) as mock_call:
+             patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=(llm_response, None)) as mock_call:
             result = await strategy.execute(messages, db, cooldown, group_id=1)
 
         assert result == llm_response
@@ -403,7 +403,7 @@ class TestSequentialStrategy:
         ids = [ep.model_id for ep in result.endpoints]
         assert ids == [2, 3, 1], f"Expected [2, 3, 1] (weight desc), got {ids}"
 
-    # -- 3.2 highest weight endpoint is first --------------------------------
+    # -- 3.2 highest weight endpoint is first -------------------------------
 
     async def test_highest_weight_first(self):
         ep1 = make_endpoint(model_id=1, weight=5.0)
@@ -421,7 +421,7 @@ class TestSequentialStrategy:
         assert result.endpoints[0].model_id == 1
         assert result.endpoints[0].detail.weight == 5.0
 
-    # -- 3.3 execute: first endpoint succeeds --------------------------------
+    # -- 3.3 execute: first endpoint succeeds -------------------------------
 
     async def test_execute_first_success(self):
         ep1 = make_endpoint(model_id=1, weight=3.0)
@@ -435,13 +435,13 @@ class TestSequentialStrategy:
         with patch(_PATCH_LOAD, new_callable=AsyncMock, return_value=[ep1, ep2]), \
              patch(_PATCH_FILTER, return_value=[ep1, ep2]), \
              patch(_PATCH_TRUNCATE, return_value=messages), \
-             patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=llm_response) as mock_call:
+             patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=(llm_response, None)) as mock_call:
             result = await strategy.execute(messages, db, cooldown, group_id=1)
 
         assert result == llm_response
         assert mock_call.call_count == 1
 
-    # -- 3.4 execute: first fails, falls back to second ----------------------
+    # -- 3.4 execute: first fails, falls back to second ---------------------
 
     async def test_execute_fallback_to_second(self):
         ep1 = make_endpoint(model_id=1, weight=3.0)
@@ -458,8 +458,8 @@ class TestSequentialStrategy:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                return None
-            return llm_response
+                return (None, ProviderError("call_llm failed"))
+            return (llm_response, None)
 
         with patch(_PATCH_LOAD, new_callable=AsyncMock, return_value=[ep1, ep2]), \
              patch(_PATCH_FILTER, return_value=[ep1, ep2]), \
@@ -483,7 +483,7 @@ class TestSequentialStrategy:
         with patch(_PATCH_LOAD, new_callable=AsyncMock, return_value=[ep1, ep2]), \
              patch(_PATCH_FILTER, return_value=[ep1, ep2]), \
              patch(_PATCH_TRUNCATE, return_value=messages), \
-             patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=None):
+             patch(_PATCH_CALL_LLM, new_callable=AsyncMock, return_value=(None, ProviderError("call_llm failed"))):
             with pytest.raises(ProviderError, match="All endpoints failed"):
                 await strategy.execute(messages, db, cooldown, group_id=1)
 

@@ -98,6 +98,12 @@ class RouteState(TypedDict, total=False):
     used_model_id: int | None
     used_provider_id: int | None
 
+    # ── Failed-attempt audit trail (SG-0) ─────────────────
+    # Every failed upstream attempt (across all fallback groups of one request)
+    # is appended here as a dict; the driver takes it out after the graph
+    # finishes and writes it to `call_attempts`. The graph never touches the DB.
+    attempts: list[dict]
+
     # ── Metadata ──────────────────────────────────────────
     stream: bool  # True = select-only mode (no LLM call in graph)
     _initialized: bool  # True after first resolve_group pass
@@ -108,7 +114,13 @@ class RouteState(TypedDict, total=False):
 # ---------------------------------------------------------------------------
 
 
-def _raise_routing_error(raw: Any, default_exc: BotflowError) -> NoReturn:
+def _raise_routing_error(
+    raw: Any,
+    default_exc: BotflowError,
+    attempts: list[dict] | None = None,
+    used_model_id: int | None = None,
+    used_provider_id: int | None = None,
+) -> NoReturn:
     """Re-raise a routing failure, preferring its original exception type.
 
     ``_load_and_select`` deliberately stores recoverable exceptions in
@@ -126,10 +138,19 @@ def _raise_routing_error(raw: Any, default_exc: BotflowError) -> NoReturn:
     Only exceptions captured by a node can be re-raised with their own type;
     anything that was already flattened to a message can only surface as
     ``default_exc``.
+
+    SG-0: ``attempts`` / ``used_model_id`` / ``used_provider_id`` are smuggled
+    onto the raised exception so the driver can write the failed-attempt audit
+    trail and attribute the final error row even on the failure path (the graph
+    result dict is otherwise lost when we raise).
     """
-    if isinstance(raw, BotflowError):
-        raise raw
-    raise default_exc
+    exc = raw if isinstance(raw, BotflowError) else default_exc
+    if attempts is not None:
+        exc.attempts = attempts
+    if used_model_id is not None or used_provider_id is not None:
+        exc.used_model_id = used_model_id
+        exc.used_provider_id = used_provider_id
+    raise exc
 
 
 async def _resolve_group(state: RouteState) -> dict:
@@ -250,6 +271,12 @@ async def _try_call(state: RouteState) -> dict:
     Tries each endpoint in the selected list in order.  On success,
     returns the result.  When all endpoints fail, clears the list so
     the graph routes to fallback/error — never loops back to try_call.
+
+    SG-0: each failed endpoint attempt is appended to ``state["attempts"]`` so
+    the driver can persist it to ``call_attempts`` (even when the request later
+    succeeds via a fallback endpoint).  ``used_model_id`` / ``used_provider_id``
+    are carried through as the *last endpoint actually attempted*, so the
+    final error row is correctly attributed (G2).
     """
     ctx: GraphContext = get_config()["configurable"]["ctx"]
     endpoints = state.get("endpoints", [])
@@ -261,13 +288,20 @@ async def _try_call(state: RouteState) -> dict:
     max_tokens = state.get("max_tokens")
     extra = state.get("extra_kwargs", {})
 
+    attempts = list(state.get("attempts", []))
+    # Seed from the last endpoint tried in any previous group (fallback chain).
+    last_model_id = state.get("used_model_id")
+    last_provider_id = state.get("used_provider_id")
+
     # Walk through all remaining endpoints, call_llm once per endpoint
     while idx < len(endpoints):
         ep = endpoints[idx]
-        resp = await call_llm(
+        t0 = time.monotonic()
+        resp, err = await call_llm(
             ep, truncated, group_id, ctx.cooldown,
             temperature, max_tokens, **extra,
         )
+        duration_ms = int((time.monotonic() - t0) * 1000)
         if resp is not None:
             routing = resp.get("_routing", {})
             return {
@@ -278,7 +312,23 @@ async def _try_call(state: RouteState) -> dict:
                 # Clear so graph routes to success/end, not fallback
                 "endpoints": [],
                 "current_ep_idx": 0,
+                "attempts": attempts,
             }
+        # Failed attempt — record it (G1). call_llm hides endpoint-internal
+        # retries, so we log one row per endpoint with its final error.
+        last_model_id = ep.model_id
+        last_provider_id = ep.detail.provider_id
+        attempts.append({
+            "group_id": group_id,
+            "model_id": ep.model_id,
+            "provider_id": ep.detail.provider_id,
+            "stage": "call",
+            "endpoint_idx": idx,
+            "attempt_no": ep.max_retries,
+            "error_type": type(err).__name__ if err is not None else "UnknownError",
+            "error_message": str(err) if err is not None else "All retries exhausted",
+            "duration_ms": duration_ms,
+        })
         idx += 1
 
     # All endpoints failed — clear so graph routes to fallback/error.
@@ -287,8 +337,17 @@ async def _try_call(state: RouteState) -> dict:
     # verdict from `_resolve_group`). Overwriting it with this generic string
     # would erase *why* routing failed. See `_raise_routing_error`.
     if state.get("fatal_error") or state.get("error"):
-        return {"endpoints": [], "current_ep_idx": 0}
-    return {"endpoints": [], "current_ep_idx": 0, "error": "All endpoints in group failed"}
+        return {
+            "endpoints": [], "current_ep_idx": 0,
+            "attempts": attempts,
+            "used_model_id": last_model_id, "used_provider_id": last_provider_id,
+        }
+    return {
+        "endpoints": [], "current_ep_idx": 0,
+        "error": "All endpoints in group failed",
+        "attempts": attempts,
+        "used_model_id": last_model_id, "used_provider_id": last_provider_id,
+    }
 
 
 async def _finalize_error(state: RouteState) -> dict:
@@ -495,6 +554,12 @@ class LangGraphEngine:
             config={"configurable": {"ctx": ctx}},
         )
 
+        # SG-0: collect the failed-attempt trail and the last attempted endpoint
+        # so the driver can persist them (on both success and failure paths).
+        final_attempts = result.get("attempts", [])
+        used_model_id = result.get("used_model_id")
+        used_provider_id = result.get("used_provider_id")
+
         result_dict = result.get("result")
         if result_dict:
             # `_finalize_error` puts error info inside result["error"]
@@ -503,14 +568,28 @@ class LangGraphEngine:
                 msg = err.get("message", "Routing failed") if isinstance(err, dict) else str(err)
                 # state["error"] may still hold the original typed exception —
                 # prefer it over the flattened message.
-                _raise_routing_error(result.get("error"), ProviderError(msg))
+                exc = ProviderError(msg)
+                _raise_routing_error(
+                    result.get("error"), exc,
+                    attempts=final_attempts,
+                    used_model_id=used_model_id, used_provider_id=used_provider_id,
+                )
+            # Success: smuggle the attempt trail out via the response dict so the
+            # driver can write it without changing this method's return contract.
+            result_dict = dict(result_dict)
+            result_dict["_attempts"] = final_attempts
             return result_dict
 
         # graph ended without setting result — treat state["error"] as failure
         err = result.get("error")
         if err is not None:
             msg = err.get("message", "Routing failed") if isinstance(err, dict) else str(err)
-            _raise_routing_error(err, ProviderError(msg))
+            exc = ProviderError(msg)
+            _raise_routing_error(
+                err, exc,
+                attempts=final_attempts,
+                used_model_id=used_model_id, used_provider_id=used_provider_id,
+            )
         raise ProviderError("Routing failed with no result")
 
     async def route_stream(

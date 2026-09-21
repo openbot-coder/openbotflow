@@ -9,6 +9,7 @@ P3 migration: now uses PipelineEngine.route_stream() instead of GroupRouter.
 from __future__ import annotations
 
 import pytest
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 from botflow import core
@@ -112,15 +113,33 @@ async def _collect(agen) -> list[str]:
     return [line async for line in agen]
 
 
+class _LogCapture(list):
+    """Captures both ``_log_call`` (as list items) and ``_log_attempts``
+    (via the ``.attempts`` attribute), so existing ``env`` usages that
+    iterate the log list keep working while SG-0 attempt-logging tests can
+    read ``env.attempts``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts: list[dict] = []
+
+
 @pytest.fixture
 def env(monkeypatch):
-    logs: list[dict] = []
+    cap = _LogCapture()
 
     async def fake_log_call(**kwargs):
-        logs.append(kwargs)
+        cap.append(kwargs)
+
+    async def fake_log_attempts(rows):
+        if rows:
+            cap.attempts.extend(rows if isinstance(rows, list) else [rows])
 
     monkeypatch.setattr(core, "_log_call", fake_log_call)
-    return logs
+    # SG-0: also capture the new attempt-logging sink so F6/F7 can assert on it.
+    monkeypatch.setattr(core, "_log_attempts", fake_log_attempts)
+    return cap
 
 
 def _setup(monkeypatch, engine: StubEngine) -> None:
@@ -184,7 +203,10 @@ async def test_all_endpoints_fail_emits_error_sse(monkeypatch, env):
     assert "HTTP 500" in error_line
     error_log = [entry for entry in env if entry["status"] == "error"]
     assert len(error_log) == 1
-    assert error_log[0]["model_id"] is None
+    # F6 / T6.2: both endpoints were actually tried, so the final error row
+    # must be attributed to the last attempted endpoint (ep2), not None.
+    assert error_log[0]["model_id"] == ep2.model_id
+    assert error_log[0]["provider_id"] == ep2.detail.provider_id
     assert error_log[0]["error_message"] == "OpenAICompat stream failed: HTTP 500"
     assert engine.cooldown.get_failure_count(1, ep1.model_id) == 1
     assert engine.cooldown.get_failure_count(1, ep2.model_id) == 1
@@ -202,6 +224,13 @@ async def test_empty_stream_falls_back_to_next(monkeypatch, env):
     assert out == ["data: ok\n\n", "data: [DONE]\n\n"]
     assert engine.cooldown.get_failure_count(1, ep1.model_id) == 1
     assert [entry for entry in env if entry["status"] == "success"][0]["model_id"] == ep2.model_id
+
+    # T7.1 / F7: empty stream must also produce an attempt record (G1 留痕),
+    # attributed to the failing endpoint. Cooldown counting must NOT double-count.
+    ep1_attempts = [a for a in env.attempts if a.get("model_id") == ep1.model_id]
+    assert ep1_attempts, "empty-stream attempt should be recorded"
+    assert any("empty stream" in (a.get("error_message") or "") for a in ep1_attempts)
+    assert engine.cooldown.get_failure_count(1, ep1.model_id) == 1
 
 
 async def test_retryable_error_retries_same_endpoint(monkeypatch, env):
@@ -339,6 +368,14 @@ async def test_stream_timeout_from_request_overrides_default(monkeypatch, env):
     assert out == ["data: ok\n\n", "data: [DONE]\n\n"]
     assert engine.cooldown.get_failure_count(1, ep1.model_id) == 1
 
+    # T7.2 / F7: first-chunk timeout must record an attempt and must NOT add a
+    # second cooldown entry (cooldown is already recorded; §0.2 / §1.1 口径).
+    ep1_attempts = [a for a in env.attempts if a.get("model_id") == ep1.model_id]
+    assert ep1_attempts, "first-chunk-timeout attempt should be recorded"
+    assert any("timed out waiting for first chunk" in (a.get("error_message") or "")
+               for a in ep1_attempts)
+    assert engine.cooldown.get_failure_count(1, ep1.model_id) == 1
+
 
 async def test_serialize_error_emits_error_sse_no_fallback(monkeypatch, env):
     """序列化异常（botflow 侧 chunk 形状问题）→ SSE error，且不回退到其他模型。"""
@@ -357,3 +394,31 @@ async def test_serialize_error_emits_error_sse_no_fallback(monkeypatch, env):
     error_log = [entry for entry in env if entry["status"] == "error"]
     assert len(error_log) == 1
     assert error_log[0]["model_id"] == ep1.model_id
+
+
+# ---------------------------------------------------------------------------
+# F7 / T7.3: the unreachable ``if gen is None: break`` dead branch in
+# ``_stream_common`` (core.py:1146-1147) was deleted, and with it the
+# ``# UNCOVERED`` marker. Coverage of that region is carried by the real
+# T7.1 / T7.2 cases instead. This is a source-text guard (see
+# tests/test_context.py::test_no_cjk_ratio_refs_in_src for the pattern).
+# ---------------------------------------------------------------------------
+
+
+async def test_empty_stream_dead_branch_removed(monkeypatch):
+    """core._stream_common 内不可达的 ``if gen is None: break`` 死代码已删除，
+    且该文件内不含 ``# UNCOVERED``（F7 / AGENTS.md 规则 4「优先删除」）。"""
+    import inspect
+
+    from botflow import core as _core
+
+    source = inspect.getsource(_core._stream_common)
+    # The unreachable dead branch must be gone.
+    assert "if gen is None:" not in source, (
+        "dead `if gen is None: break` branch must be removed from _stream_common"
+    )
+    # No leftover coverage-exclusion marker anywhere in core.py.
+    full_source = Path(_core.__file__).read_text(encoding="utf-8")
+    assert "# UNCOVERED" not in full_source, (
+        "core.py must not contain any `# UNCOVERED` marker after SG-0"
+    )

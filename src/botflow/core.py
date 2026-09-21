@@ -60,7 +60,7 @@ from botflow.storage.daily_summary import (
 import httpx
 
 from botflow.storage.db import Database
-from botflow.storage.models import CallLog, Model, ModelGroup
+from botflow.storage.models import CallAttempt, CallLog, Model, ModelGroup
 from botflow.workspace import get_workspace_path, init_workspace
 
 log = get_logger("core")
@@ -117,6 +117,7 @@ class CallLogWriter:
     def __init__(self, db: Database, flush_interval: float = 5.0, max_buffer: int = 100):
         self._db = db
         self._buffer: list[CallLog] = []
+        self._attempts_buffer: list[CallAttempt] = []
         self._flush_interval = flush_interval
         self._max_buffer = max_buffer
         self._lock = asyncio.Lock()
@@ -146,6 +147,14 @@ class CallLogWriter:
         if reached_threshold:
             await self._flush_unlocked()
 
+    async def log_attempt(self, attempt: CallAttempt) -> None:
+        """Add a failed-attempt row to the (separate) buffer (SG-0)."""
+        async with self._lock:
+            self._attempts_buffer.append(attempt)
+            reached_threshold = len(self._attempts_buffer) >= self._max_buffer
+        if reached_threshold:
+            await self._flush_unlocked()
+
     async def _flush_loop(self) -> None:
         """Background task to periodically flush the buffer."""
         while True:
@@ -155,16 +164,24 @@ class CallLogWriter:
     async def _flush_unlocked(self) -> None:
         """Flush buffered log entries to the database (caller must NOT hold _lock)."""
         async with self._lock:
-            if not self._buffer:
+            if not self._buffer and not self._attempts_buffer:
                 return
-            batch = self._buffer.copy()
+            log_batch = self._buffer.copy()
             self._buffer.clear()
+            attempt_batch = self._attempts_buffer.copy()
+            self._attempts_buffer.clear()
 
         try:
-            for entry in batch:
+            for entry in log_batch:
                 await self._db.create_call_log(entry)
         except Exception as e:
-            log.error("Failed to flush {} call log entries: {}", len(batch), e)
+            log.error("Failed to flush {} call log entries: {}", len(log_batch), e)
+
+        try:
+            if attempt_batch:
+                await self._db.create_call_attempts(attempt_batch)
+        except Exception as e:
+            log.error("Failed to flush {} call attempt entries: {}", len(attempt_batch), e)
 
     async def _flush(self) -> None:
         """Flush buffered log entries to the database (acquires lock)."""
@@ -711,6 +728,48 @@ async def _log_call(
         await _get_db().create_call_log(log_entry)
 
 
+async def _log_attempts(attempts: list[dict]) -> None:
+    """Buffer failed-attempt rows for ``call_attempts`` (SG-0).
+
+    Mirrors ``_log_call``: pulls ``request_id`` from the per-request context and
+    feeds the shared ``CallLogWriter`` batch buffer. A writer flush failure only
+    logs (``CallLogWriter._flush_unlocked`` swallows it) — it must never break
+    the main request path (this is observation code, not business code). An
+    empty list is a no-op.
+    """
+    global _log_writer
+    if not attempts:
+        return
+    try:
+        ctx = _request_ctx.get() or {}
+        request_id = ctx.get("request_id")
+        entries = [
+            CallAttempt(
+                request_id=request_id,
+                group_id=a.get("group_id"),
+                model_id=a.get("model_id"),
+                provider_id=a.get("provider_id"),
+                stage=a.get("stage", ""),
+                endpoint_idx=a.get("endpoint_idx"),
+                attempt_no=a.get("attempt_no"),
+                error_type=a.get("error_type"),
+                error_message=a.get("error_message"),
+                duration_ms=a.get("duration_ms"),
+            )
+            for a in attempts
+        ]
+        if _log_writer:
+            for entry in entries:
+                await _log_writer.log_attempt(entry)
+        else:
+            # Fallback: direct write if writer not initialized (mirrors _log_call).
+            await _get_db().create_call_attempts(entries)
+    except Exception as e:
+        # SG-0 硬约束 3：这是观测代码，不是业务代码 —— 留痕失败只记日志，
+        # 绝不冒泡到驱动（否则驱动得再包一层 try，变成两处防御）。
+        log.error("Failed to record {} call attempts: {}", len(attempts), e)
+
+
 def _extract_model_route_info(response: dict, internal_params: dict) -> tuple[int | None, int | None, int | None]:
     """Extract model/provider IDs from response metadata if available."""
     model_id = None
@@ -986,7 +1045,11 @@ async def _handle_chat_non_stream(
         duration = int((time.monotonic() - start) * 1000)
         usage = result.get("usage", {})
         routing = result.pop("_routing", {})
+        # SG-0: failed attempts from this request (may be non-empty even on
+        # success — retries that eventually succeeded). Pop before serialising.
+        attempts = result.pop("_attempts", [])
 
+        await _log_attempts(attempts)
         await _log_call(
             group_id=group_id,
             model_id=routing.get("model_id"),
@@ -1004,10 +1067,17 @@ async def _handle_chat_non_stream(
         duration = int((time.monotonic() - start) * 1000)
         log.opt(exception=True).error("Chat request failed: {}", e)
 
+        # SG-0: recover the attempt trail + last attempted endpoint that the
+        # engine smuggled onto the exception, so the final error row is
+        # attributed (G2) and the failed attempts are persisted (G1).
+        attempts = getattr(e, "attempts", [])
+        used_model_id = getattr(e, "used_model_id", None)
+        used_provider_id = getattr(e, "used_provider_id", None)
+        await _log_attempts(attempts)
         await _log_call(
             group_id=group_id,
-            model_id=None,
-            provider_id=None,
+            model_id=used_model_id,
+            provider_id=used_provider_id,
             request_body=_request_summary(internal, full=True),
             response_body=None,
             status="error",
@@ -1082,7 +1152,12 @@ async def _stream_common(
     """
     model_name = internal.get("model", "")
     used_ep = None
+    last_attempted_ep = None
     last_error: Exception | None = None
+    # SG-0: failed-attempt audit trail for this streaming request (across all
+    # fallback groups). The graph only *selects* endpoints for streaming, so
+    # the driver collects attempts here (the actual call loop lives in core).
+    attempts: list[dict] = []
 
     group_id, engine, active_group, safe_extra = await _get_extra_route_params(internal, stream=True)
 
@@ -1101,10 +1176,12 @@ async def _stream_common(
             start = time.monotonic()
             usage_final = None
 
-            for ep in route_result["endpoints"]:
-                attempts = max(ep.max_retries, 1)
-                for attempt in range(attempts):
+            for ep_idx, ep in enumerate(route_result["endpoints"]):
+                attempts_count = max(ep.max_retries, 1)
+                last_attempted_ep = ep
+                for attempt in range(attempts_count):
                     gen: AsyncGenerator[dict, None] | None = None
+                    t0 = time.monotonic()
                     try:
                         gen = ep.provider.chat_stream(
                             messages=route_result["messages"],
@@ -1118,6 +1195,17 @@ async def _stream_common(
                     except asyncio.TimeoutError:
                         last_error = ProviderError(f"Model {ep.detail.model_name} timed out waiting for first chunk")
                         log.warning("{}", last_error)
+                        attempts.append({
+                            "group_id": routed_group_id,
+                            "model_id": ep.model_id,
+                            "provider_id": ep.detail.provider_id,
+                            "stage": "stream",
+                            "endpoint_idx": ep_idx,
+                            "attempt_no": attempt + 1,
+                            "error_type": type(last_error).__name__,
+                            "error_message": str(last_error),
+                            "duration_ms": int((time.monotonic() - t0) * 1000),
+                        })
                         if gen:
                             await gen.aclose()
                         gen = None
@@ -1125,6 +1213,17 @@ async def _stream_common(
                     except StopAsyncIteration:
                         last_error = ProviderError(f"Model {ep.detail.model_name} returned an empty stream")
                         log.warning("{}", last_error)
+                        attempts.append({
+                            "group_id": routed_group_id,
+                            "model_id": ep.model_id,
+                            "provider_id": ep.detail.provider_id,
+                            "stage": "stream",
+                            "endpoint_idx": ep_idx,
+                            "attempt_no": attempt + 1,
+                            "error_type": type(last_error).__name__,
+                            "error_message": str(last_error),
+                            "duration_ms": int((time.monotonic() - t0) * 1000),
+                        })
                         gen = None
                         break
                     except Exception as e:
@@ -1133,18 +1232,26 @@ async def _stream_common(
                             "Model {} stream failed (attempt {}/{}): {}",
                             ep.detail.model_name,
                             attempt + 1,
-                            attempts,
+                            attempts_count,
                             e,
                         )
+                        attempts.append({
+                            "group_id": routed_group_id,
+                            "model_id": ep.model_id,
+                            "provider_id": ep.detail.provider_id,
+                            "stage": "stream",
+                            "endpoint_idx": ep_idx,
+                            "attempt_no": attempt + 1,
+                            "error_type": type(last_error).__name__,
+                            "error_message": str(last_error),
+                            "duration_ms": int((time.monotonic() - t0) * 1000),
+                        })
                         if gen:
                             await gen.aclose()
-                        if is_retryable_error(e) and attempt < attempts - 1:
+                        if is_retryable_error(e) and attempt < attempts_count - 1:
                             await exponential_backoff(attempt)
                             continue
                         break
-
-                    if gen is None:
-                        break  # empty stream: move to next endpoint  # UNCOVERED
 
                     # Stream started: commit to this model.
                     used_ep = ep
@@ -1181,6 +1288,7 @@ async def _stream_common(
                     yield done_signal
 
                     duration = int((time.monotonic() - start) * 1000)
+                    await _log_attempts(attempts)
                     await _log_call(
                         group_id=group_id,
                         model_id=used_ep.model_id,
@@ -1194,6 +1302,9 @@ async def _stream_common(
                     return
 
                 # All attempts on this endpoint failed — cool it down, try next.
+                # NOTE: the cooldown is already recorded here for the endpoint;
+                # do NOT add another record_failure call (would double-count and
+                # trip cooldown_failure_threshold early). See SG-0_features §1.1.
                 engine.cooldown.record_failure(
                     routed_group_id,
                     ep.model_id,
@@ -1222,10 +1333,15 @@ async def _stream_common(
 
     except Exception as e:
         log.opt(exception=True).error("Stream failed for model {}: {}", model_name, e)
+        # SG-0: persist whatever failed attempts we collected, and attribute the
+        # final error row to the last endpoint we actually tried (G2). When no
+        # endpoint was ever attempted (e.g. route_stream raised AllModelsCooldown
+        # before the loop), both stay None.
+        await _log_attempts(attempts)
         await _log_call(
             group_id=group_id,
-            model_id=used_ep.model_id if used_ep else None,
-            provider_id=used_ep.detail.provider_id if used_ep else None,
+            model_id=last_attempted_ep.model_id if last_attempted_ep else None,
+            provider_id=last_attempted_ep.detail.provider_id if last_attempted_ep else None,
             request_body=_request_summary(internal, full=True),
             response_body=None,
             status="error",

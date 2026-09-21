@@ -112,9 +112,10 @@ async def test_patch_ensure_provider_semaphore_via_shared(sample_endpoint, coold
         "botflow.pipeline._shared._ensure_provider_semaphore", return_value=sem
     ), patch("botflow.pipeline._shared.get_config") as cfg:
         cfg.return_value = MagicMock(upstream_semaphore_size=0)
-        result = await call_llm(
+        result, err = await call_llm(
             sample_endpoint, messages=[], group_id=1, cooldown=cooldown
         )
+        assert err is None
     assert result is not None
     assert result["ok"] is True
 
@@ -313,9 +314,10 @@ async def test_existing_router_suite_contract(sample_endpoint, cooldown):
     ) as m, patch("botflow.pipeline._shared.get_config") as cfg:
         cfg.return_value = MagicMock(upstream_semaphore_size=0)
         sample_endpoint.provider.chat = AsyncMock(return_value={"ok": True})
-        result = await call_llm(
+        result, err = await call_llm(
             sample_endpoint, messages=[], group_id=1, cooldown=cooldown
         )
+        assert err is None
         assert m.called
     assert result is not None
     # 对象同一性轻量校验（与 F2 验收标准一致）

@@ -233,7 +233,7 @@ class GraphContext:
 | G1 | 逐次尝试失败只 `log.warning`，不落库 | `_shared.py:134-146`（`call_llm`）、`core.py:1130-1144`（流式重试环） | **重试成功时 `call_logs` 只有一条 success**，之前的失败无迹可查 |
 | G2 | 最终错误行丢失归属 | `core.py:1009-1010` 写死 `model_id=None, provider_id=None`；流式 `:1227-1228` 在 `used_ep` 未设置时同样为 `None` | 失败行无法定位到具体模型 / 供应商 |
 | G3 | 降级前的组失败无痕 | `core.py:1204-1219` 切 backup 组 | 主组失败只在应用日志里，DB 无行 |
-| G4 | 空流 / 首 chunk 超时既不留痕也不记冷却 | `core.py:1125-1129` `break` 直接跳到下一端点，**绕过** `:1196-1202` 的 `record_failure` | 坏模型不被冷却、也无记录（该行现为 `# UNCOVERED`） |
+| G4 | 空流 / 首 chunk 超时**不留痕**；且有一段不可达死代码 | `core.py:1125-1129`（⚠️ **冷却是记了的** —— `break` 退出的是内层 `for attempt` 循环，控制流随即落到 `:1197` 的 `record_failure`，见 `SG-0_features.md §1.1`）；真正的问题在 `:1146-1147` 的 `if gen is None: break` **不可达** | 失败尝试无迹可查（同 G1 根因）；死代码挂着 `# UNCOVERED` 需删除 |
 
 **目标**：**每一次失败尝试都留下一条可查记录，即使该请求最终成功。**
 
@@ -266,7 +266,7 @@ CREATE INDEX IF NOT EXISTS idx_call_attempts_request ON call_attempts(request_id
 
 3. **修 G2**：`_try_call` 把最后一次尝试的 `model_id` / `provider_id` 一并写进 state，驱动用它填最终错误行（不再写死 `None`）。
 
-4. **修 G4**：空流 / 首 chunk 超时并入统一失败路径 —— 既 `cooldown.record_failure`，也进 attempts 列表。
+4. **修 G4**：空流 / 首 chunk 超时并入统一失败路径 —— **补 attempt 留痕**，并删除 `core.py:1146-1147` 的不可达死代码。⚠️ **不新增 `cooldown.record_failure`**：冷却现状已在记（见本节 G4 行与 `SG-0_features.md §1.1`），重复添加会变成双重计数，使 `cooldown_failure_threshold` 提前触发。
 
 5. **`call_llm` 暴露失败原因**：现签名在失败时 `return None`，**异常被吞掉**。需改为返回 `(result | None, last_error | None)`（或等价机制），否则白名单判定（§3.5）与留痕都拿不到 `error_type`。
 
