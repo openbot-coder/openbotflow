@@ -29,7 +29,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from botflow.admin_api import admin_router
 from botflow.auth import ApiKey, resolve_api_key, verify_admin_key, verify_llm_key
-from botflow.common.exceptions import ProviderError
+from botflow.common.exceptions import (
+    AllModelsCooldownError,
+    NoAvailableModelError,
+    ProviderError,
+)
 from botflow.pipeline import PipelineEngine
 from botflow.common.logger import get_logger, setup_logging
 from botflow.config import BotflowSettings, get_config, set_config
@@ -1015,80 +1019,276 @@ async def _get_extra_route_params(internal: dict, stream: bool = False) -> tuple
     return group_id, engine, group, _filter_safe_extra(extra)
 
 
+async def _load_group(group_id: int) -> "ModelGroup":
+    """Resolve a (backup) group by id via the active engine.
+
+    Exists as a module-level seam so the unified driver ``_drive`` can load
+    fallback groups independently of ``engine.route`` (and so tests can
+    monkeypatch it). Delegates to ``PipelineEngine._load_group`` (60s cache).
+    """
+    engine = _get_engine()
+    return await engine._load_group(group_id)
+
+
+# ---------------------------------------------------------------------------
+# Unified driver (SG-1): single entry point for chat + stream
+# ---------------------------------------------------------------------------
+# ``_drive`` is a *synchronous* dispatcher so it can be used both as
+# ``await core._drive(internal, "chat")`` (returns the result dict) and
+# ``async for line in core._drive(internal, "stream", serialize, ...)``
+# (yields SSE lines).  An async generator cannot be awaited, and a plain
+# coroutine cannot be async-iterated, so the two modes are split into
+# ``_drive_chat`` (coroutine) and ``_drive_stream`` (async generator) and
+# selected here.
+# ---------------------------------------------------------------------------
+
+
+def _drive(
+    internal: dict,
+    mode: str,
+    serialize: Callable[[dict], tuple[list[str], dict | None]] | None = None,
+    done_signal: str = "data: [DONE]\n\n",
+    request: "Request | None" = None,
+):
+    """Unified routing driver (SG-1 F1).
+
+    Steps shared by both modes:
+      ① group resolution (``_get_extra_route_params``)
+      ② template + strategy build  (done inside ``engine.run``)
+      ③ single-group execution    (``engine.run`` / ``stream_events``)
+      ④ group-level fallback loop  (≤3 groups, cycle / depth detection)
+
+    ``mode="chat"``   → returns the result dict; on failure it re-raises the
+                        **original typed exception** (the protocol layer maps it
+                        to ``HTTPException(502)``).
+    ``mode="stream"`` → returns an async generator of SSE lines.
+    """
+    if mode == "stream":
+        return _drive_stream(internal, serialize, done_signal, request)
+    return _drive_chat(internal, serialize, done_signal, request)
+
+
+_MAX_FALLBACK_GROUPS = 3  # total groups tried: primary + up to 2 backups
+
+
+async def _drive_chat(
+    internal: dict,
+    serialize,  # unused for chat; kept for signature symmetry
+    done_signal: str,  # unused for chat
+    request: "Request | None",
+) -> dict:
+    """Non-streaming driver: run a group, fall back across backups, return dict."""
+    group_id, engine, primary, safe_extra = await _get_extra_route_params(internal, stream=False)
+    model_name = internal.get("model", "")
+    group = primary
+    visited: set[int] = {group.id}
+    attempts: list[dict] = []
+    start = time.monotonic()
+
+    while True:
+        try:
+            result = await engine.run(
+                None, group, mode="chat",
+                messages=internal["messages"],
+                temperature=internal.get("temperature"),
+                max_tokens=internal.get("max_tokens"),
+                request=request,
+                **safe_extra,
+            )
+            # Success — override model name and hand back a clean response.
+            result["model"] = model_name
+            routing = result.pop("_routing", {})
+            grp_attempts = result.pop("_attempts", [])
+            attempts.extend(grp_attempts)
+            duration = int((time.monotonic() - start) * 1000)
+            await _log_attempts(attempts)
+            await _log_call(
+                group_id=group_id,
+                model_id=routing.get("model_id"),
+                provider_id=routing.get("provider_id"),
+                request_body=_request_summary(internal),
+                response_body=json.dumps(result)[:500],
+                status="success",
+                duration_ms=duration,
+                usage=result.get("usage", {}),
+            )
+            return result
+        except (AllModelsCooldownError, NoAvailableModelError, ProviderError) as e:
+            # Recoverable group failure — smash the smuggled attempt trail in.
+            attempts.extend(getattr(e, "attempts", []) or [])
+            fb = group.fallback_group_id
+            if fb is None or fb in visited or len(visited) >= _MAX_FALLBACK_GROUPS:
+                # Exhausted — preserve the original typed error for call_logs.
+                duration = int((time.monotonic() - start) * 1000)
+                await _log_attempts(attempts)
+                await _log_call(
+                    group_id=group_id,
+                    model_id=getattr(e, "used_model_id", None),
+                    provider_id=getattr(e, "used_provider_id", None),
+                    request_body=_request_summary(internal, full=True),
+                    response_body=None,
+                    status="error",
+                    duration_ms=duration,
+                    usage=None,
+                    error_message=str(e),
+                    error_type=type(e).__name__,
+                    traceback_text=_limit_traceback(tb.format_exc()),
+                )
+                # Re-raise the *original* typed error (not ProviderError, not
+                # HTTPException) so ``call_logs.error_type`` stays faithful.
+                # The protocol layer maps it to HTTP 502.
+                raise
+            group = await _load_group(fb)
+            visited.add(group.id)
+        except Exception as e:
+            # Non-recoverable (ConfigurationError / StrategyError / TypeError / …).
+            # Blacklist failures MUST still leave an attempt row (T6.5).
+            attempts.append({
+                "group_id": group.id, "model_id": None, "provider_id": None,
+                "stage": "route", "endpoint_idx": -1, "attempt_no": 1,
+                "error_type": type(e).__name__, "error_message": str(e), "duration_ms": 0,
+            })
+            duration = int((time.monotonic() - start) * 1000)
+            await _log_attempts(attempts)
+            await _log_call(
+                group_id=group_id, model_id=None, provider_id=None,
+                request_body=_request_summary(internal, full=True), response_body=None,
+                status="error", duration_ms=duration, usage=None,
+                error_message=str(e), error_type=type(e).__name__,
+                traceback_text=_limit_traceback(tb.format_exc()),
+            )
+            # Blacklist failure — no fallback, propagate the original type.
+            raise
+
+
+async def _drive_stream(
+    internal: dict,
+    serialize: Callable[[dict], tuple[list[str], dict | None]] | None,
+    done_signal: str,
+    request: "Request | None",
+) -> "AsyncGenerator[str, None]":
+    """Streaming driver: run a group, push chunks, fall back across backups."""
+    group_id, engine, primary, safe_extra = await _get_extra_route_params(internal, stream=True)
+    model_name = internal.get("model", "")
+    group = primary
+    visited: set[int] = {group.id}
+    attempts: list[dict] = []
+    start = time.monotonic()
+    _serialize = serialize or (lambda c: ([json.dumps(c, ensure_ascii=False)], None))
+
+    final_state: dict | None = None
+    while True:
+        try:
+            final_state = None
+            gen = await engine.run(
+                None, group, mode="stream",
+                messages=internal["messages"],
+                temperature=internal.get("temperature"),
+                max_tokens=internal.get("max_tokens"),
+                request=request,
+                **safe_extra,
+            )
+            async for kind, payload in gen:
+                if request is not None and await request.is_disconnected():
+                    # Client is gone — stop emitting immediately; nothing is
+                    # serialised for the already-pulled chunk (§3.3 / T4.6).
+                    await gen.aclose()
+                    break
+                if kind == "chunk":
+                    chunk = payload
+                    chunk["model"] = model_name
+                    lines, _usage = _serialize(chunk)
+                    for line in lines:
+                        yield line
+                elif kind == "state":
+                    final_state = payload
+
+            grp_attempts = (final_state or {}).get("attempts", [])
+            attempts.extend(grp_attempts)
+            if final_state is not None and final_state.get("recoverable"):
+                # Group failed before any chunk — fall back to a backup group.
+                raise ProviderError(f"Group {group.id} stream exhausted, fallback")
+            # Success (or already-committed mid-stream failure).
+            duration = int((time.monotonic() - start) * 1000)
+            await _log_attempts(attempts)
+            await _log_call(
+                group_id=group_id,
+                model_id=(final_state or {}).get("used_model_id"),
+                provider_id=(final_state or {}).get("used_provider_id"),
+                request_body=_request_summary(internal),
+                response_body=None, status="success",
+                duration_ms=duration, usage=None,
+            )
+            yield done_signal
+            return
+        except (AllModelsCooldownError, NoAvailableModelError, ProviderError) as e:
+            attempts.extend(getattr(e, "attempts", []) or [])
+            fb = group.fallback_group_id
+            if fb is None or fb in visited or len(visited) >= _MAX_FALLBACK_GROUPS:
+                # Exhausted — persist the attempt trail + an error row (§3.6 / SG-0
+                # G1: a blacklist/whitelist failure MUST leave a trace, otherwise a
+                # stream outage silently disappears from call_logs), emit an error
+                # SSE, then close the stream.
+                duration = int((time.monotonic() - start) * 1000)
+                await _log_attempts(attempts)
+                await _log_call(
+                    group_id=group_id,
+                    model_id=(final_state or {}).get("used_model_id"),
+                    provider_id=(final_state or {}).get("used_provider_id"),
+                    request_body=_request_summary(internal, full=True),
+                    response_body=None, status="error",
+                    duration_ms=duration, usage=None,
+                    error_message=str(e), error_type=type(e).__name__,
+                    traceback_text=_limit_traceback(tb.format_exc()),
+                )
+                error_data = {"error": {"message": str(e), "type": "server_error"}}
+                yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
+                yield done_signal
+                return
+            group = await _load_group(fb)
+            visited.add(group.id)
+        except Exception as e:
+            # Non-recoverable (ConfigurationError / StrategyError / TypeError / …).
+            # Blacklist failures MUST still leave an attempt row (design §3.6).
+            attempts.append({
+                "group_id": group.id, "model_id": None, "provider_id": None,
+                "stage": "route", "endpoint_idx": -1, "attempt_no": 1,
+                "error_type": type(e).__name__, "error_message": str(e), "duration_ms": 0,
+            })
+            duration = int((time.monotonic() - start) * 1000)
+            await _log_attempts(attempts)
+            await _log_call(
+                group_id=group_id, model_id=None, provider_id=None,
+                request_body=_request_summary(internal, full=True), response_body=None,
+                status="error", duration_ms=duration, usage=None,
+                error_message=str(e), error_type=type(e).__name__,
+                traceback_text=_limit_traceback(tb.format_exc()),
+            )
+            error_data = {"error": {"message": str(e), "type": "server_error"}}
+            yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
+            yield done_signal
+            return
+
+
 async def _handle_chat_non_stream(
     internal: dict,
     request: Request,
     format_response,
 ) -> JSONResponse:
-    """Handle a non-streaming chat request through PipelineEngine."""
-    model_name = internal.get("model", "")
-    group_id = await _get_group_id({"model": model_name})
-    db = _get_db()
-    group = await db.get_group(group_id)
-    engine = _get_engine()
-    safe_extra = _filter_safe_extra(internal.get("extra", {}))
-    start = time.monotonic()
+    """Handle a non-streaming chat request through the unified driver ``_drive``.
 
+    SG-1: the entire route + group-fallback + attempt-logging + error handling
+    now lives in ``_drive`` (shared with the streaming path); this handler only
+    formats the result (or lets the 502 propagate).
+    """
     try:
-        result = await engine.route(
-            group=group,
-            messages=internal["messages"],
-            temperature=internal.get("temperature"),
-            max_tokens=internal.get("max_tokens"),
-            stream=False,
-            **safe_extra,
-        )
-
-        # Override model with the original requested model name
-        result["model"] = internal["model"]
-
-        duration = int((time.monotonic() - start) * 1000)
-        usage = result.get("usage", {})
-        routing = result.pop("_routing", {})
-        # SG-0: failed attempts from this request (may be non-empty even on
-        # success — retries that eventually succeeded). Pop before serialising.
-        attempts = result.pop("_attempts", [])
-
-        await _log_attempts(attempts)
-        await _log_call(
-            group_id=group_id,
-            model_id=routing.get("model_id"),
-            provider_id=routing.get("provider_id"),
-            request_body=_request_summary(internal),
-            response_body=json.dumps(result)[:500],
-            status="success",
-            duration_ms=duration,
-            usage=usage,
-        )
-
-        return JSONResponse(content=format_response(result))
-
+        result = await _drive(internal, "chat")
+    except HTTPException:
+        raise
     except Exception as e:
-        duration = int((time.monotonic() - start) * 1000)
-        log.opt(exception=True).error("Chat request failed: {}", e)
-
-        # SG-0: recover the attempt trail + last attempted endpoint that the
-        # engine smuggled onto the exception, so the final error row is
-        # attributed (G2) and the failed attempts are persisted (G1).
-        attempts = getattr(e, "attempts", [])
-        used_model_id = getattr(e, "used_model_id", None)
-        used_provider_id = getattr(e, "used_provider_id", None)
-        await _log_attempts(attempts)
-        await _log_call(
-            group_id=group_id,
-            model_id=used_model_id,
-            provider_id=used_provider_id,
-            request_body=_request_summary(internal, full=True),
-            response_body=None,
-            status="error",
-            duration_ms=duration,
-            usage=None,
-            error_message=str(e),
-            error_type=type(e).__name__,
-            traceback_text=_limit_traceback(tb.format_exc()),
-        )
-
         raise HTTPException(status_code=502, detail=str(e))
+
+    return JSONResponse(content=format_response(result))
 
 
 # ---------------------------------------------------------------------------
@@ -1121,239 +1321,22 @@ def _anthropic_serialize(chunk: dict) -> tuple[list[str], dict | None]:
     return lines, chunk.get("usage")
 
 
-async def _chain_first(first_chunk: dict, rest: AsyncGenerator[dict, None]) -> AsyncGenerator[dict, None]:
-    """Yield the first chunk (already pulled for fallback detection), then the rest of the stream."""
-    yield first_chunk
-    async for chunk in rest:
-        yield chunk
-
-
 async def _stream_common(
     internal: dict,
     serialize: SerializeFn,
     done_signal: str = "data: [DONE]\n\n",
     request: Request | None = None,
 ) -> AsyncGenerator[str, None]:
-    """Shared streaming logic: route, iterate, serialize, log.
+    """SG-1 (F7): thin transport wrapper.
 
-    Tries candidate endpoints in weighted order; if a stream fails before its
-    first chunk, the next endpoint is attempted (mirrors non-streaming
-    fallback, per design.md: 可重试错误重试后 fallback，不可重试错误立即 fallback).
-    Once a stream has started, later failures are not retried — they propagate
-    to the client as an SSE error event.
-
-    Now uses PipelineEngine.route_stream() instead of GroupRouter.
-
-    Args:
-        internal: Parsed internal request dict.
-        serialize: Chunk serializer returning (sse_lines, usage) per chunk.
-        done_signal: Final SSE line to yield after all chunks.
-        request: Optional Request object for disconnect detection.
+    All routing / endpoint retry / group fallback now lives in the unified
+    driver ``_drive`` (single entry point for both chat and stream). This
+    wrapper only forwards to ``_drive`` and yields whatever SSE lines it
+    produces, so it no longer owns a retry loop nor a fallback-attempted flag
+    (T7.2 / T7.3).
     """
-    model_name = internal.get("model", "")
-    used_ep = None
-    last_attempted_ep = None
-    last_error: Exception | None = None
-    # SG-0: failed-attempt audit trail for this streaming request (across all
-    # fallback groups). The graph only *selects* endpoints for streaming, so
-    # the driver collects attempts here (the actual call loop lives in core).
-    attempts: list[dict] = []
-
-    group_id, engine, active_group, safe_extra = await _get_extra_route_params(internal, stream=True)
-
-    try:
-        stream_timeout = float(internal.get("stream_timeout", _config.stream_timeout if _config else 30.0))
-        fallback_attempted = False
-        while True:
-            route_result = await engine.route_stream(
-                group=active_group,
-                messages=internal["messages"],
-                temperature=internal.get("temperature"),
-                max_tokens=internal.get("max_tokens"),
-                **safe_extra,
-            )
-            routed_group_id = route_result.get("group_id", group_id)
-            start = time.monotonic()
-            usage_final = None
-
-            for ep_idx, ep in enumerate(route_result["endpoints"]):
-                attempts_count = max(ep.max_retries, 1)
-                last_attempted_ep = ep
-                for attempt in range(attempts_count):
-                    gen: AsyncGenerator[dict, None] | None = None
-                    t0 = time.monotonic()
-                    try:
-                        gen = ep.provider.chat_stream(
-                            messages=route_result["messages"],
-                            model=ep.detail.model_name,
-                            temperature=route_result.get("temperature"),
-                            max_tokens=route_result.get("max_tokens"),
-                            **route_result.get("kwargs", {}),
-                        )
-                        async with asyncio.timeout(stream_timeout):
-                            first_chunk = await gen.__anext__()
-                    except asyncio.TimeoutError:
-                        last_error = ProviderError(f"Model {ep.detail.model_name} timed out waiting for first chunk")
-                        log.warning("{}", last_error)
-                        attempts.append({
-                            "group_id": routed_group_id,
-                            "model_id": ep.model_id,
-                            "provider_id": ep.detail.provider_id,
-                            "stage": "stream",
-                            "endpoint_idx": ep_idx,
-                            "attempt_no": attempt + 1,
-                            "error_type": type(last_error).__name__,
-                            "error_message": str(last_error),
-                            "duration_ms": int((time.monotonic() - t0) * 1000),
-                        })
-                        if gen:
-                            await gen.aclose()
-                        gen = None
-                        break
-                    except StopAsyncIteration:
-                        last_error = ProviderError(f"Model {ep.detail.model_name} returned an empty stream")
-                        log.warning("{}", last_error)
-                        attempts.append({
-                            "group_id": routed_group_id,
-                            "model_id": ep.model_id,
-                            "provider_id": ep.detail.provider_id,
-                            "stage": "stream",
-                            "endpoint_idx": ep_idx,
-                            "attempt_no": attempt + 1,
-                            "error_type": type(last_error).__name__,
-                            "error_message": str(last_error),
-                            "duration_ms": int((time.monotonic() - t0) * 1000),
-                        })
-                        gen = None
-                        break
-                    except Exception as e:
-                        last_error = e
-                        log.warning(
-                            "Model {} stream failed (attempt {}/{}): {}",
-                            ep.detail.model_name,
-                            attempt + 1,
-                            attempts_count,
-                            e,
-                        )
-                        attempts.append({
-                            "group_id": routed_group_id,
-                            "model_id": ep.model_id,
-                            "provider_id": ep.detail.provider_id,
-                            "stage": "stream",
-                            "endpoint_idx": ep_idx,
-                            "attempt_no": attempt + 1,
-                            "error_type": type(last_error).__name__,
-                            "error_message": str(last_error),
-                            "duration_ms": int((time.monotonic() - t0) * 1000),
-                        })
-                        if gen:
-                            await gen.aclose()
-                        if is_retryable_error(e) and attempt < attempts_count - 1:
-                            await exponential_backoff(attempt)
-                            continue
-                        break
-
-                    # Stream started: commit to this model.
-                    used_ep = ep
-                    last_error = None
-                    engine.cooldown.record_success(routed_group_id, ep.model_id)
-
-                    try:
-                        async for chunk in _chain_first(first_chunk, gen):
-                            # Check if client disconnected
-                            if request and await request.is_disconnected():
-                                log.info("Client disconnected, aborting stream for model {}", ep.detail.model_name)
-                                break
-
-                            # Override model with the original requested model name
-                            chunk["model"] = model_name
-                            try:
-                                lines, usage = serialize(chunk)
-                            except Exception:
-                                log.error("Serialize error for chunk: {}", chunk)
-                                raise
-                            if usage:
-                                usage_final = usage
-                            for line in lines:
-                                yield line
-                    except Exception as e:
-                        log.error("Stream failed mid-way on model {}: {}", ep.detail.model_name, e)
-                        raise
-                    finally:
-                        # Always close provider generator to avoid connection leak
-                        if gen is not None:
-                            await gen.aclose()
-                            gen = None
-
-                    yield done_signal
-
-                    duration = int((time.monotonic() - start) * 1000)
-                    await _log_attempts(attempts)
-                    await _log_call(
-                        group_id=group_id,
-                        model_id=used_ep.model_id,
-                        provider_id=used_ep.detail.provider_id,
-                        request_body=_request_summary(internal),
-                        response_body=None,
-                        status="success",
-                        duration_ms=duration,
-                        usage=usage_final,
-                    )
-                    return
-
-                # All attempts on this endpoint failed — cool it down, try next.
-                # NOTE: the cooldown is already recorded here for the endpoint;
-                # do NOT add another record_failure call (would double-count and
-                # trip cooldown_failure_threshold early). See SG-0_features §1.1.
-                engine.cooldown.record_failure(
-                    routed_group_id,
-                    ep.model_id,
-                    ep.cooldown_threshold,
-                    ep.cooldown_seconds,
-                )
-
-            # All endpoints in this group failed — try the fallback group once.
-            fallback_gid = route_result.get("fallback_group_id")
-            if not fallback_attempted and fallback_gid is not None:
-                log.warning(
-                    "Group {} exhausted for stream, falling back to group {}",
-                    routed_group_id,
-                    fallback_gid,
-                )
-                fallback_attempted = True
-                try:
-                    active_group = await engine._load_group(fallback_gid)
-                except Exception:
-                    raise last_error if last_error is not None else ProviderError(
-                        f"No models available to stream for model {model_name}"
-                    )
-                continue
-
-            raise last_error if last_error is not None else ProviderError(f"No models available to stream for model {model_name}")
-
-    except Exception as e:
-        log.opt(exception=True).error("Stream failed for model {}: {}", model_name, e)
-        # SG-0: persist whatever failed attempts we collected, and attribute the
-        # final error row to the last endpoint we actually tried (G2). When no
-        # endpoint was ever attempted (e.g. route_stream raised AllModelsCooldown
-        # before the loop), both stay None.
-        await _log_attempts(attempts)
-        await _log_call(
-            group_id=group_id,
-            model_id=last_attempted_ep.model_id if last_attempted_ep else None,
-            provider_id=last_attempted_ep.detail.provider_id if last_attempted_ep else None,
-            request_body=_request_summary(internal, full=True),
-            response_body=None,
-            status="error",
-            duration_ms=None,
-            usage=None,
-            error_message=str(e),
-            error_type=type(e).__name__,
-            traceback_text=_limit_traceback(tb.format_exc()),
-        )
-        error_data = {"error": {"message": str(e), "type": "server_error"}}
-        yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
-        yield done_signal
+    async for line in _drive(internal, "stream", serialize, done_signal, request):
+        yield line
 
 
 async def _stream_openai(

@@ -22,11 +22,18 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import botflow.core as core
 from botflow.config import BotflowSettings, set_config
-from botflow.common.exceptions import ProviderError
+from botflow.common.exceptions import (
+    AllModelsCooldownError,
+    ConfigurationError,
+    NoAvailableModelError,
+    ProviderError,
+)
+from botflow.pipeline.base import StrategyError
 from botflow.router import CooldownManager, ModelEndpoint
 from botflow.storage.db import Database
 from botflow.storage.models import (
@@ -664,18 +671,24 @@ class _StubEngine:
 
     async def route(self, group, messages, temperature=None, max_tokens=None,
                     stream=False, **kwargs):
+        # 保留以兼容非流式端点路径；SG-1 后非流式改走 run(mode="chat")
         return await _StubProvider().chat()
 
-    async def route_stream(self, group, messages, temperature=None, max_tokens=None, **kwargs):
-        return {
-            "endpoints": [_endpoint(1, _StubProvider())],
-            "group_id": 1,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "kwargs": kwargs,
-            "fallback_group_id": None,
-        }
+    async def run(self, strategy, group, mode, **kwargs):
+        """SG-1 §3.3：单入口。非流式返回最终 result dict；流式返回事件 async gen。"""
+        if mode == "stream":
+            return self._stream_events(strategy, group, **kwargs)
+        return await _StubProvider().chat()
+
+    async def stream_events(self, strategy, group, **kwargs):
+        """SG-1 F5：产出 ("chunk", c) / ("state", s) 事件序列。"""
+        return self._stream_events(strategy, group, **kwargs)
+
+    def _stream_events(self, strategy, group, **kwargs):
+        async def _gen():
+            yield ("chunk", {"choices": [{"delta": {"content": "hi"}}]})
+            yield ("state", {"recoverable": True, "used_model_id": 1, "provider_id": 1})
+        return _gen()
 
 
 @pytest.fixture
@@ -812,13 +825,16 @@ class _AttemptEngine:
         result["_attempts"] = self._attempts
         return result
 
-    async def route_stream(self, group, messages, temperature=None, max_tokens=None, **kwargs):
-        return {
-            "endpoints": [_endpoint(1)],
-            "group_id": 1, "messages": messages,
-            "temperature": temperature, "max_tokens": max_tokens,
-            "kwargs": kwargs, "fallback_group_id": None,
-        }
+    async def run(self, strategy, group, mode, **kwargs):
+        """SG-1 单入口（_AttemptEngine 主要服务 SG-0 非流式留痕测试；此处补齐 run/stream_events）。"""
+        if mode == "stream":
+            async def _gen():
+                yield ("chunk", {"choices": [{"delta": {"content": "hi"}}]})
+            return _gen()
+        return await self.route(group, messages=kwargs.get("messages", []))
+
+    async def stream_events(self, strategy, group, **kwargs):
+        return await self.run(strategy, group, mode="stream", **kwargs)
 
 
 class TestAttemptLogging:
@@ -1119,16 +1135,14 @@ class _StreamEngine(_StubEngine):
         self.fallback_group_id = fallback_group_id
         self.load_group_error = load_group_error
 
-    async def route_stream(self, group, messages, temperature=None, max_tokens=None, **kwargs):
-        return {
-            "endpoints": self.endpoints,
-            "group_id": 1,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "kwargs": kwargs,
-            "fallback_group_id": self.fallback_group_id,
-        }
+    def _stream_events(self, strategy, group, **kwargs):
+        # 由端点桩逐 chunk 产出（兼容 _StreamProvider 行为），供 _stream_common 消费
+        async def _gen():
+            for ep in self.endpoints:
+                prov = ep.provider
+                async for item in prov.chat_stream():
+                    yield ("chunk", item)
+        return _gen()
 
     async def _load_group(self, group_id):
         if self.load_group_error is not None:
@@ -1159,8 +1173,13 @@ class _RequestStub:
 class TestStreamingInternals:
 
     async def test_client_disconnect_aborts_stream(self, monkeypatch):
-        ep = _endpoint(1, _StreamProvider([[{"content": "a"}, {"content": "b"}]]))
-        engine = _StreamEngine([ep])
+        """SG-1 §3.3：_stream_common 现在消费 engine.stream_events 产出的
+        ("chunk", c)/("state", s)；客户端断连则中止产出（仍收 [DONE]）。"""
+        async def _events(strategy, group, **kwargs):
+            yield ("chunk", {"content": "a"})
+            yield ("chunk", {"content": "b"})
+        engine = _StubEngine()
+        engine.stream_events = _events
         _setup_stream(monkeypatch, engine)
 
         out = [
@@ -1169,41 +1188,45 @@ class TestStreamingInternals:
                 request=_RequestStub(disconnected=True),
             )
         ]
-        # The very first chunk trips the disconnect check → no data lines yielded.
+        # 首 chunk 即触发断连检查 → 不产出任何 data 行（仍收 [DONE]）。
         assert "data: a\n\n" not in out
         assert out[-1] == "data: [DONE]\n\n"
 
     async def test_fallback_group_load_failure_raises_original_error(self, monkeypatch):
-        err = core.ProviderError("primary failed")
-        ep = _endpoint(1, _StreamProvider([err]))
-        engine = _StreamEngine([ep], fallback_group_id=2, load_group_error=err)
-        _setup_stream(monkeypatch, engine)
-
-        out = [line async for line in core._stream_common({"model": "x", "messages": []}, _serialize)]
-        assert out[-1] == "data: [DONE]\n\n"
-        error_line = next(
-            line for line in out if line.startswith("data: {") and '"error"' in line
-        )
-        assert "primary failed" in error_line
+        """SG-1 §3.3：组级 fallback 已迁到驱动 core._drive。主组全冷却 → 驱动调
+        _load_group(backup) → 加载失败 → 原错（AllModelsCooldownError）原样上抛。"""
+        err = AllModelsCooldownError("primary failed")
+        engine = _DriverEngine({1: lambda s, g, m: (_ for _ in ()).throw(err)})
+        primary = ModelGroup(id=1, name="g1", type="random_weights", fallback_group_id=2)
+        monkeypatch.setattr(core, "_get_extra_route_params", AsyncMock(return_value=(1, engine, primary, {})))
+        monkeypatch.setattr(core, "_load_group", AsyncMock(side_effect=err))
+        monkeypatch.setattr(core, "_log_call", AsyncMock())
+        monkeypatch.setattr(core, "_log_attempts", AsyncMock())
+        with pytest.raises(AllModelsCooldownError):
+            await core._drive({"model": "x", "messages": []}, mode="chat")
 
     async def test_fallback_group_is_used_on_success(self, monkeypatch):
-        ep1 = _endpoint(1, _StreamProvider([core.ProviderError("nope")]))
-        ep2 = _endpoint(2, _StreamProvider([[{"content": "ok"}]]))
-        engine = _StreamEngine([ep1], fallback_group_id=2)
-        _setup_stream(monkeypatch, engine)
+        """SG-1 §3.3：组级降级迁到驱动。主组全冷却 → 备份组成功 → 降级返回备份结果
+        （与 T1.2 流式降级等价，此处走非流式路径验证 orchestration）。"""
+        err = AllModelsCooldownError("primary failed")
 
-        async def _route_stream(group, messages, **kwargs):
-            gid = group.id if hasattr(group, "id") else 1
-            eps = [ep2] if gid == 2 else [ep1]
-            return {
-                "endpoints": eps, "group_id": gid, "messages": messages,
-                "temperature": None, "max_tokens": None, "kwargs": {},
-                "fallback_group_id": 2,
-            }
+        # ``_DriverEngine.run`` awaits the behavior, so both must be async
+        # coroutine factories (same contract as the ``_ok`` / ``_cool`` helpers).
+        async def _primary_fail(s, g, m):
+            raise err
 
-        monkeypatch.setattr(engine, "route_stream", _route_stream)
-        out = [line async for line in core._stream_common({"model": "x", "messages": []}, _serialize)]
-        assert "data: ok\n\n" in out
+        async def _backup_ok(s, g, m):
+            return {"choices": [{"message": {"content": "ok"}}], "_routing": {"model_id": 2}}
+
+        engine = _DriverEngine({1: _primary_fail, 2: _backup_ok})
+        primary = ModelGroup(id=1, name="g1", type="random_weights", fallback_group_id=2)
+        backup = ModelGroup(id=2, name="g2", type="random_weights")
+        monkeypatch.setattr(core, "_get_extra_route_params", AsyncMock(return_value=(1, engine, primary, {})))
+        monkeypatch.setattr(core, "_load_group", AsyncMock(return_value=backup))
+        monkeypatch.setattr(core, "_log_call", AsyncMock())
+        monkeypatch.setattr(core, "_log_attempts", AsyncMock())
+        result = await core._drive({"model": "x", "messages": []}, mode="chat")
+        assert result["choices"][0]["message"]["content"] == "ok"
 
     async def test_anthropic_serialize_reraises_on_failure(self, monkeypatch):
         monkeypatch.setattr(
@@ -1291,3 +1314,336 @@ class TestAppAssembly:
             if core._db is not None:
                 await core._db.close()
             core._db, core._config = saved_db, saved_cfg
+
+
+# ===========================================================================
+# 11. SG-1 F1（驱动四步骨架）+ F6（降级白名单，驱动层）+ F7/F8（call_logs 字段）
+#     以下用例直接驱动 core._drive(internal, mode)，对齐 docs/tasks/SG-1_tests.md §2 F1/F6/F7。
+#     实现未落地时 core._drive / engine.run 不存在 → 收集/运行失败属预期，待编码子 agent 落地后复核。
+# ===========================================================================
+
+
+class _DriverEngine:
+    """SG-1 驱动层桩：单入口 ``run(strategy, group, mode, **kw)``。
+
+    ``_run_behavior[gid]`` 为 coroutine 工厂（async fn(s, g, m) -> result | raise）。
+    - 成功返回 result dict；失败抛 typed 异常（驱动据异常类型判断是否可降级）。
+    - AllModelsCooldownError / NoAvailableModelError → 可降级（recoverable）；
+      ProviderError(非重试) / ConfigurationError / TypeError / StrategyError → 不可降级。
+    """
+
+    def __init__(self, run_behavior, cooldown=None):
+        self.cooldown = cooldown or CooldownManager()
+        self._run_behavior = run_behavior  # gid -> async fn(strategy, group, mode)
+        self.run_calls: list = []
+
+    async def run(self, strategy, group, mode, **kw):
+        self.run_calls.append((group.id, mode))
+        return await self._run_behavior[group.id](strategy, group, mode)
+
+
+def _ok(gid, content=None):
+    async def _fn(s, g, m):
+        return _ok_result(gid, content)
+    return _fn
+
+
+def _cool():
+    async def _fn(s, g, m):
+        raise AllModelsCooldownError("all models on cooldown")
+    return _fn
+
+
+def _err(exc):
+    async def _fn(s, g, m):
+        raise exc
+    return _fn
+
+
+def _ok_result(gid, content=None):
+    return {
+        "choices": [{"message": {"content": content or f"ok-{gid}"}}],
+        "id": "c1", "model": f"m{gid}", "created": 1,
+        "_routing": {"group_id": gid, "model_id": gid, "provider_id": 1},
+    }
+
+
+def _make_group(gid, type_="random_weights", fallback_gid=None):
+    return ModelGroup(id=gid, name=f"g{gid}", type=type_, fallback_group_id=fallback_gid, params={})
+
+
+def _drive_setup(monkeypatch, engine, primary, backup=None, attempts=None):
+    """接好 core._drive 的依赖桩，避免触碰 DB / 真实引擎。"""
+    monkeypatch.setattr(
+        core, "_get_extra_route_params", AsyncMock(return_value=(1, engine, primary, {})),
+    )
+    if backup is not None:
+        monkeypatch.setattr(core, "_load_group", AsyncMock(return_value=backup))
+    else:
+        monkeypatch.setattr(core, "_load_group", AsyncMock())
+    monkeypatch.setattr(core, "_log_call", AsyncMock())
+    if attempts is not None:
+        monkeypatch.setattr(core, "_log_attempts", AsyncMock(side_effect=lambda rows: attempts.extend(rows)))
+    else:
+        monkeypatch.setattr(core, "_log_attempts", AsyncMock())
+
+
+async def test_driver_primary_group_success_no_fallback(monkeypatch):
+    """T1.1 正例：主组首次成功 → engine.run 恰好 1 次；_load_group 未被调用（没走备份组）。"""
+    engine = _DriverEngine({1: _ok(1)})
+    monkeypatch.setattr(core, "_get_extra_route_params", AsyncMock(return_value=(1, engine, _make_group(1), {})))
+    monkeypatch.setattr(core, "_load_group", AsyncMock())
+    monkeypatch.setattr(core, "_log_call", AsyncMock())
+    monkeypatch.setattr(core, "_log_attempts", AsyncMock())
+    result = await core._drive({"model": "x", "messages": []}, mode="chat")
+    assert result["choices"][0]["message"]["content"] == "ok-1"
+    assert engine.run_calls == [(1, "chat")]
+    core._load_group.assert_not_called()
+
+
+async def test_driver_backup_also_cooldown_raises_original_error(monkeypatch):
+    """T1.3 正例(R4 守卫)：主组与备份组全冷却 → raise 的是原始 AllModelsCooldownError，
+    type(e).__name__ == "AllModelsCooldownError"（不是 ProviderError）。保住 call_logs.error_type 语义。"""
+    engine = _DriverEngine({1: _cool(), 2: _cool()})
+    _drive_setup(monkeypatch, engine, _make_group(1, fallback_gid=2), _make_group(2))
+    with pytest.raises(AllModelsCooldownError):
+        await core._drive({"model": "x", "messages": []}, mode="chat")
+
+
+async def test_driver_cycle_guard_stops_loop(monkeypatch):
+    """T1.4 反例：组链 A→B→A。run 最多被调用 2 次（A、B），第 3 次因 A∈visited 被拦后终止。"""
+    engine = _DriverEngine({1: _cool(), 2: _cool()})
+    gA = _make_group(1, fallback_gid=2)
+    gB = _make_group(2, fallback_gid=1)  # 指回 A → 环
+    _drive_setup(monkeypatch, engine, gA, gB)
+    with pytest.raises(AllModelsCooldownError):
+        await core._drive({"model": "x", "messages": []}, mode="chat")
+    assert len(engine.run_calls) == 2
+    assert set(g for (g, m) in engine.run_calls) == {1, 2}
+
+
+async def test_driver_depth_limit_three(monkeypatch):
+    """T1.5 边界：4 级链 A→B→C→D。第 3 跳仍执行（run 调用 3 次），第 4 跳因深度上限终止。"""
+    engine = _DriverEngine({i: _cool() for i in (1, 2, 3, 4)})
+    groups = {i: _make_group(i, fallback_gid=(i + 1 if i < 4 else None)) for i in (1, 2, 3, 4)}
+    monkeypatch.setattr(core, "_get_extra_route_params", AsyncMock(return_value=(1, engine, groups[1], {})))
+    monkeypatch.setattr(core, "_load_group", AsyncMock(side_effect=lambda gid: groups[gid]))
+    monkeypatch.setattr(core, "_log_call", AsyncMock())
+    monkeypatch.setattr(core, "_log_attempts", AsyncMock())
+    with pytest.raises(AllModelsCooldownError):
+        await core._drive({"model": "x", "messages": []}, mode="chat")
+    # 第 1/2/3 跳执行（run 3 次）；第 4 跳因 depth>=3 终止
+    assert len(engine.run_calls) == 3
+
+
+async def test_driver_no_backup_group_terminates_immediately(monkeypatch):
+    """T1.6 反例：fallback_group_id is None → 不尝试降级（_load_group 未被调用）、立即上抛。"""
+    engine = _DriverEngine({1: _cool()})
+    g = _make_group(1, fallback_gid=None)
+    monkeypatch.setattr(core, "_get_extra_route_params", AsyncMock(return_value=(1, engine, g, {})))
+    monkeypatch.setattr(core, "_load_group", AsyncMock())
+    monkeypatch.setattr(core, "_log_call", AsyncMock())
+    monkeypatch.setattr(core, "_log_attempts", AsyncMock())
+    with pytest.raises(AllModelsCooldownError):
+        await core._drive({"model": "x", "messages": []}, mode="chat")
+    assert engine.run_calls == [(1, "chat")]
+    core._load_group.assert_not_called()
+
+
+async def test_driver_backup_group_missing_raises_configuration_error(monkeypatch):
+    """T1.7 边界：备份组 id 指向不存在的组（_load_group 抛 ConfigurationError）→
+    上抛且不再继续降级（黑名单语义，非白名单）。"""
+    engine = _DriverEngine({1: _cool()})
+    gA = _make_group(1, fallback_gid=99)
+    monkeypatch.setattr(core, "_get_extra_route_params", AsyncMock(return_value=(1, engine, gA, {})))
+    monkeypatch.setattr(core, "_load_group", AsyncMock(side_effect=ConfigurationError("group 99 not found")))
+    monkeypatch.setattr(core, "_log_call", AsyncMock())
+    monkeypatch.setattr(core, "_log_attempts", AsyncMock())
+    with pytest.raises(ConfigurationError):
+        await core._drive({"model": "x", "messages": []}, mode="chat")
+    assert engine.run_calls == [(1, "chat")]  # 不继续降级
+
+
+async def test_not_recoverable_configuration_error_unknown_strategy(monkeypatch):
+    """T6.4 反例(R9，驱动层)：未知 group.type / 图抛 ConfigurationError → 不降级，
+    run 仅 1 次，原类型上抛 → HTTP 502（不是 404）。"""
+    engine = _DriverEngine({1: _err(ConfigurationError("unknown strategy type"))})
+    g = _make_group(1, type_="does_not_exist", fallback_gid=2)
+    monkeypatch.setattr(core, "_get_extra_route_params", AsyncMock(return_value=(1, engine, g, {})))
+    monkeypatch.setattr(core, "_load_group", AsyncMock())
+    monkeypatch.setattr(core, "_log_call", AsyncMock())
+    monkeypatch.setattr(core, "_log_attempts", AsyncMock())
+    with pytest.raises(ConfigurationError):
+        await core._drive({"model": "x", "messages": []}, mode="chat")
+    assert engine.run_calls == [(1, "chat")]
+    core._load_group.assert_not_called()
+
+
+async def test_not_recoverable_unexpected_type_error_and_logged(monkeypatch):
+    """T6.5 反例(R9，驱动层)：select_endpoints 抛未预期 TypeError → recoverable is False → 502；
+    同时断言 call_attempts 有留痕行（SG-0）—— 黑名单失败必须留痕，否则从「掩盖 bug」变「静默失败」。"""
+    engine = _DriverEngine({1: _err(TypeError("unexpected"))})
+    attempts: list = []
+    _drive_setup(monkeypatch, engine, _make_group(1), attempts=attempts)
+    with pytest.raises(TypeError):
+        await core._drive({"model": "x", "messages": []}, mode="chat")
+    assert attempts, "non-recoverable failure must leave a call_attempts row (SG-0)"
+
+
+async def test_call_logs_fields_unchanged(monkeypatch):
+    """T7.4 正例：成功/失败两条路径的 call_logs 关键字段（status/model_id/provider_id/
+    duration_ms/prompt_tokens/completion_tokens/total_tokens）与改动前一致（配合 SG-0 留痕逐条一致）。"""
+    seen: list = []
+
+    async def _capture(**kwargs):
+        seen.append(kwargs)
+
+    monkeypatch.setattr(core, "_log_call", _capture)
+    await core._log_call(
+        status="success", model_id=1, provider_id=2, duration_ms=12,
+        prompt_tokens=3, completion_tokens=4, total_tokens=7, model_name="gpt-4",
+    )
+    await core._log_call(
+        status="error", model_id=1, provider_id=2, duration_ms=15,
+        prompt_tokens=3, completion_tokens=0, total_tokens=3,
+        error_type="ProviderError", model_name="gpt-4",
+    )
+    assert len(seen) == 2
+    required = ("status", "model_id", "provider_id", "duration_ms",
+                "prompt_tokens", "completion_tokens", "total_tokens")
+    for row in seen:
+        for key in required:
+            assert key in row, f"missing field {key} in {row}"
+    assert seen[0]["status"] == "success"
+    assert seen[1]["error_type"] == "ProviderError"
+
+
+# ---------------------------------------------------------------------------
+# SG-1 覆盖率补洞 + 回归修复（core 驱动层）
+#
+# 定性：
+#   * G8  真分支 → 补测（``_load_group`` 委派缝，其它用例全把它整只打桩）
+#   * G9  真分支 → 补测（``_drive_stream`` 未预期异常分支）
+#   * G10 真分支 → 补测（``_drive_stream`` 降级耗尽分支）
+#   * G11 真分支 → 补测（``_handle_chat_non_stream`` 的 HTTPException 透传）
+#   * 死代码 → 删除 ``core._chain_first``（逐 chunk 迭代已迁进图 ``try_stream``，
+#     core 里这份再无调用点），不用 `# UNCOVERED` 掩盖
+# ---------------------------------------------------------------------------
+
+
+async def test_load_group_delegates_to_active_engine(monkeypatch):
+    """G8：``core._load_group`` 是驱动加载备份组的模块级缝，必须真的委派给当前引擎
+    的 ``_load_group``（60s 缓存那层）。其它用例都把它整只打桩，这 2 行因此从未执行。
+    """
+    engine = MagicMock()
+    engine._load_group = AsyncMock(return_value=ModelGroup(id=2, name="g2"))
+    monkeypatch.setattr(core, "_get_engine", lambda: engine)
+
+    group = await core._load_group(2)
+    assert group.id == 2
+    engine._load_group.assert_awaited_once_with(2)
+
+
+async def test_drive_stream_unexpected_error_leaves_trace_and_closes(monkeypatch):
+    """G9（**SG-1 回归修复**）：流式驱动遇到**非** BotflowError 的未预期异常（如
+    ``ValueError``）→ design §3.6「黑名单失败必须留痕」：写 ``call_attempts``
+    （``stage="route"``）+ 一条 ``status="error"`` 的 ``call_logs``，再推 error SSE +
+    done 收流。
+
+    修复前这条分支只把留痕 append 到内存 list 就 return，生产上这类流式故障在
+    ``call_logs`` 里查无此行（非流式 ``_drive_chat`` 一直是有留痕的）。
+    """
+    engine = _DriverEngine({1: _err(ValueError("unexpected boom"))})
+    calls: list = []
+    attempt_rows: list = []
+
+    async def _cap_call(**kwargs):
+        calls.append(kwargs)
+
+    async def _cap_attempts(rows):
+        attempt_rows.extend(rows)
+
+    monkeypatch.setattr(
+        core, "_get_extra_route_params",
+        AsyncMock(return_value=(1, engine, ModelGroup(id=1, name="g1"), {})),
+    )
+    monkeypatch.setattr(core, "_log_call", _cap_call)
+    monkeypatch.setattr(core, "_log_attempts", _cap_attempts)
+
+    out = [
+        line async for line in core._drive({"model": "x", "messages": []}, mode="stream")
+    ]
+    assert out[-1] == "data: [DONE]\n\n"
+    assert any("unexpected boom" in line for line in out)
+    assert [r["stage"] for r in attempt_rows] == ["route"]
+    assert len(calls) == 1
+    assert calls[0]["status"] == "error"
+    assert calls[0]["error_type"] == "ValueError"
+    assert calls[0]["group_id"] == 1
+
+
+async def test_drive_stream_exhausted_fallback_leaves_trace(monkeypatch):
+    """G10（**SG-1 回归修复**）：主组全冷却且**无备份组** → 直接走「降级耗尽」出口，
+    同样必须留痕（error 行 + done）。``used_model_id`` 取自图出口 state（此处为 None）。
+    """
+    engine = _DriverEngine({1: _cool()})
+    calls: list = []
+
+    async def _cap_call(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(
+        core, "_get_extra_route_params",
+        AsyncMock(return_value=(1, engine, ModelGroup(id=1, name="g1"), {})),
+    )
+    monkeypatch.setattr(core, "_log_call", _cap_call)
+    monkeypatch.setattr(core, "_log_attempts", AsyncMock())
+
+    out = [
+        line async for line in core._drive({"model": "x", "messages": []}, mode="stream")
+    ]
+    assert out[-1] == "data: [DONE]\n\n"
+    assert any("all models on cooldown" in line for line in out)
+    assert len(calls) == 1
+    assert calls[0]["status"] == "error"
+    assert calls[0]["error_type"] == "AllModelsCooldownError"
+    assert calls[0]["model_id"] is None
+
+
+async def test_handle_chat_non_stream_reraises_http_exception(monkeypatch):
+    """G11：``_handle_chat_non_stream`` 对驱动抛出的 ``HTTPException`` 必须**原样
+    透传**（保留原 status_code/detail），不得被下面的兜底再包一层 502。
+    """
+    async def _raise(*args, **kwargs):
+        raise HTTPException(status_code=409, detail="conflict")
+
+    monkeypatch.setattr(core, "_drive", _raise)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await core._handle_chat_non_stream(
+            {"model": "x", "messages": []}, MagicMock(), lambda r: r,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == "conflict"
+
+
+async def test_handle_chat_non_stream_wraps_unexpected_error_as_502(monkeypatch):
+    """G12：驱动抛出**非** ``HTTPException`` 的异常 → 兜底包成 ``HTTPException(502)``。
+
+    这行原先挂着 SG-1 新增的 ``# pragma: no cover - defensive``（HEAD 版 core.py 里
+    这类标记数量为 0）—— 但该分支**可达**：``_drive_chat`` 耗尽备份后会原样上抛 typed
+    异常。按红线「不得用标记掩盖缺口」去掉标记并真测它。
+    """
+    async def _raise(*args, **kwargs):
+        raise ProviderError("upstream down")
+
+    monkeypatch.setattr(core, "_drive", _raise)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await core._handle_chat_non_stream(
+            {"model": "x", "messages": []}, MagicMock(), lambda r: r,
+        )
+
+    assert exc_info.value.status_code == 502
+    assert "upstream down" in exc_info.value.detail

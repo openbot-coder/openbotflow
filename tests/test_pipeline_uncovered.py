@@ -1,7 +1,7 @@
 """补充覆盖：pipeline 层的分支缺口。
 
 - ``langgraph_engine``：节点级分支（首轮 visited 追加、fallback 组缺失、
-  fatal_error 短路、langgraph 策略拒绝、``_finalize_error`` 的 Exception/dict 形态、
+  fatal_error 短路、langgraph 策略拒绝、``finalize_error`` 的 Exception/dict 形态、
   ``_route_after_call`` 的 fatal_error 分支、``route()`` 在 graph 未产出 result 时的兜底）
 - ``strategies``：RoundRobin / Sequential 的「无模型」「全部冷却」抛出
 - ``_shared``：``_apply_model_extra_config`` 从 kwargs 剥离 reasoning 参数
@@ -29,10 +29,7 @@ from botflow.pipeline.langgraph_engine import (
     GraphContext,
     LangGraphEngine,
     RouteState,
-    _finalize_error,
-    _load_and_select,
-    _resolve_group,
-    _route_after_call,
+    finalize_error,
 )
 from botflow.pipeline.strategies import (
     RandomWeightsStrategy,
@@ -93,83 +90,33 @@ async def _invoke_node(node, state: dict, ctx: GraphContext) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# _resolve_group
+# NOTE (SG-1 §3.2): 以下节点级用例已由图内组级降级迁到驱动 core._drive：
+#   test_resolve_group_first_pass_appends_unvisited_group → T1.4（visited 由驱动维护）
+#   test_resolve_group_fallback_group_not_found_is_fatal  → T1.7（备份组缺失 → ConfigurationError）
+# 同时 §3.1 删除 fatal_error 短路用例（fatal_error 退出历史，配置错误改由
+# recoverable=False 表达）：
+#   test_load_and_select_short_circuits_when_fatal_error_present
+#   test_load_and_select_rejects_langgraph_strategy → T6.4（拒绝迁到驱动步骤②）
+#   test_route_after_call_fatal_error_routes_to_error（_route_after_call 的 fatal_error 分支消失）
+# SG-1 后 _resolve_group / _load_and_select / _route_after_call 不再存在，
+# 上述旧用例已删除，等价语义由 T1.x / T6.x 在驱动层与图出口覆盖。
 # ---------------------------------------------------------------------------
 
 
-async def test_resolve_group_first_pass_appends_unvisited_group():
-    """首次进入时若 group.id 不在 visited 里，必须补登记（防环）。"""
-    ctx = _ctx()
-    state = {
-        "_initialized": False,
-        "group": _group(7),
-        "visited_groups": [],
-        "fallback_depth": 0,
-    }
-    out = await _invoke_node(_resolve_group, state, ctx)
-    assert out["visited_groups"] == [7]
-    assert out["_initialized"] is True
-
-
-async def test_resolve_group_fallback_group_not_found_is_fatal():
-    db = MagicMock(spec=Database)
-    db.get_group = AsyncMock(return_value=None)
-    state = {
-        "_initialized": True,
-        "fallback_group_id": 5,
-        "visited_groups": [1],
-        "fallback_depth": 0,
-    }
-    out = await _invoke_node(_resolve_group, state, _ctx(db))
-    assert out["fatal_error"] == "Fallback group 5 not found"
-
-
 # ---------------------------------------------------------------------------
-# _load_and_select
+# finalize_error
 # ---------------------------------------------------------------------------
 
 
-async def test_load_and_select_short_circuits_when_fatal_error_present():
-    """fatal_error 已置位时直接放行（交给路由函数走 error）。"""
-    state = {"fatal_error": "Fallback chain too deep", "group": _group()}
-    out = await _invoke_node(_load_and_select, state, _ctx())
-    assert out["fatal_error"] == "Fallback chain too deep"
-    assert "endpoints" not in out
-
-
-async def test_load_and_select_rejects_langgraph_strategy():
-    state = {
-        "group": _group(type_="langgraph"),
-        "messages": [{"role": "user", "content": "hi"}],
-        "extra_kwargs": {},
-    }
-    with pytest.raises(ConfigurationError, match="multi-step workflow"):
-        await _invoke_node(_load_and_select, state, _ctx())
-
-
-# ---------------------------------------------------------------------------
-# _finalize_error
-# ---------------------------------------------------------------------------
-
-
-async def test_finalize_error_uses_exception_message():
-    out = await _invoke_node(_finalize_error, {"fatal_error": RuntimeError("kaboom")}, _ctx())
+async def testfinalize_error_uses_exception_message():
+    out = await _invoke_node(finalize_error, {"error": RuntimeError("kaboom")}, _ctx())
     assert out["result"]["error"]["message"] == "kaboom"
     assert out["result"]["error"]["type"] == "server_error"
 
 
-async def test_finalize_error_uses_dict_message():
-    out = await _invoke_node(_finalize_error, {"error": {"message": "dict msg"}}, _ctx())
+async def testfinalize_error_uses_dict_message():
+    out = await _invoke_node(finalize_error, {"error": {"message": "dict msg"}}, _ctx())
     assert out["result"]["error"]["message"] == "dict msg"
-
-
-# ---------------------------------------------------------------------------
-# _route_after_call
-# ---------------------------------------------------------------------------
-
-
-def test_route_after_call_fatal_error_routes_to_error():
-    assert _route_after_call({"fatal_error": "boom"}) == "error"
 
 
 # ---------------------------------------------------------------------------

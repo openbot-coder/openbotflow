@@ -12,6 +12,7 @@ from botflow.common.exceptions import (
     NoAvailableModelError,
     ProviderError,
 )
+from botflow.pipeline.strategies import RandomWeightsStrategy
 from botflow.router import (
     CooldownManager,
     weighted_random_order,
@@ -273,10 +274,12 @@ class TestPipelineEngineRouting:
         with pytest.raises(NoAvailableModelError):
             await engine.route(group=group, messages=[{"role": "user", "content": "hi"}])
 
-    # -- streaming routing -------------------------------------------------
+    # -- streaming routing (SG-1 §3.3: route_stream 合并进 run(mode="stream")) ----
 
     @pytest.mark.asyncio
-    async def test_route_stream_returns_all_available(self, engine, mock_db):
+    async def test_route_stream_returns_all_available(self, engine, mock_db, monkeypatch):
+        """SG-1 §3.3：route_stream 合并进 run(mode="stream")。选端点语义不变 ——
+        经由 spy 捕获 select_endpoints 的 RouteResult 来断言（run 返回事件流，不再回传选择字典）。"""
         group = self._make_group()
         mock_db.get_group.return_value = group
         mock_db.get_group_models.return_value = [
@@ -285,18 +288,53 @@ class TestPipelineEngineRouting:
         ]
         mock_db.get_provider.return_value = Provider(id=1, name="p", provider_type="openai")
 
-        msgs = [{"role": "user", "content": "hi"}]
-        result = await engine.route_stream(group=group, messages=msgs, temperature=0.5, max_tokens=100, tools=[{"type": "function"}])
+        captured: dict = {}
+        orig = RandomWeightsStrategy.select_endpoints
 
-        assert result["group_id"] == 1
-        assert {ep.model_id for ep in result["endpoints"]} == {1, 2}
-        assert result["temperature"] == 0.5
-        assert result["max_tokens"] == 100
-        assert result["kwargs"] == {"tools": [{"type": "function"}]}
-        assert result["messages"] == msgs
+        async def _spy(self_, *args, **kwargs):
+            res = await orig(self_, *args, **kwargs)
+            captured.update(
+                endpoints=res.endpoints, temperature=res.temperature,
+                max_tokens=res.max_tokens, extra_kwargs=res.extra_kwargs,
+                messages=res.messages,
+            )
+            return res
+
+        monkeypatch.setattr(RandomWeightsStrategy, "select_endpoints", _spy)
+
+        # 阻止真实流式网络调用：selection 已捕获后，在 ``try_stream`` 的**最早期**抛哨兵中断。
+        # SG-1 后流式不再经过 ``call_llm``（端点级流式调用在图内直接走 provider.chat_stream），
+        # 故中止点从 ``call_llm`` 改到 ``get_stream_writer()``：它在任何 provider 调用之前被调用，
+        # 且 ``try_stream`` 只兜底 ``RuntimeError``，``_SelectionDone`` 会正常外泄。
+        class _SelectionDone(Exception):
+            pass
+
+        def _abort_writer():
+            raise _SelectionDone()
+
+        monkeypatch.setattr(
+            "botflow.pipeline.langgraph_engine.get_stream_writer", _abort_writer,
+        )
+
+        msgs = [{"role": "user", "content": "hi"}]
+        with pytest.raises(_SelectionDone):
+            # SG-1: run(mode="stream") 是 async def（与 core._drive 的 await 契约一致），
+            # 先 await 拿到事件异步生成器，再 async for 迭代。
+            async for _ in await engine.run(
+                group=group, mode="stream", messages=msgs,
+                temperature=0.5, max_tokens=100, tools=[{"type": "function"}],
+            ):
+                pass
+
+        assert {ep.model_id for ep in captured["endpoints"]} == {1, 2}
+        assert captured["temperature"] == 0.5
+        assert captured["max_tokens"] == 100
+        assert captured["extra_kwargs"] == {"tools": [{"type": "function"}]}
+        assert captured["messages"] == msgs
 
     @pytest.mark.asyncio
-    async def test_route_stream_excludes_cooldown_models(self, engine, mock_db):
+    async def test_route_stream_excludes_cooldown_models(self, engine, mock_db, monkeypatch):
+        """SG-1 §3.3：冷却模型被过滤（选端点语义不变，经 spy 捕获断言）。"""
         cm = engine.cooldown
         cm.record_failure(1, 2, 1, 60)
         group = self._make_group()
@@ -307,18 +345,37 @@ class TestPipelineEngineRouting:
         ]
         mock_db.get_provider.return_value = Provider(id=1, name="p", provider_type="openai")
 
-        result = await engine.route_stream(group=group, messages=[{"role": "user", "content": "hi"}])
-        assert [ep.model_id for ep in result["endpoints"]] == [1]
+        captured: dict = {}
+        orig = RandomWeightsStrategy.select_endpoints
+
+        async def _spy(self_, *args, **kwargs):
+            res = await orig(self_, *args, **kwargs)
+            captured["endpoints"] = res.endpoints
+            return res
+
+        monkeypatch.setattr(RandomWeightsStrategy, "select_endpoints", _spy)
+
+        class _SelectionDone(Exception):
+            pass
+
+        def _abort_writer():
+            raise _SelectionDone()
+
+        # 见 test_route_stream_returns_all_available：流式中止点已从 call_llm 迁到
+        # get_stream_writer()（流式图不再调用 call_llm）。
+        monkeypatch.setattr(
+            "botflow.pipeline.langgraph_engine.get_stream_writer", _abort_writer,
+        )
+
+        with pytest.raises(_SelectionDone):
+            async for _ in await engine.run(group=group, mode="stream", messages=[{"role": "user", "content": "hi"}]):
+                pass
+        assert [ep.model_id for ep in captured["endpoints"]] == [1]
 
     @pytest.mark.asyncio
     async def test_route_stream_all_on_cooldown_raises_typed_error(self, engine, mock_db):
-        """design.md §3.5: the streaming path only selects endpoints.
-
-        Group-level fallback is owned by the caller (``core._stream_common``,
-        attempted once via ``fallback_group_id``), so a fully cooled-down group
-        must surface as a typed ``AllModelsCooldownError`` rather than being
-        silently resolved inside ``route_stream()``.
-        """
+        """SG-1 §3.2 第 7 组：route_stream 合并进 run(mode="stream") 后，冷却组必须仍以
+        类型化 ``AllModelsCooldownError`` 上抛（不再由图内 fallback 静默消化）。"""
         cm = engine.cooldown
         cm.record_failure(1, 1, 1, 60)
         group = self._make_group(group_id=1, fallback_group_id=4)
@@ -327,10 +384,10 @@ class TestPipelineEngineRouting:
         )
         mock_db.get_provider.return_value = Provider(id=1, name="p", provider_type="openai")
 
-        # fallback_group_id is still handed to the caller on the success path,
-        # so core.py can fall back when the *stream* itself fails.
         with pytest.raises(AllModelsCooldownError):
-            await engine.route_stream(group=group, messages=[{"role": "user", "content": "hi"}])
+            # run(mode="stream") 先 await 做选端点（此处全冷却 → 立即抛类型化异常）
+            async for _ in await engine.run(group=group, mode="stream", messages=[{"role": "user", "content": "hi"}]):
+                pass
 
 
 # ---------------------------------------------------------------------------

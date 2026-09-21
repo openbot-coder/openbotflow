@@ -50,7 +50,8 @@ NON_STREAM_RESPONSE = {
 
 
 class StubEngine:
-    """Lightweight stand-in for PipelineEngine used by core._handle_chat_* and _stream_common."""
+    """SG-1 §3.3：轻量 PipelineEngine 替身，单入口 ``run`` / ``stream_events``。
+    非流式返回最终 result dict；流式返回 ("chunk", c)/("state", s) 事件序列。"""
 
     def __init__(self):
         self.kwargs = None
@@ -58,24 +59,36 @@ class StubEngine:
         self.cooldown = CooldownManager()
 
     async def route(self, group, messages, temperature=None, max_tokens=None, stream=False, **kwargs):
+        # 保留以兼容非流式端点路径
         self.kwargs = kwargs
         if self.exc is not None:
             raise self.exc
         return dict(NON_STREAM_RESPONSE)
 
-    async def route_stream(self, group, messages, temperature=None, max_tokens=None, **kwargs):
+    async def run(self, strategy, group, mode, **kwargs):
+        """SG-1 单入口：非流式返回 result dict；流式返回事件 async gen。"""
+        self.kwargs = kwargs
         if self.exc is not None:
             raise self.exc
-        ep = _make_stream_endpoint()
-        return {
-            "endpoints": [ep],
-            "group_id": 1,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "kwargs": kwargs,
-            "fallback_group_id": None,
-        }
+        if mode == "stream":
+            return self._stream_events(kwargs.get("messages"))
+        return dict(NON_STREAM_RESPONSE)
+
+    async def stream_events(self, strategy, group, **kwargs):
+        return self._stream_events(kwargs.get("messages"))
+
+    def _stream_events(self, messages=None):
+        async def _gen():
+            # 首个（也是唯一的）delta 带 role 且 finish_reason="stop" —— 真实 provider
+            # 的「完整短流」就是这个形状：
+            #   * role 让 anthropic 序列化产出 message_start（其中含被传输层覆盖后的
+            #     model 名，T5.1 断言它出现）；
+            #   * finish_reason 让 responses 序列化产出 response.completed 终态事件。
+            yield ("chunk", {"choices": [{"index": 0, "delta": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}]})
+            # 已推过 chunk 的流是「已提交」的，recoverable 必须为 False，
+            # 否则 _drive_stream 会当成「组级失败」去降级（把成功流改写成 error SSE）。
+            yield ("state", {"recoverable": False, "used_model_id": 1, "provider_id": 2})
+        return _gen()
 
 
 # ---------------------------------------------------------------------------
@@ -243,3 +256,65 @@ async def test_get_engine_real(tmp_path):
         assert isinstance(engine, PipelineEngine)
     finally:
         core._db = None
+
+
+# ---------------------------------------------------------------------------
+# SG-1 F5 (T5.1) + F7 (T7.1)：传输层分离 / 归一
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("endpoint, payload_extra, terminator", [
+    ("/v1/chat/completions", {}, "data: [DONE]"),
+    ("/v1/completions", {"prompt": "hi"}, "data: [DONE]"),
+    ("/v1/messages", {}, "data: [DONE]"),
+    # Responses API 的终态是 response.completed，且**不发** OpenAI 的 [DONE]。
+    ("/v1/responses", {}, "event: response.completed"),
+])
+def test_stream_events_serialize_all_four_protocols(client, endpoint, payload_extra, terminator):
+    """T5.1 正例(F5)：4 种协议各一条流式 → ① 响应含请求 model 名（传输层覆盖为请求 model）；
+    ② 终态信号在最末且仅一次；③ final_state 被消费（驱动读到 recoverable/used_model_id）。
+
+    ⚠️ `/v1/responses` 是唯一例外：其终态事件为 `response.completed`，**不发** `[DONE]`
+    （OpenAI Responses 语义）。原任务单把 4 条协议都写成「[DONE] 在最末」属笔误 ——
+    以既有守卫 `test_core_runtime.test_stream_responses_emits_response_events`
+    （断言 `"[DONE]" not in joined`）为准，本用例按协议区分终态信号。
+    """
+    payload = {"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+    payload.update(payload_extra)
+    headers = {"authorization": "Bearer test-key"}
+    with client.stream("POST", endpoint, json=payload, headers=headers) as r:
+        assert r.status_code == 200
+        lines = [ln for ln in r.iter_lines() if ln.strip()]
+    joined = "\n".join(lines)
+    # 终态信号出现且只出现一次
+    assert terminator in lines
+    assert sum(1 for ln in lines if ln == terminator) == 1
+    if terminator == "data: [DONE]":
+        assert lines[-1] == "data: [DONE]"
+    else:
+        # SSE 每事件两行（`event: X` + `data: {...}`）→ 终态 event 行后紧跟它自己的 data 行
+        assert "[DONE]" not in joined
+        assert lines[-1].startswith("data: ")
+        assert lines[-2] == terminator
+    # 传输层把 model 覆盖为请求的 model 名（至少响应文本含请求 model）
+    assert "gpt-4" in joined
+
+
+def test_non_stream_response_byte_identical(client):
+    """T7.1 正例(F7)：固定请求 + 固定 stub 上游 → 非流式响应与改动前的「黄金响应」逐字段一致。
+
+    golden 按 spec 的两处豁免构造（不做「关键字段抽查」，仍是整 dict 比对）：
+      * `created`：时间戳类字段（每次请求不同），两侧同时剔除后再比；
+      * `model`：驱动层按 T5.1 语义覆盖为**请求的 model 名**（`gpt-4`），
+        而非 stub 上游自称的 `m`；`object` 由响应格式化器补写。
+    """
+    golden = {k: v for k, v in NON_STREAM_RESPONSE.items() if k != "_routing"}
+    golden.pop("created", None)   # 时间戳类字段，spec 明确豁免
+    golden["model"] = "gpt-4"     # 传输层覆盖为请求 model（与 T5.1 同款语义）
+    golden["object"] = "chat.completion"
+    payload = {"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]}
+    r = client.post("/v1/chat/completions", json=payload, headers={"authorization": "Bearer test-key"})
+    assert r.status_code == 200
+    body = r.json()
+    body.pop("created", None)
+    assert body == golden, f"response drift vs golden:\n{body}\n!=\n{golden}"

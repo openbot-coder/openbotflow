@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -12,6 +12,7 @@ from botflow.common.exceptions import (
     NoAvailableModelError,
     ProviderError,
 )
+from botflow.pipeline.strategies import RandomWeightsStrategy
 from botflow.providers.base import BaseProvider
 from botflow.router import (
     CooldownManager,
@@ -398,37 +399,54 @@ async def test_route_non_stream_all_exhausted_no_fallback():
 # ---------------------------------------------------------------------------
 
 
-async def test_route_stream_returns_ordered_endpoints():
+async def test_route_stream_returns_ordered_endpoints(monkeypatch):
+    """SG-1 §3.3：route_stream 合并进 run(mode="stream")，选端点语义不变（经 spy 捕获断言）。"""
     from botflow.pipeline.engine import PipelineEngine
+
     models = [_make_detail(1), _make_detail(2)]
     providers = {11: _make_provider(11), 12: _make_provider(12)}
     db = _FakeDb(models, providers)
     engine = PipelineEngine(db_factory=lambda: db, cooldown=CooldownManager())
     group = _make_group()
-    out = await engine.route_stream(group=group, messages=[{"role": "user", "content": "hi"}])
-    assert "endpoints" in out
-    assert len(out["endpoints"]) == 2
+
+    captured: dict = {}
+    orig = RandomWeightsStrategy.select_endpoints
+
+    async def _spy(self_, *a, **k):
+        res = await orig(self_, *a, **k)
+        captured["endpoints"] = res.endpoints
+        return res
+
+    monkeypatch.setattr(RandomWeightsStrategy, "select_endpoints", _spy)
+
+    class _Done(Exception):
+        pass
+
+    def _abort_writer():
+        raise _Done()
+
+    # SG-1: 流式图不再调用 call_llm（端点级流式调用在图内直接用 provider.chat_stream），
+    # 中止点改到 try_stream 最早期执行的 get_stream_writer()。
+    monkeypatch.setattr(
+        "botflow.pipeline.langgraph_engine.get_stream_writer", _abort_writer,
+    )
+    with pytest.raises(_Done):
+        # run(mode="stream") 为 async def，需先 await 取事件异步生成器（与 core._drive 一致）
+        async for _ in await engine.run(group=group, mode="stream", messages=[{"role": "user", "content": "hi"}]):
+            pass
+    assert len(captured["endpoints"]) == 2
 
 
-async def test_route_stream_all_cooldown_fallback():
+# NOTE (SG-1 §3.2 第 7 组): 原 test_route_stream_all_cooldown_fallback 依赖 route_stream
+# 在图内解析 fallback 组（fallback 组无模型 → NoAvailableModelError）。SG-1 把组级 fallback 移出
+# 图外，改由驱动 core._drive 负责；engine.run(mode="stream") 本身不再做跨组 fallback。
+# 该语义已迁到驱动层 T1.2 / T1.6（tests/test_core_runtime.py），此处不再保留冗余用例。
+
+
+async def test_route_stream_all_cooldown_no_fallback_raises(monkeypatch):
+    """SG-1 §3.3：route_stream 合并进 run(mode="stream")；无 fallback → AllModelsCooldownError。"""
     from botflow.pipeline.engine import PipelineEngine
-    cm = CooldownManager()
-    models = [_make_detail(1)]
-    providers = {11: _make_provider(11)}
-    primary_group = _make_group(group_id=1, fallback_group_id=2)
-    fallback_group = _make_group(group_id=2, name="fallback")
-    db = _FakeDb(models, providers, groups={1: primary_group, 2: fallback_group})
-    cm.record_failure(1, 1, cooldown_failure_threshold=1, cooldown_seconds=1000)
-    # fallback group has no models -> raises NoAvailableModelError
-    from botflow.router import _endpoint_cache
-    _endpoint_cache.clear()
-    engine = PipelineEngine(db_factory=lambda: db, cooldown=cm)
-    with pytest.raises(NoAvailableModelError):
-        await engine.route_stream(group=primary_group, messages=[{"role": "user", "content": "hi"}])
 
-
-async def test_route_stream_all_cooldown_no_fallback_raises():
-    from botflow.pipeline.engine import PipelineEngine
     cm = CooldownManager()
     models = [_make_detail(1)]
     providers = {11: _make_provider(11)}
@@ -437,11 +455,15 @@ async def test_route_stream_all_cooldown_no_fallback_raises():
     cm.record_failure(1, 1, cooldown_failure_threshold=1, cooldown_seconds=1000)
     engine = PipelineEngine(db_factory=lambda: db, cooldown=cm)
     with pytest.raises(AllModelsCooldownError):
-        await engine.route_stream(group=group, messages=[{"role": "user", "content": "hi"}])
+        # run(mode="stream") 为 async def，先 await 取事件生成器（与 core._drive 契约一致）
+        async for _ in await engine.run(group=group, mode="stream", messages=[{"role": "user", "content": "hi"}]):
+            pass
 
 
-async def test_route_stream_context_window_truncation():
+async def test_route_stream_context_window_truncation(monkeypatch):
+    """SG-1 §3.3：route_stream 合并进 run(mode="stream")；上下文窗口截断语义不变（经 spy 捕获断言）。"""
     from botflow.pipeline.engine import PipelineEngine
+
     models = [_make_detail(1, context_window=10), _make_detail(2)]
     providers = {11: _make_provider(11), 12: _make_provider(12)}
     db = _FakeDb(models, providers)
@@ -453,6 +475,28 @@ async def test_route_stream_context_window_truncation():
         {"role": "user", "content": "y" * 5000},
         {"role": "user", "content": "z" * 5000},
     ]
-    out = await engine.route_stream(group=group, messages=big)
-    sent = out["messages"]
-    assert sent == [{"role": "system", "content": "s"}]
+
+    captured: dict = {}
+    orig = RandomWeightsStrategy.select_endpoints
+
+    async def _spy(self_, *a, **k):
+        res = await orig(self_, *a, **k)
+        captured["messages"] = res.messages
+        return res
+
+    monkeypatch.setattr(RandomWeightsStrategy, "select_endpoints", _spy)
+
+    class _Done(Exception):
+        pass
+
+    def _abort_writer():
+        raise _Done()
+
+    # 见 test_route_stream_returns_ordered_endpoints：中止点迁到 get_stream_writer()。
+    monkeypatch.setattr(
+        "botflow.pipeline.langgraph_engine.get_stream_writer", _abort_writer,
+    )
+    with pytest.raises(_Done):
+        async for _ in await engine.run(group=group, mode="stream", messages=big):
+            pass
+    assert captured["messages"] == [{"role": "system", "content": "s"}]

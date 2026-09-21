@@ -1,9 +1,8 @@
-"""Tests for streaming fallback: _stream_common tries endpoints in order.
+"""Tests for streaming fallback (SG-1)：驱动 core._drive / engine.run 的组级降级 + 传输层。
 
-Covers design.md error policy: 可重试错误重试后 fallback，不可重试错误立即 fallback，
-以及首 chunk 之前的失败才会回退（已开始的流失败直接上报给客户端）。
-
-P3 migration: now uses PipelineEngine.route_stream() instead of GroupRouter.
+- T1.2：主组全冷却 → 驱动降级到 backup 组（流式与非流式对照，缺陷 1 修复）
+- T7.2 / T7.3：_stream_common 不再持有端点重试环；fallback_attempted 全仓清零
+- 端点级流式回退 / 选端点语义已迁到 test_langgraph_engine.py（T4.x）
 """
 
 from __future__ import annotations
@@ -68,42 +67,9 @@ def _make_group(group_id=1, fallback_group_id=None):
     )
 
 
-class StubEngine:
-    """Mimics PipelineEngine.route_stream() for testing _stream_common."""
-
-    def __init__(self, endpoints, route_error=None, fallback_group_id=None):
-        self.endpoints = endpoints
-        self.route_error = route_error
-        self.fallback_group_id = fallback_group_id
-        self.cooldown = CooldownManager()
-        self._groups = {}
-
-    def register_group(self, group_id, endpoints, fallback_group_id=None):
-        self._groups[group_id] = (endpoints, fallback_group_id)
-
-    async def route_stream(self, group, messages, temperature=None, max_tokens=None, **kwargs):
-        if self.route_error:
-            raise self.route_error
-        # Look up endpoints for this group_id
-        gid = group.id if hasattr(group, 'id') else group
-        if gid in self._groups:
-            eps, fb_id = self._groups[gid]
-        else:
-            eps = self.endpoints
-            fb_id = self.fallback_group_id
-        return {
-            "endpoints": eps,
-            "group_id": gid,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "kwargs": kwargs,
-            "fallback_group_id": fb_id,
-        }
-
-    async def _load_group(self, group_id):
-        return _make_group(group_id=group_id)
-
+# NOTE (SG-1 §3.3): 旧的 StubEngine（打桩 route_stream 返回端点列表）已由下方
+# SG-1 版 StubEngine（按 group.id 返回 ("chunk", c)/("state", s) 事件序列）取代，
+# 此处不再保留旧桩。
 
 def _serialize(chunk: dict) -> tuple[list[str], dict | None]:
     return [f"data: {chunk['content']}\n\n"], None
@@ -151,274 +117,150 @@ def _setup(monkeypatch, engine: StubEngine) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fallback behavior
+# NOTE (SG-1 §3.3 / §3.2): 以下 14 条旧 ``_stream_common`` 端点级回退用例已被删除。
+# SG-1 把端点级重试/回退迁入图（try_stream 节点，见 test_langgraph_engine.py T4.x），
+# 组级降级迁入驱动 core._drive（见本文件 T1.2 与 test_core_runtime.py T1.x）。
+# ``_stream_common`` 自身不再持有重试环 / fallback_attempted（T7.2 / T7.3）。
+# 旧用例意图已被 T4.x（端点级流式）+ T1.2（流式组级降级）+ T5.1（传输层）覆盖。
 # ---------------------------------------------------------------------------
 
 
-async def test_fallback_to_next_endpoint_on_pre_stream_failure(monkeypatch, env):
-    """不可重试错误（400）→ 立即 fallback 到下一个模型。"""
-    ep1 = _make_endpoint(1, StubProvider([ProviderError("OpenAICompat stream failed: HTTP 400 Bad Request")]))
-    ep2 = _make_endpoint(2, StubProvider([[{"content": "a"}, {"content": "b"}]]))
-    engine = StubEngine([ep1, ep2])
-    _setup(monkeypatch, engine)
-
-    out = await _collect(core._stream_common({"model": "x", "messages": []}, _serialize))
-
-    assert out == ["data: a\n\n", "data: b\n\n", "data: [DONE]\n\n"]
-    assert engine.cooldown.get_failure_count(1, ep1.model_id) == 1
-    assert engine.cooldown.get_failure_count(1, ep2.model_id) == 0
-    assert [entry for entry in env if entry["status"] == "success"][0]["model_id"] == ep2.model_id
-    assert not any(entry["status"] == "error" for entry in env)
-
-
-async def test_first_endpoint_used_when_healthy(monkeypatch, env):
-    """首个模型正常 → 直接使用，不触发 fallback。"""
-    ep1 = _make_endpoint(1, StubProvider([[{"content": "hello"}]]))
-    ep2 = _make_endpoint(2, StubProvider([[{"content": "unused"}]]))
-    engine = StubEngine([ep1, ep2])
-    _setup(monkeypatch, engine)
-
-    out = await _collect(core._stream_common({"model": "x", "messages": []}, _serialize))
-
-    assert out == ["data: hello\n\n", "data: [DONE]\n\n"]
-    assert ep2.provider.calls == 0
-    assert [entry for entry in env if entry["status"] == "success"][0]["model_id"] == ep1.model_id
-    assert engine.cooldown.get_failure_count(1, ep1.model_id) == 0
-
-
-async def test_all_endpoints_fail_emits_error_sse(monkeypatch, env):
-    """全部模型失败 → 向上游返回 SSE error 事件。"""
-    err = ProviderError("OpenAICompat stream failed: HTTP 400 Bad Request")
-    ep1 = _make_endpoint(1, StubProvider([err]))
-    ep2 = _make_endpoint(2, StubProvider([ProviderError("OpenAICompat stream failed: HTTP 500")]))
-    engine = StubEngine([ep1, ep2])
-    _setup(monkeypatch, engine)
-    monkeypatch.setattr(core, "exponential_backoff", AsyncMock())
-
-    out = await _collect(core._stream_common({"model": "x", "messages": []}, _serialize))
-
-    assert out[-1] == "data: [DONE]\n\n"
-    error_line = next(line for line in out if line.startswith("data: {") and '"error"' in line)
-    assert '"type": "server_error"' in error_line
-    assert "HTTP 500" in error_line
-    error_log = [entry for entry in env if entry["status"] == "error"]
-    assert len(error_log) == 1
-    # F6 / T6.2: both endpoints were actually tried, so the final error row
-    # must be attributed to the last attempted endpoint (ep2), not None.
-    assert error_log[0]["model_id"] == ep2.model_id
-    assert error_log[0]["provider_id"] == ep2.detail.provider_id
-    assert error_log[0]["error_message"] == "OpenAICompat stream failed: HTTP 500"
-    assert engine.cooldown.get_failure_count(1, ep1.model_id) == 1
-    assert engine.cooldown.get_failure_count(1, ep2.model_id) == 1
-
-
-async def test_empty_stream_falls_back_to_next(monkeypatch, env):
-    """空流（无任何 chunk）视为失败，回退下一个模型。"""
-    ep1 = _make_endpoint(1, StubProvider([[]]))
-    ep2 = _make_endpoint(2, StubProvider([[{"content": "ok"}]]))
-    engine = StubEngine([ep1, ep2])
-    _setup(monkeypatch, engine)
-
-    out = await _collect(core._stream_common({"model": "x", "messages": []}, _serialize))
-
-    assert out == ["data: ok\n\n", "data: [DONE]\n\n"]
-    assert engine.cooldown.get_failure_count(1, ep1.model_id) == 1
-    assert [entry for entry in env if entry["status"] == "success"][0]["model_id"] == ep2.model_id
-
-    # T7.1 / F7: empty stream must also produce an attempt record (G1 留痕),
-    # attributed to the failing endpoint. Cooldown counting must NOT double-count.
-    ep1_attempts = [a for a in env.attempts if a.get("model_id") == ep1.model_id]
-    assert ep1_attempts, "empty-stream attempt should be recorded"
-    assert any("empty stream" in (a.get("error_message") or "") for a in ep1_attempts)
-    assert engine.cooldown.get_failure_count(1, ep1.model_id) == 1
-
-
-async def test_retryable_error_retries_same_endpoint(monkeypatch, env):
-    """可重试错误（5xx）→ 指数退避后重试同一模型，不立即 fallback。"""
-    ep1 = _make_endpoint(1, StubProvider([ProviderError("OpenAICompat request failed: HTTP 500"), [{"content": "a"}, {"content": "b"}]]), max_retries=3)
-    ep2 = _make_endpoint(2, StubProvider([[{"content": "unused"}]]))
-    engine = StubEngine([ep1, ep2])
-    _setup(monkeypatch, engine)
-    monkeypatch.setattr(core, "exponential_backoff", AsyncMock())
-
-    out = await _collect(core._stream_common({"model": "x", "messages": []}, _serialize))
-
-    assert out == ["data: a\n\n", "data: b\n\n", "data: [DONE]\n\n"]
-    assert ep1.provider.calls == 2
-    assert ep2.provider.calls == 0
-    assert engine.cooldown.get_failure_count(1, ep1.model_id) == 0
-    assert [entry for entry in env if entry["status"] == "success"][0]["model_id"] == ep1.model_id
-
-
-async def test_mid_stream_failure_not_retried(monkeypatch, env):
-    """流已开始后中途失败 → 不回退，直接上报 SSE error。"""
-    ep1 = _make_endpoint(1, StubProvider([[{"content": "a"}, ProviderError("connection reset")]]))
-    ep2 = _make_endpoint(2, StubProvider([[{"content": "b"}]]))
-    engine = StubEngine([ep1, ep2])
-    _setup(monkeypatch, engine)
-
-    out = await _collect(core._stream_common({"model": "x", "messages": []}, _serialize))
-
-    assert ep2.provider.calls == 0
-    assert out[0] == "data: a\n\n"
-    assert out[-1] == "data: [DONE]\n\n"
-    error_log = [entry for entry in env if entry["status"] == "error"]
-    assert len(error_log) == 1
-    assert error_log[0]["model_id"] == ep1.model_id
-    assert "connection reset" in error_log[0]["error_message"]
-
-
-async def test_route_failure_emits_error_sse(monkeypatch, env):
-    """路由层失败（如全部模型冷却）→ SSE error。"""
-    engine = StubEngine([], route_error=AllModelsCooldownError("Group 1: all models are on cooldown"))
-    _setup(monkeypatch, engine)
-
-    out = await _collect(core._stream_common({"model": "x", "messages": []}, _serialize))
-
-    assert out[-1] == "data: [DONE]\n\n"
-    assert any('"type": "server_error"' in line for line in out)
-    assert [entry for entry in env if entry["status"] == "error"][0]["model_id"] is None
-
-
-async def test_stream_options_forwarded_to_provider(monkeypatch, env):
-    """kwargs（如 stream_options）在回退路径上原样传给每个候选模型。"""
-    ep1 = _make_endpoint(1, StubProvider([ProviderError("HTTP 400")]))
-    ep2 = _make_endpoint(2, StubProvider([[{"content": "hi"}]]))
-
-    class EngineWithKwargs(StubEngine):
-        async def route_stream(self, group, messages, temperature=None, max_tokens=None, **kwargs):
-            result = await super().route_stream(group, messages, temperature, max_tokens, **kwargs)
-            result["kwargs"] = {"stream_options": {"include_usage": True}}
-            return result
-
-    engine = EngineWithKwargs([ep1, ep2])
-    _setup(monkeypatch, engine)
-
-    out = await _collect(core._stream_common({"model": "x", "messages": []}, _serialize))
-    assert out == ["data: hi\n\n", "data: [DONE]\n\n"]
-
-
-async def test_usage_chunk_recorded_in_success_log(monkeypatch, env):
-    """携带 usage 的 chunk → 成功日志记录 usage。"""
-    ep1 = _make_endpoint(1, StubProvider([[{"content": "a", "usage": {"prompt_tokens": 5}}]]))
-    engine = StubEngine([ep1])
-    _setup(monkeypatch, engine)
-
-    def serialize_with_usage(chunk):
-        return [f"data: {chunk['content']}\n\n"], chunk.get("usage")
-
-    out = await _collect(core._stream_common({"model": "x", "messages": []}, serialize_with_usage))
-
-    assert out == ["data: a\n\n", "data: [DONE]\n\n"]
-    success_log = [entry for entry in env if entry["status"] == "success"][0]
-    assert success_log["usage"] == {"prompt_tokens": 5}
-
-
-async def test_fallback_group_used_when_all_endpoints_fail(monkeypatch, env):
-    """组内全部模型失败 → 降级到 fallback group 重试。"""
-    ep1 = _make_endpoint(1, StubProvider([ProviderError("Model model-1 timed out waiting for first chunk")]))
-    ep2 = _make_endpoint(2, StubProvider([[{"content": "fallback-ok"}]]))
-
-    engine = StubEngine([ep1], fallback_group_id=4)
-    engine.register_group(1, [ep1], fallback_group_id=4)
-    engine.register_group(4, [ep2], fallback_group_id=None)
-    _setup(monkeypatch, engine)
-    monkeypatch.setattr(core, "exponential_backoff", AsyncMock())
-
-    out = await _collect(core._stream_common({"model": "x", "messages": []}, _serialize))
-
-    assert out == ["data: fallback-ok\n\n", "data: [DONE]\n\n"]
-    success_log = [entry for entry in env if entry["status"] == "success"]
-    assert success_log[0]["model_id"] == ep2.model_id
-    assert not any(entry["status"] == "error" for entry in env)
-    assert engine.cooldown.get_failure_count(1, ep1.model_id) == 1
-
-
-async def test_fallback_group_failure_emits_error_sse(monkeypatch, env):
-    """主组与 fallback group 都失败 → 上报 SSE error。"""
-    ep1 = _make_endpoint(1, StubProvider([ProviderError("HTTP 400")]))
-    ep2 = _make_endpoint(2, StubProvider([ProviderError("HTTP 500")]))
-
-    engine = StubEngine([ep1], fallback_group_id=4)
-    engine.register_group(1, [ep1], fallback_group_id=4)
-    engine.register_group(4, [ep2], fallback_group_id=None)
-    _setup(monkeypatch, engine)
-    monkeypatch.setattr(core, "exponential_backoff", AsyncMock())
-
-    out = await _collect(core._stream_common({"model": "x", "messages": []}, _serialize))
-
-    assert out[-1] == "data: [DONE]\n\n"
-    error_line = next(line for line in out if line.startswith("data: {") and '"error"' in line)
-    assert '"type": "server_error"' in error_line
-    error_log = [entry for entry in env if entry["status"] == "error"]
-    assert len(error_log) == 1
-    assert "HTTP 500" in error_log[0]["error_message"]
-
-
-async def test_stream_timeout_from_request_overrides_default(monkeypatch, env):
-    """请求可自定义首 chunk 超时；超时后回退下一个模型。"""
-    ep1 = _make_endpoint(1, StubProvider([TimeoutError()]))
-    ep2 = _make_endpoint(2, StubProvider([[{"content": "ok"}]]))
-    engine = StubEngine([ep1, ep2])
-    _setup(monkeypatch, engine)
-    monkeypatch.setattr(core, "exponential_backoff", AsyncMock())
-
-    out = await _collect(core._stream_common({"model": "x", "messages": [], "stream_timeout": 0.1}, _serialize))
-
-    assert out == ["data: ok\n\n", "data: [DONE]\n\n"]
-    assert engine.cooldown.get_failure_count(1, ep1.model_id) == 1
-
-    # T7.2 / F7: first-chunk timeout must record an attempt and must NOT add a
-    # second cooldown entry (cooldown is already recorded; §0.2 / §1.1 口径).
-    ep1_attempts = [a for a in env.attempts if a.get("model_id") == ep1.model_id]
-    assert ep1_attempts, "first-chunk-timeout attempt should be recorded"
-    assert any("timed out waiting for first chunk" in (a.get("error_message") or "")
-               for a in ep1_attempts)
-    assert engine.cooldown.get_failure_count(1, ep1.model_id) == 1
-
-
-async def test_serialize_error_emits_error_sse_no_fallback(monkeypatch, env):
-    """序列化异常（botflow 侧 chunk 形状问题）→ SSE error，且不回退到其他模型。"""
-    ep1 = _make_endpoint(1, StubProvider([[{"content": "a"}]]))
-
-    def bad_serialize(chunk):
-        raise ValueError("unexpected chunk shape")
-
-    engine = StubEngine([ep1])
-    _setup(monkeypatch, engine)
-
-    out = await _collect(core._stream_common({"model": "x", "messages": []}, bad_serialize))
-
-    assert out[-1] == "data: [DONE]\n\n"
-    assert any('"type": "server_error"' in line for line in out)
-    error_log = [entry for entry in env if entry["status"] == "error"]
-    assert len(error_log) == 1
-    assert error_log[0]["model_id"] == ep1.model_id
-
-
 # ---------------------------------------------------------------------------
-# F7 / T7.3: the unreachable ``if gen is None: break`` dead branch in
-# ``_stream_common`` (core.py:1146-1147) was deleted, and with it the
-# ``# UNCOVERED`` marker. Coverage of that region is carried by the real
-# T7.1 / T7.2 cases instead. This is a source-text guard (see
-# tests/test_context.py::test_no_cjk_ratio_refs_in_src for the pattern).
+# StubEngine（SG-1 §3.3 重写）：由打桩 route_stream() 改为按 group.id 返回
+# 「图事件序列」。core._drive / engine.run 是新的调用目标：
+#   - run(mode="chat") 返回最终 result dict（含 _attempts）
+#   - run(mode="stream") / stream_events 返回 async gen，产出 ("chunk", c) / ("state", s)
 # ---------------------------------------------------------------------------
 
 
-async def test_empty_stream_dead_branch_removed(monkeypatch):
-    """core._stream_common 内不可达的 ``if gen is None: break`` 死代码已删除，
-    且该文件内不含 ``# UNCOVERED``（F7 / AGENTS.md 规则 4「优先删除」）。"""
+class StubEngine:
+    """SG-1 §3.3：按 group.id 返回图事件序列的引擎桩。"""
+
+    def __init__(self, cooldown=None):
+        self.cooldown = cooldown or CooldownManager()
+        self._groups: dict = {}  # gid -> (events, error)
+        self.run_calls: list = []  # 记录 ("gid", mode)
+
+    def register_group(self, group_id, events=None, error=None):
+        self._groups[group_id] = (events or [], error)
+
+    async def run(self, strategy, group, mode, **kw):
+        gid = getattr(group, "id", group)
+        self.run_calls.append((gid, mode))
+        events, error = self._groups.get(gid, (None, None))
+        if error is not None:
+            raise error
+        if mode == "chat":
+            return events  # 最终 result dict
+        # 流式：事件 async iterator
+        async def _gen():
+            for ev in (events or []):
+                yield ev
+        return _gen()
+
+    async def stream_events(self, strategy, group, **kw):
+        gid = getattr(group, "id", group)
+        events, error = self._groups.get(gid, (None, None))
+        if error is not None:
+            raise error
+
+        async def _gen():
+            for ev in (events or []):
+                yield ev
+        return _gen()
+
+
+# ---------------------------------------------------------------------------
+# F1 / T1.2：流式组级降级（缺陷 1 修复）—— 主组全冷却 → 驱动降级到 backup 组
+# ---------------------------------------------------------------------------
+
+
+async def test_driver_group_fallback_works_for_stream(monkeypatch, env):
+    """T1.2（正例，缺陷 1 核心）：主组全冷却（run 抛 AllModelsCooldownError）
+    → 备份组可用 → **流式同样降级成功**，SSE 正常收尾 [DONE]。改动前此场景返回 502。"""
+    engine = StubEngine()
+    engine.register_group(1, error=AllModelsCooldownError("Group 1: all models on cooldown"))
+    engine.register_group(
+        2,
+        events=[
+            ("chunk", {"choices": [{"delta": {"content": "fallback-ok"}}]}),
+            ("state", {"recoverable": True, "used_model_id": 2, "provider_id": 1}),
+        ],
+    )
+
+    primary = _make_group(group_id=1, fallback_group_id=2)
+    backup = _make_group(group_id=2)
+
+    monkeypatch.setattr(
+        core, "_get_extra_route_params",
+        AsyncMock(return_value=(1, engine, primary, {})),
+    )
+    monkeypatch.setattr(core, "_load_group", AsyncMock(return_value=backup))
+
+    out = [
+        line async for line in core._drive(
+            {"model": "x", "messages": []}, mode="stream",
+        )
+    ]
+    assert out[-1] == "data: [DONE]\n\n"
+    assert any("fallback-ok" in line for line in out)
+    # 驱动对主组与备份组各调用一次 run（流式）
+    assert engine.run_calls == [(1, "stream"), (2, "stream")]
+    assert len([c for c in engine.run_calls if c[1] == "stream"]) == 2
+
+
+async def test_driver_group_fallback_works_for_stream_non_stream_counterpart(monkeypatch, env):
+    """T1.2 对照：同一 stub，仅 mode="chat" 也应降级成功（保证流式与
+    非流式共用驱动骨架）。"""
+    engine = StubEngine()
+    engine.register_group(1, error=AllModelsCooldownError("Group 1: all models on cooldown"))
+    engine.register_group(2, events={"choices": [{"message": {"content": "fallback-ok"}}], "_routing": {"model_id": 2}})
+
+    primary = _make_group(group_id=1, fallback_group_id=2)
+    backup = _make_group(group_id=2)
+
+    monkeypatch.setattr(
+        core, "_get_extra_route_params",
+        AsyncMock(return_value=(1, engine, primary, {})),
+    )
+    monkeypatch.setattr(core, "_load_group", AsyncMock(return_value=backup))
+
+    result = await core._drive({"model": "x", "messages": []}, mode="chat")
+    assert result["choices"][0]["message"]["content"] == "fallback-ok"
+    assert len([c for c in engine.run_calls if c[1] == "chat"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# F7 / T7.2：_stream_common 不再持有端点重试环；T7.3：fallback_attempted 全仓清零
+# ---------------------------------------------------------------------------
+
+
+async def test_stream_common_has_no_own_retry_loop(monkeypatch):
+    """T7.2：SG-1 后 core._stream_common 体内不含 `for attempt in range(`（端点重试环
+    已迁入图），行数从 ~180 降到 ~60 量级（断言上限 < 90 即可，别写死精确值）。"""
     import inspect
 
     from botflow import core as _core
 
     source = inspect.getsource(_core._stream_common)
-    # The unreachable dead branch must be gone.
-    assert "if gen is None:" not in source, (
-        "dead `if gen is None: break` branch must be removed from _stream_common"
+    assert "for attempt in range(" not in source, (
+        "_stream_common must not contain an endpoint retry loop after SG-1"
     )
-    # No leftover coverage-exclusion marker anywhere in core.py.
-    full_source = Path(_core.__file__).read_text(encoding="utf-8")
-    assert "# UNCOVERED" not in full_source, (
-        "core.py must not contain any `# UNCOVERED` marker after SG-0"
+    assert len(source.splitlines()) < 90, (
+        f"_stream_common is too long ({len(source.splitlines())} lines); expected < 90"
     )
+
+
+async def test_fallback_attempted_symbol_fully_removed(monkeypatch):
+    """T7.3：全仓 src/ grep `fallback_attempted` → 0 命中（参照 test_context 写法）。"""
+    from pathlib import Path
+
+    from botflow import core as _core
+
+    src_root = Path(_core.__file__).resolve().parent
+    hits = [
+        str(p)
+        for p in src_root.rglob("*.py")
+        if "fallback_attempted" in p.read_text(encoding="utf-8")
+    ]
+    assert hits == [], f"`fallback_attempted` still present in: {hits}"

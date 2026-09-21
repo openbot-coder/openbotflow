@@ -60,7 +60,7 @@ class PipelineEngine:
         max_tokens: int | None = None,
         **kwargs,
     ) -> dict:
-        """非流式路由 — 由 LangGraph 图驱动完整的重试/降级生命周期。"""
+        """非流式路由 — 图内单次执行 + 驱动层组级降级（兼容 R-09~R-14）。"""
         return await self._inner.route(
             group, messages,
             stream=stream,
@@ -69,22 +69,29 @@ class PipelineEngine:
             **kwargs,
         )
 
-    async def route_stream(
+    async def run(
         self,
-        group: ModelGroup,
-        messages: list[dict],
+        strategy=None,
+        group: ModelGroup | None = None,
+        *,
+        messages: list[dict] | None = None,
+        mode: str = "chat",
         temperature: float | None = None,
         max_tokens: int | None = None,
+        request: Any | None = None,
         **kwargs: Any,
-    ) -> dict[str, Any]:
-        """流式路由 — LangGraph 选择候选端点，由调用方迭代 chat_stream。
+    ):
+        """SG-1 单组执行入口 — 委托内层 LangGraphEngine。
 
-        返回格式与原版完全兼容：
-        ``{endpoints, group_id, messages, temperature, max_tokens, kwargs, fallback_group_id}``
+        ``mode="chat"`` 返回最终 result dict；``mode="stream"`` 返回事件异步生成器。
         """
-        return await self._inner.route_stream(
-            group, messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            **kwargs,
+        return await self._inner.run(
+            strategy, group,
+            messages=messages, mode=mode,
+            temperature=temperature, max_tokens=max_tokens,
+            request=request, **kwargs,
         )
+
+    async def stream_events(self, strategy=None, group: ModelGroup | None = None, **kwargs: Any):
+        """SG-1 流式事件入口 — 委托内层 LangGraphEngine。"""
+        return await self._inner.stream_events(strategy, group, **kwargs)

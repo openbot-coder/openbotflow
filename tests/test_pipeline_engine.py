@@ -425,203 +425,10 @@ def _select_factory_with_fail(fail_group_ids):
     return _select
 
 
-# R-04: call_llm 返回 None → graph fallback 到 fallback_group
-async def test_route_non_stream_fallback_on_provider_error():
-    ep_a = _make_ep(model_id=1, model_name="m1")
-    ep_b = _make_ep(model_id=2, provider_id=20, model_name="m2")
-    fallback_result = {"choices": [{"message": {"content": "Fallback OK"}}], "_routing": {"model_id": 2}}
-
-    mock_db = AsyncMock(spec=Database)
-    group_a = ModelGroup(id=1, name="fast", type="random_weights", fallback_group_id=2)
-    group_b = ModelGroup(id=2, name="default", type="random_weights")
-    mock_db.get_group = AsyncMock(side_effect=lambda gid: {1: group_a, 2: group_b}[gid])
-    mock_cooldown = Mock(spec=CooldownManager)
-    mock_cooldown.is_on_cooldown.return_value = False
-    engine = PipelineEngine(db_factory=lambda: mock_db, cooldown=mock_cooldown)
-
-    call_count = 0
-
-    async def call_llm_side_effect(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return (None, ProviderError("call_llm failed"))  # primary group fails
-        return (fallback_result, None)  # fallback group succeeds
-
-    select_fn = _select_factory({1: [ep_a], 2: [ep_b]})
-    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
-         patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
-        result = await engine.route(group=group_a, messages=[{"role": "user", "content": "Hi"}])
-
-    assert _without_attempts(result) == fallback_result
-
-
-# R-05: call_llm 返回 None（所有 endpoint 失败）→ graph fallback
-async def test_route_non_stream_fallback_on_cooldown_error():
-    ep_a = _make_ep(model_id=1, model_name="m1")
-    ep_b = _make_ep(model_id=2, provider_id=20, model_name="m2")
-    fallback_result = {"choices": [{"message": {"content": "Fallback OK"}}], "_routing": {"model_id": 2}}
-
-    mock_db = AsyncMock(spec=Database)
-    group_a = ModelGroup(id=1, name="fast", type="random_weights", fallback_group_id=2)
-    group_b = ModelGroup(id=2, name="default", type="random_weights")
-    mock_db.get_group = AsyncMock(side_effect=lambda gid: {1: group_a, 2: group_b}[gid])
-    mock_cooldown = Mock(spec=CooldownManager)
-    mock_cooldown.is_on_cooldown.return_value = False
-    engine = PipelineEngine(db_factory=lambda: mock_db, cooldown=mock_cooldown)
-
-    call_count = 0
-
-    async def call_llm_side_effect(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return (None, ProviderError("call_llm failed"))  # primary group fails
-        return (fallback_result, None)  # fallback group succeeds
-
-    select_fn = _select_factory({1: [ep_a], 2: [ep_b]})
-    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
-         patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
-        result = await engine.route(group=group_a, messages=[{"role": "user", "content": "Hi"}])
-
-    assert _without_attempts(result) == fallback_result
-
-
-# R-06: call_llm 返回 None → graph fallback（所有 endpoint 不可用）
-async def test_route_non_stream_fallback_on_no_available_error():
-    """验证所有 endpoint 失败时 graph 触发 fallback."""
-    ep_a = _make_ep(model_id=1, model_name="m1")
-    ep_b = _make_ep(model_id=2, provider_id=20, model_name="m2")
-    fallback_result = {"choices": [{"message": {"content": "Fallback OK"}}], "_routing": {"model_id": 2}}
-
-    mock_db = AsyncMock(spec=Database)
-    group_a = ModelGroup(id=1, name="fast", type="random_weights", fallback_group_id=2)
-    group_b = ModelGroup(id=2, name="default", type="random_weights")
-    mock_db.get_group = AsyncMock(side_effect=lambda gid: {1: group_a, 2: group_b}[gid])
-    mock_cooldown = Mock(spec=CooldownManager)
-    mock_cooldown.is_on_cooldown.return_value = False
-    engine = PipelineEngine(db_factory=lambda: mock_db, cooldown=mock_cooldown)
-
-    call_count = 0
-
-    async def call_llm_side_effect(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return (None, ProviderError("call_llm failed"))  # primary group fails
-        return (fallback_result, None)  # fallback group succeeds
-
-    select_fn = _select_factory({1: [ep_a], 2: [ep_b]})
-    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
-         patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
-        result = await engine.route(group=group_a, messages=[{"role": "user", "content": "Hi"}])
-
-    assert _without_attempts(result) == fallback_result
-
-
-# R-07a: strategy.select_endpoints 抛异常 → graph fallback
-async def test_route_non_stream_fallback_on_strategy_error():
-    """验证 strategy 抛异常时 graph 触发 fallback."""
-    ep_b = _make_ep(model_id=2, provider_id=20, model_name="m2")
-    fallback_result = {"choices": [{"message": {"content": "Fallback OK"}}], "_routing": {"model_id": 2}}
-
-    mock_db = AsyncMock(spec=Database)
-    group_a = ModelGroup(id=1, name="fast", type="random_weights", fallback_group_id=2)
-    group_b = ModelGroup(id=2, name="default", type="random_weights")
-    mock_db.get_group = AsyncMock(side_effect=lambda gid: {1: group_a, 2: group_b}[gid])
-    mock_cooldown = Mock(spec=CooldownManager)
-    mock_cooldown.is_on_cooldown.return_value = False
-    engine = PipelineEngine(db_factory=lambda: mock_db, cooldown=mock_cooldown)
-
-    # group A strategy raises; group B strategy returns ep_b
-    select_fn_a = _select_factory_with_fail(fail_group_ids={1})
-
-    async def select_fn_b(messages, db, cooldown, group_id, **kw):
-        return RouteResult(endpoints=[ep_b], messages=messages,
-                           temperature=None, max_tokens=None, extra_kwargs={})
-
-    call_count = 0
-
-    async def call_llm_side_effect(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        return (fallback_result, None)
-
-    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn_a), \
-         patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
-        # On fallback, select_fn_a is called again for group_b (same strategy type)
-        # but group_b id=2 is not in fail_group_ids, so it raises "should not be called"
-        # We need select_fn_a to also handle group_b:
-        pass
-
-    # Rethink: _select_factory_with_fail only raises for fail_group_ids.
-    # For fallback group (id=2), it should return ep_b.
-    # Let's use a combined function:
-    async def select_fn_combined(messages, db, cooldown, group_id, **kw):
-        if group_id == 1:
-            raise StrategyError("group 1 strategy failed")
-        return RouteResult(endpoints=[ep_b], messages=messages,
-                           temperature=None, max_tokens=None, extra_kwargs={})
-
-    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn_combined), \
-         patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
-        result = await engine.route(group=group_a, messages=[{"role": "user", "content": "Hi"}])
-
-    assert _without_attempts(result) == fallback_result
-
-
-# R-07b: fallback group 执行成功，返回 fallback 结果
-async def test_route_non_stream_fallback_success():
-    """验证 fallback group 执行成功时返回 fallback 结果."""
-    ep_a = _make_ep(model_id=1, model_name="m1")
-    ep_b = _make_ep(model_id=2, provider_id=20, model_name="m2")
-    fallback_result = {"model": "default", "choices": [{"message": {"content": "From fallback"}}], "_routing": {"model_id": 2}}
-
-    mock_db = AsyncMock(spec=Database)
-    group_a = ModelGroup(id=1, name="fast", type="random_weights", fallback_group_id=2)
-    group_b = ModelGroup(id=2, name="default", type="round_robin")
-    mock_db.get_group = AsyncMock(side_effect=lambda gid: {1: group_a, 2: group_b}[gid])
-    mock_cooldown = Mock(spec=CooldownManager)
-    mock_cooldown.is_on_cooldown.return_value = False
-    engine = PipelineEngine(db_factory=lambda: mock_db, cooldown=mock_cooldown)
-
-    call_count = 0
-
-    async def call_llm_side_effect(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return (None, ProviderError("call_llm failed"))  # primary group fails
-        return (fallback_result, None)  # fallback group succeeds
-
-    # group A → RandomWeightsStrategy; group B → RoundRobinStrategy
-    select_rw = _select_factory({1: [ep_a]})
-    select_rr = _select_factory({2: [ep_b]})
-    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_rw), \
-         _patch_select_endpoints(RoundRobinStrategy, side_effect=select_rr), \
-         patch(PATCH_CALL, new_callable=AsyncMock, side_effect=call_llm_side_effect):
-        result = await engine.route(group=group_a, messages=[{"role": "user", "content": "Hi"}])
-
-    assert _without_attempts(result) == fallback_result
-
-
-# R-08: fallback_group_id=None 且 call_llm 返回 None → ProviderError
-async def test_route_non_stream_no_fallback_without_id():
-    ep = _make_ep()
-
-    mock_db = AsyncMock(spec=Database)
-    group = ModelGroup(id=1, name="fast", type="random_weights", fallback_group_id=None)
-    mock_cooldown = Mock(spec=CooldownManager)
-    mock_cooldown.is_on_cooldown.return_value = False
-    engine = PipelineEngine(db_factory=lambda: mock_db, cooldown=mock_cooldown)
-
-    select_fn = _select_factory({1: [ep]})
-    with _patch_select_endpoints(RandomWeightsStrategy, side_effect=select_fn), \
-         patch(PATCH_CALL, new_callable=AsyncMock, return_value=(None, ProviderError("call_llm failed"))):
-        with pytest.raises(ProviderError):
-            await engine.route(group=group, messages=[])
-
-
+# NOTE (SG-1 §3.2): R-04 ~ R-08（call_llm 返回 None → 图内组级 fallback）已删除。
+# 组级降级在 SG-1 中移出图外，改由驱动 ``core._drive`` 的 while 循环负责
+# （见 docs/tasks/SG-1_tests.md §2 F1：T1.1 / T1.3 / T1.6）。R-08 与 T1.6 同源，
+# 只留 T1.6 一条，不重复。等价语义见 tests/test_core_runtime.py 的 T1.x。
 # ---------------------------------------------------------------------------
 # 1.10 route fallback 循环检测 (R-09 ~ R-10)
 # ---------------------------------------------------------------------------
@@ -823,7 +630,7 @@ async def test_handle_non_stream_uses_pipeline_engine():
     # 设置 mock engine
     mock_engine = Mock(spec=PipelineEngine)
     mock_group = ModelGroup(id=1, name="fast", type="random_weights")
-    mock_engine.route = AsyncMock(return_value={
+    mock_engine.run = AsyncMock(return_value={
         "model": "fast",
         "choices": [{"message": {"content": "Hello"}}],
         "usage": {"prompt_tokens": 10, "completion_tokens": 5},
@@ -846,10 +653,10 @@ async def test_handle_non_stream_uses_pipeline_engine():
             internal, mock_request, lambda x: x,
         )
 
-    # 验证使用了 engine.route
-    mock_engine.route.assert_called_once()
-    call_kwargs = mock_engine.route.call_args.kwargs
-    assert call_kwargs.get("stream") is False
+    # 验证使用了 engine.run（SG-1：非流式单入口 run(mode="chat")）
+    mock_engine.run.assert_called_once()
+    call_kwargs = mock_engine.run.call_args.kwargs
+    assert call_kwargs.get("mode") == "chat"
 
 
 # C-05: 验证 engine.route() 收到正确的 group 参数
@@ -859,7 +666,7 @@ async def test_handle_non_stream_passes_group():
 
     mock_engine = Mock(spec=PipelineEngine)
     mock_group = ModelGroup(id=42, name="test_group", type="round_robin")
-    mock_engine.route = AsyncMock(return_value={
+    mock_engine.run = AsyncMock(return_value={
         "model": "test_group",
         "choices": [{"message": {"content": "OK"}}],
         "usage": {},
@@ -879,9 +686,9 @@ async def test_handle_non_stream_passes_group():
          patch.object(core_module, "_get_db", return_value=mock_db):
         await core_module._handle_chat_non_stream(internal, Mock(), lambda x: x)
 
-    # 验证 route 收到的 group 参数
-    call_args = mock_engine.route.call_args
-    assert call_args.kwargs.get("group") is mock_group or call_args[1].get("group") is mock_group
+    # 验证 run 收到的 group 参数（_drive_chat 以位置参数传 group）
+    call_args = mock_engine.run.call_args
+    assert call_args.args[1] is mock_group or call_args.kwargs.get("group") is mock_group
 
 
 # C-06: 验证 stream=False 被显式传递
@@ -891,7 +698,7 @@ async def test_handle_non_stream_stream_false():
 
     mock_engine = Mock(spec=PipelineEngine)
     mock_group = ModelGroup(id=1, name="fast", type="random_weights")
-    mock_engine.route = AsyncMock(return_value={
+    mock_engine.run = AsyncMock(return_value={
         "model": "fast",
         "choices": [{"message": {"content": "OK"}}],
         "usage": {},
@@ -911,8 +718,8 @@ async def test_handle_non_stream_stream_false():
          patch.object(core_module, "_get_db", return_value=mock_db):
         await core_module._handle_chat_non_stream(internal, Mock(), lambda x: x)
 
-    call_kwargs = mock_engine.route.call_args.kwargs
-    assert call_kwargs.get("stream") is False
+    call_kwargs = mock_engine.run.call_args.kwargs
+    assert call_kwargs.get("mode") == "chat"
 
 
 # C-07: PipelineEngine 返回的结果正确传递给 format_response
@@ -928,7 +735,7 @@ async def test_handle_non_stream_preserves_response():
 
     mock_engine = Mock(spec=PipelineEngine)
     mock_group = ModelGroup(id=1, name="fast", type="random_weights")
-    mock_engine.route = AsyncMock(return_value=engine_result)
+    mock_engine.run = AsyncMock(return_value=engine_result)
     core_module._engine = mock_engine
 
     mock_db = AsyncMock(spec=Database)
@@ -959,27 +766,32 @@ async def test_handle_non_stream_preserves_response():
 # ---------------------------------------------------------------------------
 
 
-# TC-27: _stream_common 仍通过 _get_extra_route_params() + PipelineEngine 执行
-async def test_stream_common_still_uses_pipeline_engine():
-    """回归测试：streaming 路径仍使用 _get_extra_route_params 返回 4 元组 (group_id, engine, group_obj, safe_extra)."""
+# TC-27: streaming 路径统一经 core._drive（SG-1 F7：_stream_common 走 _drive）
+async def test_stream_common_uses_driver(monkeypatch):
+    """SG-1 §3.1：streaming 路径不再经由 ``_get_extra_route_params()`` + ``PipelineEngine``
+    自行路由/重试，而是统一调用 ``core._drive``（驱动四步骨架，组级降级与端点重试都迁
+    入此骨架）。本用例断言 ``_stream_common`` 确实把流式活儿委托给 ``_drive``，且自身
+    不再持有路由/重试逻辑。"""
     import botflow.core as core_module
 
-    mock_engine = Mock()
-    mock_group = ModelGroup(id=1, name="fast", type="random_weights")
-    mock_params_result = (1, mock_engine, mock_group, {})
+    drive_calls: list = []
 
-    with patch.object(core_module, "_get_extra_route_params",
-                      new_callable=AsyncMock) as mock_params, \
-         patch.object(core_module, "_get_engine", return_value=mock_engine):
-        mock_params.return_value = mock_params_result
+    async def _fake_drive(internal, mode="stream", serialize=None, done_signal=None, request=None):
+        drive_calls.append((internal, mode))
+        # 返回一个空异步流，让 _stream_common 的迭代不报错
+        return
+        yield  # noqa: unreachable (makes this an async generator)
 
-        group_id, engine, active_group, safe_extra = await core_module._get_extra_route_params(
-            {"model": "fast", "stream": True},
-        )
-        assert group_id == 1
-        assert engine is mock_engine
-        assert active_group is mock_group
-        assert safe_extra == {}
+    monkeypatch.setattr(core_module, "_drive", _fake_drive)
+    monkeypatch.setattr(core_module, "_log_call", AsyncMock())
+
+    # _stream_common(internal, serialize) 内部应调用 _drive(internal, mode="stream")
+    _ = [line async for line in core_module._stream_common(
+        {"model": "fast", "messages": []}, lambda c: [""],
+    )]
+
+    assert drive_calls, "_stream_common must delegate to core._drive"
+    assert drive_calls[0][1] == "stream"
 
 
 # TC-28: 验证 _handle_chat_non_stream 使用 PipelineEngine 而非 GroupRouter
@@ -989,7 +801,7 @@ async def test_handle_non_stream_uses_pipeline_engine_not_group_router():
 
     mock_engine = Mock(spec=PipelineEngine)
     mock_group = ModelGroup(id=1, name="fast", type="random_weights")
-    mock_engine.route = AsyncMock(return_value={
+    mock_engine.run = AsyncMock(return_value={
         "model": "fast",
         "choices": [{"message": {"content": "OK"}}],
         "usage": {},
@@ -1009,7 +821,48 @@ async def test_handle_non_stream_uses_pipeline_engine_not_group_router():
          patch.object(core_module, "_get_db", return_value=mock_db):
         await core_module._handle_chat_non_stream(internal, Mock(), lambda x: x)
 
-    # 验证使用了 engine.route 而非 GroupRouter
-    mock_engine.route.assert_called_once()
-    call_args = mock_engine.route.call_args
-    assert call_args.kwargs.get("group") is mock_group or call_args[1].get("group") is mock_group
+    # 验证使用了 engine.run（而非 GroupRouter）
+    mock_engine.run.assert_called_once()
+    call_args = mock_engine.run.call_args
+    assert call_args.args[1] is mock_group or call_args.kwargs.get("group") is mock_group
+
+
+# ---------------------------------------------------------------------------
+# SG-1 F5：PipelineEngine.stream_events 是 run(mode="stream") 的透传别名
+# ---------------------------------------------------------------------------
+
+
+async def test_pipeline_engine_stream_events_delegates_to_inner_run():
+    """SG-1 F5：``PipelineEngine.stream_events`` 必须在**一次 await** 内把内层别名
+    转成 mode="stream" 并原样返回**事件异步生成器**（与驱动契约
+    ``gen = await engine.run(...)`` 同款）。少了 ``await`` 就只能拿到协程，
+    ``async for`` 会报 ``requires __aiter__``。
+    """
+    calls: list = []
+
+    async def _fake_inner_run(strategy=None, group=None, *, mode="chat", **kw):
+        calls.append((strategy, group, mode))
+        assert mode == "stream"
+
+        async def _gen():
+            yield ("chunk", {"choices": [{"delta": {"content": "a"}}]})
+            yield ("state", {"recoverable": False})
+
+        return _gen()
+
+    engine = PipelineEngine(
+        db_factory=lambda: MagicMock(spec=Database), cooldown=CooldownManager(),
+    )
+    engine._inner.run = _fake_inner_run
+
+    sentinel_group = MagicMock()
+    gen = await engine.stream_events(
+        group=sentinel_group, messages=[{"role": "user", "content": "hi"}],
+    )
+    events = [ev async for ev in gen]
+
+    assert len(calls) == 1
+    assert calls[0][1] is sentinel_group
+    assert calls[0][2] == "stream"
+    assert events[0] == ("chunk", {"choices": [{"delta": {"content": "a"}}]})
+    assert events[-1] == ("state", {"recoverable": False})
