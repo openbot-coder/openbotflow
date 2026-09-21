@@ -667,7 +667,7 @@ GET /admin/strategies
 
 | 依赖 | 必须/可选 | 说明 |
 |------|----------|------|
-| `langgraph>=0.2.0` | **必须** | 路由图引擎与 `langgraph` 类型策略都依赖它 |
+| `langgraph>=1.0` | **必须** | 路由图引擎与 `langgraph` 类型策略都依赖它；下限 1.0 是 `langgraph.config.get_stream_writer`（图内推 chunk）的硬前提（2026-09-21 由 `>=0.2.0` 提升） |
 | `langchain-core` | 传递引入 | 由 `langgraph` 依赖链带入 |
 
 实施时按决策改为 hard 依赖：安装即用，不再「未安装则静默跳过」——`pipeline/__init__.py` 无条件 import `LangGraphStrategy`。
@@ -676,7 +676,7 @@ GET /admin/strategies
 # pyproject.toml
 dependencies = [
     ...
-    "langgraph>=0.2.0",
+    "langgraph>=1.0",
 ]
 
 [project.optional-dependencies]

@@ -197,7 +197,13 @@ raw_sessions (gzip blobs)
 
 ### 3.5 Stream 模式
 
-`stream: true` 时返回 SSE 流。**流式路由只做端点选择**，实际迭代与重试由调用方（`core.py`）完成；fallback 分组**只尝试一次**。
+`stream: true` 时返回 SSE 流。**流式与非流式共用同一条调用骨架**：
+
+- **驱动层（图外，`core.py`）** 负责分组、生成策略、以及组级降级循环（最多 3 跳 + 环检测）—— 流式与非流式语义一致。
+- **执行层（图内，`StateGraph`）** 负责单次「策略执行」：选端点 → 逐端点调用。流式下该节点经 `langgraph.config.get_stream_writer()` 推送 provider chunk，由驱动层完成 SSE 序列化与落库。
+- 已推出首个 chunk 之后失败（`stream_started=True`）**不再降级**，只报错 —— 已下发内容无法收回。
+
+> **本节描述目标态**（`docs/pipeline-single-graph-design.md` v2）。现状是「流式路由只做端点选择、`core._stream_common` 自行重试、fallback 分组只尝试一次」，该实现将在阶段一被替换。
 
 ---
 
@@ -212,36 +218,39 @@ raw_sessions (gzip blobs)
 AuthMiddleware（客户端 Key 校验）
   │
   ▼
-Group 解析（model → group，或默认组）
+驱动层（图外，core.py）—— 四步骨架
   │
-  ▼
-PipelineEngine.route / route_stream
-  │
-  ▼
-LangGraphEngine StateGraph:
-  resolve_group → load_and_select → try_call → 条件边
-  │
-  ├─ 端点缓存（TTL，单一事实源在 router.py，_shared.py 仅 re-export）
-  ├─ 冷却过滤
-  ├─ 策略选择（group.type 决定）
-  └─ 每端点重试（ep.max_retries；retryable = 429/500/502/503/504/timeout）
-  │
-  ▼
-Context Window Truncation（若组内最小 context_window > 0）
-  │
-  ▼
-上游调用
+  ├─ ① 分组：model → group（或默认组）
+  ├─ ② 取模板 + 参数：STRATEGY_REGISTRY[group.type] + group.params
+  ├─ ③ 生成策略：strategy_cls(params)
+  └─ ④ 循环「策略执行 / 失败降级到 backup 组」（最多 3 跳 + 环检测）
+         │
+         ▼
+      StateGraph（图内）—— 单次「策略执行」
+         │
+         ├─ 端点缓存（TTL，单一事实源在 router.py，_shared.py 仅 re-export）
+         ├─ 冷却过滤
+         ├─ 策略选择（group.type 决定）
+         ├─ 每端点重试（ep.max_retries；retryable = 429/500/502/503/504/timeout）
+         └─ Context Window Truncation（若组内最小 context_window > 0）
+         │
+         ▼
+      上游调用
 ```
+
+> **本节描述目标态**（`docs/pipeline-single-graph-design.md` v2）。现状的 `PipelineEngine.route / route_stream` 与「图内 `resolve_group → load_and_select → try_call → 条件边`」将在阶段一被替换。
 
 ### 4.2 Fallback 语义（重要）
 
-**失败不保证一定有 fallback。** `_route_after_call` 在端点失败后总是返回 `"fallback"`，但 `_resolve_group` 在以下情况返回 `fatal_error` 并直接终止（不再重试）：
+**降级由驱动层统一负责**（图外，流式与非流式同一套），失败不保证一定有 fallback。终止条件：
 
-- `fallback_group_id` 为空或指向不存在的组
+- `fallback_group_id` 为空，或指向的组不存在
 - 降级深度 > 3
-- 检测到 fallback 环路
+- 检测到 fallback 环路（`visited_groups`）
 
-流式路径的 fallback 分组**只尝试一次**（由 `fallback_attempted` 标志控制）。
+**哪些失败允许降级**由图在出口写入的 `recoverable` 标志决定：图内的失败（选端点、逐端点调用、首 chunk 之前）→ 可降级；驱动层的配置错误（未知策略名、`langgraph` 策略被拒）、以及已推出 chunk 之后的失败 → 不可降级。逐条判定见 `docs/pipeline-single-graph-design.md §3.5`。
+
+> **本节描述目标态**（`docs/pipeline-single-graph-design.md` v2）。现状是非流式由图的 `_route_after_call` / `_resolve_group` 承担最多 3 跳、流式由 `core._stream_common` 的 `fallback_attempted` 只降 1 跳 —— 两者将在阶段一合并到驱动层。
 
 ### 4.3 策略系统
 
