@@ -297,6 +297,10 @@ AuthMiddleware（客户端 Key 校验）
 | 方法 | 路径 | 功能 |
 |------|------|------|
 | GET | `/admin/` | 内置管理面板 |
+| GET | `/admin/auth/status` | 管理员账号开通状态（免鉴权） |
+| POST | `/admin/auth/setup` | 用 Admin Token 开通 / 重置管理账号 |
+| POST | `/admin/auth/login` | 账号密码登录，换取会话 token |
+| POST | `/admin/auth/logout` | 注销会话（带任意非空 token 即 200） |
 | POST / GET | `/admin/providers` | 创建 / 列出 Provider |
 | GET / PATCH / DELETE | `/admin/providers/{id}` | 详情 / 更新 / 删除 |
 | POST / GET | `/admin/models` | 创建 / 列出 Model |

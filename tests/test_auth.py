@@ -150,7 +150,10 @@ class TestVerifyAdminKey:
         finally:
             set_config(None)
 
-    async def test_invalid(self, monkeypatch):
+    async def test_invalid(self, db, monkeypatch):
+        # R5（admin_auth）：verify_admin_key 错 token 会进 session 分支体内 get_db()，
+        # 直调测试必须把 auth.get_db 指到本测试的库，否则依赖全局 _active_db（跨测试脏状态）。
+        monkeypatch.setattr("botflow.auth.get_db", lambda: db)
         set_config(BotflowSettings(admin_key="admin-secret"))
         try:
             class Req:

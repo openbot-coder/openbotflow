@@ -89,14 +89,42 @@ tr:hover td{background:#f8fafc}
   <div v-if="!authenticated" class="login-wrap" data-page-node-id="nfO1aANQ8GMmigpljJ2oBk">
     <div class="login-box" data-page-node-id="KP6MziwV7ECMvKx3a8OjpG">
       <h1 data-page-node-id="UxH4bmum5BrW9vetAEygTu">Botflow Admin</h1>
-      <p data-page-node-id="Srw4jv8By314h3q4WSqF9B">LLM 网关管理面板</p>
-      <div class="form-group" data-page-node-id="yacHVttRdmzXBmXrBSoED0">
-        <label data-page-node-id="KI5DzOhrGsEQM4Dybv3gMG">Admin Key</label>
-        <input v-model="loginKey" type="password" placeholder="输入管理员密钥" @keyup.enter="doLogin" data-page-node-id="mkLpiEQWjLzUKcK2yR6iIS">
-      </div>
-      <p v-if="loginError" style="color:#ef4444;font-size:13px;margin-bottom:12px" data-page-node-id="IdbetHvH4vNAFNDrjihHBi">{{loginError}}</p>
-      <button class="btn btn-primary" style="width:100%" @click="doLogin" :disabled="loginLoading" data-page-node-id="Ie95uPCBp8pOY7t4VIC8NV">
-        {{loginLoading ? '验证中...' : '登录'}}
+      <p data-page-node-id="Srw4jv8By314h3q4WSqF9B">{{setupMode ? '首次使用：用 Admin Token 开通管理账号' : 'LLM 网关管理面板'}}</p>
+
+      <!-- 开通表单（status: configured=false） -->
+      <template v-if="setupMode">
+        <div class="form-group">
+          <label>Admin Token</label>
+          <input v-model="setupToken" type="password" placeholder="输入管理员密钥" @keyup.enter="doSetup">
+        </div>
+        <div class="form-group">
+          <label>用户名</label>
+          <input v-model="setupUsername" placeholder="登录用户名" @keyup.enter="doSetup">
+        </div>
+        <div class="form-group">
+          <label>密码</label>
+          <input v-model="setupPassword" type="password" placeholder="至少 8 位" @keyup.enter="doSetup">
+        </div>
+      </template>
+
+      <!-- 登录表单（status: configured=true，用户名预填） -->
+      <template v-else>
+        <div class="form-group">
+          <label>用户名</label>
+          <input v-model="loginUsername" placeholder="用户名" @keyup.enter="doLogin">
+        </div>
+        <div class="form-group">
+          <label>密码</label>
+          <input v-model="loginPassword" type="password" placeholder="密码" @keyup.enter="doLogin">
+        </div>
+        <p style="font-size:13px;margin-bottom:16px">
+          <a style="color:var(--accent);cursor:pointer" @click="useTokenReset">用 Token 重置</a>
+        </p>
+      </template>
+
+      <p v-if="loginError" style="color:#ef4444;font-size:13px;margin-bottom:12px">{{loginError}}</p>
+      <button class="btn btn-primary" style="width:100%" @click="setupMode ? doSetup() : doLogin()" :disabled="loginLoading">
+        {{loginLoading ? '验证中...' : (setupMode ? '开通' : '登录')}}
       </button>
     </div>
   </div>
@@ -419,16 +447,26 @@ const {createApp,ref,reactive,computed,onMounted,watch,nextTick} = Vue;
 
 createApp({
   setup(){
-    // Auth
-    const loginKey = ref(localStorage.getItem('bf_admin_key')||'');
-    const authenticated = ref(!!localStorage.getItem('bf_admin_key'));
+    // Auth —— 会话 token（bf_admin_token）取代旧的明文 admin key。legacy
+    // bf_admin_key 启动即清：残留只会让人以为还能用密钥直接登录（A1）。
+    localStorage.removeItem('bf_admin_key');
+    const TOKEN_KEY = 'bf_admin_token';
+    const savedToken = localStorage.getItem(TOKEN_KEY) || '';
+    const authenticated = ref(!!savedToken);
+    const adminKey = ref(savedToken);   // api() 的 Bearer 来源；空则不发 Authorization 头
+    const setupMode = ref(false);       // 视图由 status 决定：false=登录表单，true=开通表单
+    const setupToken = ref('');
+    const setupUsername = ref('');
+    const setupPassword = ref('');
+    const loginUsername = ref('');
+    const loginPassword = ref('');
     const loginError = ref('');
     const loginLoading = ref(false);
-    const adminKey = ref(loginKey.value);
 
     // API
     async function api(path, opts={}){
-      const headers = {'Authorization':'Bearer '+adminKey.value,'Content-Type':'application/json',...(opts.headers||{})};
+      const headers = {'Content-Type':'application/json',...(opts.headers||{})};
+      if(adminKey.value) headers['Authorization'] = 'Bearer '+adminKey.value;
       const r = await fetch('/admin'+path, {...opts, headers});
       if(!r.ok){
         // FastAPI `detail` may be a string, an object ({success,error}) or a
@@ -438,7 +476,15 @@ createApp({
         let msg = r.statusText || ('HTTP '+r.status);
         if(typeof d === 'string') msg = d;
         else if(d && typeof d === 'object') msg = d.error || d.message || JSON.stringify(d);
-        throw new Error(msg);
+        const err = new Error(msg);
+        err.status = r.status;
+        // 已登录态吃到 401 = 会话已失效（过期 / 被重置 / 被踢）：清 token 回登录页，
+        // 否则用户对着一个全空的面板反复点刷新。登录/开通走原生 authPost，进不到这里。
+        if(r.status===401 && authenticated.value){
+          clearSession();
+          toast('登录已失效，请重新登录', 'error');
+        }
+        throw err;
       }
       return r.json();
     }
@@ -497,24 +543,80 @@ createApp({
     function confirmCancel(){ confirmState.show = false; confirmState.onOk = null; }
 
     // Login
+    // 登录/开通专用 POST：不走 api() —— 那时还没有会话 token，api() 的全局 401
+    // 踢出会把一次普通的"密码错误"变成"被踢回登录页"，错误也没法细展示。
+    async function authPost(path, payload){
+      const r = await fetch('/admin/auth/'+path, {
+        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+      const body = await r.json().catch(()=>({}));
+      if(!r.ok){
+        const d = body.detail;
+        let msg = r.statusText || ('HTTP '+r.status);
+        if(typeof d === 'string') msg = d;
+        else if(d && typeof d === 'object') msg = d.error || d.message || JSON.stringify(d);
+        const err = new Error(msg);
+        err.status = r.status;
+        throw err;
+      }
+      return body;
+    }
     async function doLogin(){
       loginLoading.value = true;
       loginError.value = '';
       try{
-        adminKey.value = loginKey.value;
-        await api('/stats/models?limit=1');
-        localStorage.setItem('bf_admin_key', loginKey.value);
+        const r = await authPost('login', {username: loginUsername.value, password: loginPassword.value});
+        localStorage.setItem(TOKEN_KEY, r.token);
+        adminKey.value = r.token;
         authenticated.value = true;
         await loadAll();
       }catch(e){
-        loginError.value = '密钥验证失败: '+e.message;
-        adminKey.value = '';
+        // 401 显示中性文案，不回显服务端细节、不区分是用户名还是密码错
+        loginError.value = e.status===401 ? '用户名或密码错误' : e.message;
       }finally{ loginLoading.value = false; }
     }
-    function doLogout(){
-      localStorage.removeItem('bf_admin_key');
-      authenticated.value = false;
+    async function doSetup(){
+      loginLoading.value = true;
+      loginError.value = '';
+      try{
+        await authPost('setup', {token: setupToken.value, username: setupUsername.value, password: setupPassword.value});
+        // 开通成功切回登录表单：密码不留在状态里，用户名取 strip 后的值
+        // （服务端存的就是 strip 后的），预填好直接登录
+        setupMode.value = false;
+        loginUsername.value = setupUsername.value.trim();
+        setupToken.value = '';
+        setupPassword.value = '';
+        toast('账号已开通，请登录');
+      }catch(e){
+        loginError.value = e.message;   // token 错 → 401 "Invalid admin key."；字段违规 → 422 明细
+      }finally{ loginLoading.value = false; }
+    }
+    function useTokenReset(){
+      // 用 Token 重置：切回开通表单（仍要 BOTFLOW_ADMIN_KEY 才能改账号）
+      setupMode.value = true;
+      setupUsername.value = loginUsername.value;   // 默认保留原用户名，只换密码
+      setupToken.value = '';
+      setupPassword.value = '';
+      loginPassword.value = '';
+      loginError.value = '';
+    }
+    function clearSession(){
+      localStorage.removeItem(TOKEN_KEY);
       adminKey.value = '';
+      authenticated.value = false;
+    }
+    async function doLogout(){
+      // 先通知服务端删会话（best effort）：甲案下带 token 恒 200，失败只可能是
+      // 网络故障 —— 本地登出不能被它卡住，接口失败也照清本地。
+      try{
+        if(adminKey.value){
+          await fetch('/admin/auth/logout', {
+            method:'POST',
+            headers:{'Content-Type':'application/json','Authorization':'Bearer '+adminKey.value},
+            body:'{}',
+          });
+        }
+      }catch(e){ /* 网络失败忽略：本地退出不被它挡住 */ }
+      clearSession();
     }
 
     // Data loading
@@ -715,8 +817,16 @@ createApp({
       }
     }
 
-    // Init: load data + group details
+    // Init: status 决定视图 → 数据
     onMounted(async ()=>{
+      // 视图（开通 vs 登录）由服务端状态决定，前端不猜；username 用于登录表单预填
+      try{
+        const r = await fetch('/admin/auth/status').then(x=>x.json());
+        setupMode.value = !r.configured;
+        if(r.username) loginUsername.value = r.username;
+        // 账号已不存在（如被重置）时旧会话必然无效：别进面板吃一轮 401 再被踢
+        if(adminKey.value && !r.configured) clearSession();
+      }catch(e){ /* status 取不到不阻塞启动：保留默认登录视图，token 有效性由首个 API 的 401 兜底 */ }
       if(authenticated.value){
         await loadAll();
         for(const g of groups.value) await loadGroupDetails(g.id);
@@ -724,7 +834,9 @@ createApp({
     });
 
     return {
-      loginKey, authenticated, loginError, loginLoading, adminKey,
+      authenticated, adminKey, loginError, loginLoading,
+      setupMode, setupToken, setupUsername, setupPassword,
+      loginUsername, loginPassword, doSetup, useTokenReset,
       pages, page, currentPageLabel, toasts, modal,
       providers, models, groups, apikeys, logs, stats, strategies, summaries,
       loading, logFilters, summaryDate, newModelForGroup,

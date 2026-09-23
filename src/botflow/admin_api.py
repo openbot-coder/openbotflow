@@ -4,12 +4,23 @@ Replaces the old MCP-based management tools with plain HTTP endpoints guarded
 by the admin key (BOTFLOW_ADMIN_KEY). Each route maps 1:1 to a former MCP tool.
 """
 
+import json
+import secrets
 from typing import Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
+from pydantic import BaseModel, Field, field_validator
 
-from botflow.auth import verify_admin_key
+from botflow.auth import (
+    SESSION_TTL_SECONDS,
+    _extract_token,
+    _require_admin_key,
+    create_session,
+    hash_password,
+    session_config_key,
+    verify_admin_key,
+    verify_password,
+)
 from botflow.router import invalidate_endpoint_cache, invalidate_all_caches
 from botflow.storage.db import get_db
 from botflow.storage.models import ApiKey
@@ -86,6 +97,121 @@ class UpdateGroupReq(BaseModel):
 
 class UpdateApiKeyReq(BaseModel):
     is_enabled: bool
+
+
+# ---------------------------------------------------------------------------
+# Auth（账号开通 / 登录 / 注销）
+#
+# setup 与 login 共用一个 body 模型：字段和校验完全一样，setup 只是多一个可选
+# token（引导期唯一的准入凭据）。校验放在模型层是刻意的 —— pbkdf2 在端点里才跑，
+# 422 必须拦在它之前，超长密码才不会进入哈希计算（P1-6）。
+# ---------------------------------------------------------------------------
+class AuthReq(BaseModel):
+    # 缺省空串：token 缺失与 token 错误统一走端点内的 401 "Invalid admin key."，
+    # 不让"没带 token"以 422 的形式漏出不同的失败形态。
+    token: str = ""
+    username: str = Field(..., min_length=1, max_length=64)
+    password: str = Field(..., min_length=8, max_length=128)
+
+    @field_validator("username", mode="before")
+    @classmethod
+    def _strip_username(cls, v):
+        # 先 strip 再过 Field 约束：" admin " 与 "admin" 必须是同一个账号，
+        # 纯空格按 min_length=1 判 422。
+        return v.strip() if isinstance(v, str) else v
+
+
+class LogoutReq(BaseModel):
+    token: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Auth endpoints
+# ---------------------------------------------------------------------------
+
+
+@admin_router.get("/auth/status")
+async def auth_status():
+    """账号开通状态。免鉴权：面板冷启动时还没有任何会话，要靠它决定显示开通
+    表单还是登录表单。只回 configured / username，绝不回 pwd_hash 或 token。"""
+    db = get_db()
+    raw = await db.get_config("admin_account")
+    username = ""
+    if raw:
+        try:
+            username = str(json.loads(raw).get("username", ""))
+        except (ValueError, AttributeError):
+            username = ""  # 损坏行不修数据：仍报已开通，登录时自然 401
+    return {"success": True, "configured": bool(raw), "username": username}
+
+
+@admin_router.post("/auth/setup")
+async def auth_setup(req: AuthReq):
+    """开通 / 重置管理账号。不挂 verify_admin_key —— 准入凭据只有 token 字段
+    （必须等于 BOTFLOW_ADMIN_KEY），它是整条信任链的根，所以错一律 401。"""
+    if not secrets.compare_digest(
+        req.token.encode("utf-8"), _require_admin_key().encode("utf-8")
+    ):
+        raise HTTPException(status_code=401, detail="Invalid admin key.")
+    db = get_db()
+    await db.set_config(
+        "admin_account",
+        json.dumps({"username": req.username, "pwd_hash": hash_password(req.password)}),
+    )
+    # 重置即全量吊销：cleanup_config_by_prefix 按 updated_at 只删过期行、删不干净
+    # （R3），这里必须 execute_write + LIKE 字面量把所有会话一次清空。
+    # P0-2：LIKE 模式必须带 % —— 不带通配符删 0 行，重置后旧会话仍能进门。
+    await db.execute_write("DELETE FROM config WHERE key LIKE 'admin_sess:%'")
+    return {"success": True}
+
+
+@admin_router.post("/auth/login")
+async def auth_login(req: AuthReq):
+    """账号密码登录，换取会话 token。所有失败路径（账号不存在 / 用户名不符 /
+    密码错）共用一条 401 文案，响应上不可区分，不泄露账号是否存在。"""
+    db = get_db()
+    raw = await db.get_config("admin_account")
+    account = None
+    if raw:
+        try:
+            account = json.loads(raw)
+        except ValueError:
+            account = None
+    pwd_ok = False
+    user_ok = False
+    if isinstance(account, dict):
+        # 两个检查都无条件执行：密码错也照样跑完 pbkdf2，不靠耗时区分失败原因。
+        pwd_ok = verify_password(req.password, str(account.get("pwd_hash", "")))
+        user_ok = secrets.compare_digest(
+            req.username.encode("utf-8"), str(account.get("username", "")).encode("utf-8")
+        )
+    if not (pwd_ok and user_ok):
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+    # 成功路径：先清过期会话再签发。P0-2 —— 前缀必须带 %，否则删 0 行、过期行无限堆积。
+    await db.cleanup_config_by_prefix("admin_sess:%", SESSION_TTL_SECONDS)
+    token = await create_session(db, str(account["username"]))
+    return {"success": True, "token": token}
+
+
+@admin_router.post("/auth/logout")
+async def auth_logout(
+    authorization: Optional[str] = Header(default=None),
+    req: Optional[LogoutReq] = None,
+):
+    """注销会话（甲案）：带任意非空 token 即 200，按 key 直删、不解析有效性。
+
+    已注销与伪造 token 删库后状态相同，先 resolve 再删会让重复登出从 200 变 401
+    （幂等换鉴别力，选幂等）；token 是否有效本来就由后续请求的 401 兜底。
+    """
+    token = _extract_token(authorization)
+    if not token and req is not None:
+        token = req.token  # 允许 body 带 token：Authorization 头不是唯一发法
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing session token.")
+    await get_db().execute_write(
+        "DELETE FROM config WHERE key = ?", (session_config_key(token),)
+    )
+    return {"success": True}
 
 
 # ---------------------------------------------------------------------------
