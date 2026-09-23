@@ -28,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from botflow.admin_api import admin_router
-from botflow.auth import ApiKey, resolve_api_key, verify_admin_key, verify_llm_key
+from botflow.auth import ApiKey, ensure_setup_token, resolve_api_key, verify_admin_key, verify_llm_key
 from botflow.common.exceptions import (
     AllModelsCooldownError,
     NoAvailableModelError,
@@ -322,6 +322,9 @@ async def lifespan(app: FastAPI):
         if not db_llm_key:
             await db.set_config("llm_key", env_llm_key)
             log.info("Synced LLM_KEY from environment to DB config.")
+
+    # Setup token 生命周期维护（生成/轮换/幂等清理，失败非致命，函数内自降级）。
+    await ensure_setup_token(db)
 
     # Auto-configure legacy LLM key into the multi-key table (for log attribution).
     existing = await db.list_api_keys()

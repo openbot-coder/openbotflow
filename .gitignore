@@ -65,3 +65,6 @@ ocr-bin/
 /_*.log
 /_*.txt
 /_*.json
+
+# Setup token 明文（启动自动生成的一次性开通凭证，禁止入库）
+/.setup_token

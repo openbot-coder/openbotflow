@@ -45,7 +45,9 @@ from botflow.storage.db import Database
 
 # D2：实现的实际文案。清单要求中文「用户名或密码错误」——打回项，修复后只改这里。
 LOGIN_401 = "Invalid username or password."
-SETUP_401 = "Invalid admin key."
+# R5①：setup 端点 401 detail 新文案（setup_token_features.md 决策 3）。
+# 仅 setup 端点改；Bearer/verify_admin_key 通道仍是 "Invalid admin key."（T5.3/T4.x 守卫）。
+SETUP_401 = "Invalid setup token."
 ADMIN_KEY = "admin-secret"
 PW = "password123"
 
@@ -78,13 +80,25 @@ def db_patched(db, monkeypatch):
 
 @pytest.fixture
 def client(tmp_path):
-    """HTTP 层 fixture：照 tests/test_admin_api.py 的既有模式。"""
+    """HTTP 层 fixture：照 tests/test_admin_api.py 的既有模式。
+
+    R5⑥：预置 setup token —— 写 KV `admin_setup_token` 哈希 + 写 `.setup_token`
+    文件到 tmp_path（conftest ZG-2 隔离后的落点），明文挂 app.state 供
+    _setup() 读取；否则切换后 T6 全部成功路径 401。
+    """
     d = Database(str(tmp_path / "admin_auth_http.db"))
     asyncio.new_event_loop().run_until_complete(d.initialize())
     set_config(BotflowSettings(admin_key=ADMIN_KEY))
     app = FastAPI()
     app.include_router(admin_router)
     app.dependency_overrides[dbmod.get_db] = lambda: d
+    setup_token = auth_mod.generate_setup_token()
+    auth_mod.write_setup_token_file(auth_mod.get_config().setup_token_path, setup_token)
+    _run(d.set_config(auth_mod.SETUP_TOKEN_KEY, json.dumps({
+        "hash": hashlib.sha256(setup_token.encode("utf-8")).hexdigest(),
+        "created_at": time.time(),
+    })))
+    app.state.setup_token = setup_token
     with TestClient(app) as c:
         yield c
     asyncio.new_event_loop().run_until_complete(d.close())
@@ -132,7 +146,26 @@ async def _seed_old_session(d: Database, token: str) -> str:
     return key
 
 
-def _setup(client, username="alice", password=PW, token=ADMIN_KEY):
+def _preset_setup_token(client) -> str:
+    """R5②：幂等预置 setup token（写 KV sha256 + 写 `.setup_token` 文件），返回明文。
+
+    成功 setup 会双删凭证（F4），成功链里的第二次 _setup 必须重新预置，
+    否则 T6.9/T7.x 等多段成功用例第二次即 401。
+    """
+    token = client.app.state.setup_token
+    auth_mod.write_setup_token_file(auth_mod.get_config().setup_token_path, token)
+    _run(_db_of(client).set_config(auth_mod.SETUP_TOKEN_KEY, json.dumps({
+        "hash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+        "created_at": time.time(),
+    })))
+    return token
+
+
+def _setup(client, username="alice", password=PW, token=None):
+    # R5②：默认凭据 = 预置的 setup token 明文（BOTFLOW_ADMIN_KEY 已退出 setup 流程，
+    # 只有显式传 token 才走反例路径）。
+    if token is None:
+        token = _preset_setup_token(client)
     return client.post("/admin/auth/setup", json={
         "token": token, "username": username, "password": password,
     })
@@ -450,15 +483,21 @@ class TestAuthSetup:
     def test_t6_2_wrong_token_401(self, client):
         r = _setup(client, token="nope")
         assert r.status_code == 401
-        assert r.json()["detail"] == SETUP_401  # P2-12 统一文案
+        # R5③：detail 断言改新文案 "Invalid setup token."（SETUP_401 常量已切）。
+        assert r.json()["detail"] == SETUP_401
 
-    def test_t6_3_unconfigured_500(self, client):
-        set_config(BotflowSettings(admin_key=""))
-        try:
-            r = _setup(client)
-        finally:
-            set_config(BotflowSettings(admin_key=ADMIN_KEY))
-        assert r.status_code == 500
+    def test_t6_3_no_setup_token_kv_401_not_500(self, client):
+        # R5④：原「admin key 未配置 → 500」语义废除（admin key 与 setup 彻底解耦）。
+        # 改断：无 setup token KV 记录 → 401 Invalid setup token.；500 断言删除。
+        d = _db_of(client)
+        _run(d.execute_write(
+            "DELETE FROM config WHERE key = ?", (auth_mod.SETUP_TOKEN_KEY,)
+        ))
+        with _admin_key(""):
+            # 显式传 token → _setup 不重预置，KV 已删 → 落 401。
+            r = _setup(client, token=client.app.state.setup_token)
+        assert r.status_code == 401
+        assert r.json()["detail"] == SETUP_401
 
     def test_t6_4_username_whitespace_only_422(self, client):
         r = _setup(client, username="   ")  # strip 后为空
@@ -530,7 +569,10 @@ class TestAuthSetup:
 
     def test_t6_13_non_ascii_token_401_not_500(self, client):
         r = _setup(client, token="中文token")
-        assert r.status_code == 401  # bytes 比对，不 TypeError→500
+        # R5⑤：状态码 401 不变；实现依据从「bytes 比对」改「sha256 后比 hex」
+        # （先哈希再比 hex，天然无 compare_digest TypeError）；detail 断言随
+        # SETUP_401 常量切到新文案。
+        assert r.status_code == 401
         assert r.json()["detail"] == SETUP_401
 
 

@@ -4,6 +4,7 @@ Replaces the old MCP-based management tools with plain HTTP endpoints guarded
 by the admin key (BOTFLOW_ADMIN_KEY). Each route maps 1:1 to a former MCP tool.
 """
 
+import hashlib
 import json
 import secrets
 from typing import Optional
@@ -13,14 +14,15 @@ from pydantic import BaseModel, Field, field_validator
 
 from botflow.auth import (
     SESSION_TTL_SECONDS,
+    SETUP_TOKEN_KEY,
     _extract_token,
-    _require_admin_key,
     create_session,
     hash_password,
     session_config_key,
     verify_admin_key,
     verify_password,
 )
+from botflow.config import get_config
 from botflow.router import invalidate_endpoint_cache, invalidate_all_caches
 from botflow.storage.db import get_db
 from botflow.storage.models import ApiKey
@@ -107,7 +109,7 @@ class UpdateApiKeyReq(BaseModel):
 # 422 必须拦在它之前，超长密码才不会进入哈希计算（P1-6）。
 # ---------------------------------------------------------------------------
 class AuthReq(BaseModel):
-    # 缺省空串：token 缺失与 token 错误统一走端点内的 401 "Invalid admin key."，
+    # 缺省空串：token 缺失与 token 错误统一走端点内的 401 "Invalid setup token."，
     # 不让"没带 token"以 422 的形式漏出不同的失败形态。
     token: str = ""
     username: str = Field(..., min_length=1, max_length=64)
@@ -148,12 +150,30 @@ async def auth_status():
 @admin_router.post("/auth/setup")
 async def auth_setup(req: AuthReq):
     """开通 / 重置管理账号。不挂 verify_admin_key —— 准入凭据只有 token 字段
-    （必须等于 BOTFLOW_ADMIN_KEY），它是整条信任链的根，所以错一律 401。"""
-    if not secrets.compare_digest(
-        req.token.encode("utf-8"), _require_admin_key().encode("utf-8")
-    ):
-        raise HTTPException(status_code=401, detail="Invalid admin key.")
+    （必须等于启动时自动生成的 setup token，KV 中只存它的 sha256），错一律 401。
+
+    BOTFLOW_ADMIN_KEY 已退出 setup 流程（它只守 Bearer 通道），所以这里
+    **不再存在 500 分支**：无 KV 记录也回 401，与 token 错误同文案。
+    """
+    if not req.token:
+        # 空/缺失 token 短路（AuthReq 缺省 "" 与显式空串同路径），不进哈希比对。
+        raise HTTPException(status_code=401, detail="Invalid setup token.")
     db = get_db()
+    raw = await db.get_config(SETUP_TOKEN_KEY)
+    if not raw:
+        # 无 KV 记录（未走启动钩子 / 已开通双删）→ 401；原「admin key 未配置 → 500」废除。
+        raise HTTPException(status_code=401, detail="Invalid setup token.")
+    try:
+        stored_hash = str(json.loads(raw).get("hash", ""))
+    except (ValueError, AttributeError, TypeError):
+        stored_hash = ""  # KV 行损坏 → 比对必不等 → 401，不当场修数据
+    # 先哈希再比 hex：任意字节都可哈希，非 ASCII token 天然 401 而非 TypeError 500；
+    # compare_digest 常数时间比对，不因耗时泄漏。
+    if not secrets.compare_digest(
+        hashlib.sha256(req.token.encode("utf-8")).hexdigest().encode(),
+        stored_hash.encode("utf-8"),
+    ):
+        raise HTTPException(status_code=401, detail="Invalid setup token.")
     await db.set_config(
         "admin_account",
         json.dumps({"username": req.username, "pwd_hash": hash_password(req.password)}),
@@ -162,6 +182,12 @@ async def auth_setup(req: AuthReq):
     # （R3），这里必须 execute_write + LIKE 字面量把所有会话一次清空。
     # P0-2：LIKE 模式必须带 % —— 不带通配符删 0 行，重置后旧会话仍能进门。
     await db.execute_write("DELETE FROM config WHERE key LIKE 'admin_sess:%'")
+    # 成功双删（用毕即焚）：只在 200 路径执行；401 失败路径绝不清理（防自锁）。
+    await db.execute_write("DELETE FROM config WHERE key = ?", (SETUP_TOKEN_KEY,))
+    try:
+        get_config().setup_token_path.unlink()  # FileNotFoundError 幂等吞掉（T4.4）
+    except FileNotFoundError:
+        pass
     return {"success": True}
 
 

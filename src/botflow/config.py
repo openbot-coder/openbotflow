@@ -1,5 +1,6 @@
 """Global configuration management."""
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -24,6 +25,8 @@ class BotflowSettings(BaseSettings):
     admin_key: str = ""
     # Multiple client API keys (comma-separated). Empty => use llm_key for all.
     api_keys: str = ""
+    # Setup token 明文文件路径（env: BOTFLOW_SETUP_TOKEN_FILE）。空 => 项目根/.setup_token。
+    setup_token_file: str = ""
 
     # Logging
     log_level: str = "INFO"
@@ -63,6 +66,24 @@ class BotflowSettings(BaseSettings):
     model_sync_interval: int = 60
 
     model_config = {"env_prefix": "BOTFLOW_", "env_file": ".env", "extra": "ignore"}
+
+    @property
+    def setup_token_path(self) -> Path:
+        """setup token 明文文件的绝对路径。
+
+        解析顺序（call-time env 兜底是刻意的：settings 单例可能在
+        ``BOTFLOW_SETUP_TOKEN_FILE`` 被设置之前就构造好，字段会停在空串，
+        只有调用时再查一次 env 才能拿到测试/运行期注入的值）：
+        ① ``setup_token_file`` 字段非空 → 相对路径以项目根解析、绝对路径直接用；
+        ② 字段为空 → call-time 查 ``BOTFLOW_SETUP_TOKEN_FILE``，同规则解析；
+        ③ 仍为空 → 项目根 / ``.setup_token``（config.py 出发 parents[2] 即项目根）。
+        """
+        raw = self.setup_token_file or os.environ.get("BOTFLOW_SETUP_TOKEN_FILE", "")
+        root = Path(__file__).resolve().parents[2]
+        if not raw:
+            return root / ".setup_token"
+        path = Path(raw)
+        return path if path.is_absolute() else root / path
 
 
 def load_config(workspace_path: Optional[Path] = None) -> BotflowSettings:

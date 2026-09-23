@@ -95,7 +95,7 @@ tr:hover td{background:#f8fafc}
       <template v-if="setupMode">
         <div class="form-group">
           <label>Admin Token</label>
-          <input v-model="setupToken" type="password" placeholder="输入管理员密钥" @keyup.enter="doSetup">
+          <input v-model="setupToken" type="password" placeholder="输入开通 Token" @keyup.enter="doSetup">
         </div>
         <div class="form-group">
           <label>用户名</label>
@@ -587,11 +587,11 @@ createApp({
         setupPassword.value = '';
         toast('账号已开通，请登录');
       }catch(e){
-        loginError.value = e.message;   // token 错 → 401 "Invalid admin key."；字段违规 → 422 明细
+        loginError.value = e.message;   // token 错 → 401 "Invalid setup token."；字段违规 → 422 明细
       }finally{ loginLoading.value = false; }
     }
     function useTokenReset(){
-      // 用 Token 重置：切回开通表单（仍要 BOTFLOW_ADMIN_KEY 才能改账号）
+      // 用 Token 重置：切回开通表单（仍要有效的开通 Token 才能改账号，用毕即焚）
       setupMode.value = true;
       setupUsername.value = loginUsername.value;   // 默认保留原用户名，只换密码
       setupToken.value = '';

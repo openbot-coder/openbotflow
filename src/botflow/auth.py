@@ -4,16 +4,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
 import time
+from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from botflow.common.logger import get_logger
 from botflow.config import get_config
 from botflow.storage.db import Database, get_db
 from botflow.storage.models import ApiKey
+
+# Setup token 生命周期（生成 → 开通为止）相关日志走现成 loguru。
+_log = get_logger("auth")
 
 # Security scheme reused by Swagger UI for both LLM and admin auth.
 #
@@ -212,3 +218,135 @@ async def verify_admin_key(
             detail="Invalid admin key.",
         )
     request.state.is_admin = True
+
+
+# ---------------------------------------------------------------------------
+# Setup token（系统自动生成的一次性开通凭证）
+#
+# 与 BOTFLOW_ADMIN_KEY 是两个东西：setup token 只管 POST /admin/auth/setup 的
+# 首次开通/重置，用毕（成功开通）即从 KV 与文件双删；admin key 的 Bearer 通道
+# 不受这里影响。明文只存在两处，均在服务器侧：.setup_token 文件（0600）+ 启动
+# 日志一行；DB 只存 sha256 哈希 + 生成时间。
+# ---------------------------------------------------------------------------
+
+# config KV 中 setup token 记录的 key（value = {"hash", "created_at"}，无明文）。
+SETUP_TOKEN_KEY = "admin_setup_token"
+
+
+def generate_setup_token() -> str:
+    """32 位 hex（128 bit 随机）—— ``secrets`` 密码学安全随机源。"""
+    return secrets.token_hex(16)
+
+
+def _is_valid_setup_token(content: str) -> bool:
+    """文件内容判据（分支③④共用，T2.2 被测对象）：恰 32 位小写 hex、无换行。
+
+    只认 ``generate_setup_token`` 的产物形状：0 字节 / 截断 / 污染 / 带换行
+    一律 False → 落分支③轮换，关掉「KV 在、文件坏 → 永远开不了通」的死锁。
+    """
+    return len(content) == 32 and all(c in "0123456789abcdef" for c in content)
+
+
+def write_setup_token_file(path: Path, token: str) -> None:
+    """把明文 token 写进 0600 文件。任一步失败向上抛 OSError，由调用方降级告警。
+
+    ``fchmod`` 必须无条件执行（R2）：① ``O_CREAT`` 的 mode 会被 umask 掩码
+    （umask 022 时落成 0644），只有显式 fchmod 才钉死 0600；② 文件已存在时
+    ``O_CREAT`` 不会改旧文件的 mode，同样靠这一步收紧。
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, token.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+async def ensure_setup_token(db: Database) -> None:
+    """FastAPI 启动钩子：按「生成一次、用到开通为止」维护 setup token（四分支）。
+
+    这是 LLM 网关的开通便利功能，不配让全量网关陪葬（ZG-1/R7）：文件/KV 的
+    写删失败一律 ``log.error`` 降级，本函数任何路径不向上抛，启动不中断。
+    动作序「先写文件、再写 KV」保证 KV 记录 ⟹ 文件已完整写入，不会出现
+    「KV 有哈希、明文永失」的死锁；失败留到下次启动走分支②/③重新生成自愈。
+    """
+    path = get_config().setup_token_path
+
+    # 分支①：账号已配置 → 幂等清理（删 KV + 删文件），不生成。
+    if await db.get_config("admin_account"):
+        await db.execute_write("DELETE FROM config WHERE key = ?", (SETUP_TOKEN_KEY,))
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass  # 天然幂等
+        except OSError as e:
+            # 清理非致命：下次启动分支①重试（T2.11）。
+            _log.error(
+                "setup token file cleanup failed: path={} errno={} error={}",
+                path, getattr(e, "errno", None), e,
+            )
+        return
+
+    raw = await db.get_config(SETUP_TOKEN_KEY)
+    rotate_reason: Optional[str] = None
+    if raw is not None:
+        # 分支③④：KV 有记录 → 以文件内容定去留。
+        try:
+            content = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            rotate_reason = "file missing"
+        except (OSError, UnicodeDecodeError):
+            rotate_reason = "file invalid"  # 读不出来 → 视同损坏走轮换
+        else:
+            if _is_valid_setup_token(content):
+                # 分支④：双在不动（重启不轮换），仅收紧权限到 0600。
+                # 收紧 ≠ 轮换：O_WRONLY 不带 O_TRUNC，内容与哈希不变。
+                # 与 write_setup_token_file 统一走「fd + 无条件 fchmod」一条路径
+                # （R6 win32 spy fchmod 轨一处断言覆盖全部收紧点）；
+                # open/fchmod 任一失败同样仅告警不抛。
+                try:
+                    fd = os.open(path, os.O_WRONLY)
+                    try:
+                        os.fchmod(fd, 0o600)
+                    finally:
+                        os.close(fd)
+                except OSError as e:
+                    _log.warning(
+                        "setup token file chmod failed: path={} error={}", path, e
+                    )
+                return
+            rotate_reason = "file invalid"
+
+    # 分支②（无 KV 记录）/ 分支③（文件缺失或损坏）：生成新 token。
+    token = generate_setup_token()
+    try:
+        write_setup_token_file(path, token)
+    except Exception as e:
+        # 写文件任一步失败：不抛、不写 KV，下次启动重新生成自愈（T2.10）。
+        _log.error(
+            "setup token file write failed: path={} errno={} error={}",
+            path, getattr(e, "errno", None), e,
+        )
+        return
+    try:
+        await db.set_config(
+            SETUP_TOKEN_KEY,
+            json.dumps(
+                {"hash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                 "created_at": time.time()}
+            ),
+        )
+    except Exception as e:
+        # 文件已成功、KV 失败：只告警。下次启动无 KV → 分支②重新生成覆盖文件。
+        _log.error("setup token KV write failed: error={}", e)
+        return
+    if rotate_reason:
+        # 日志含 "rotated: file missing" / "rotated: file invalid"（A12/R4 预案锚点）。
+        _log.info(
+            "setup token rotated: {} -> new token {} (file: {})",
+            rotate_reason, token, path,
+        )
+    else:
+        # 明文进日志是决策 1 有意双写（R3：与 .setup_token 同信任域）。
+        _log.info("setup token generated: {} (file: {})", token, path)

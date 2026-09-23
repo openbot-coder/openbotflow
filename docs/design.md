@@ -292,13 +292,13 @@ AuthMiddleware（客户端 Key 校验）
 
 ## 5. 管理 API（Admin REST）
 
-所有 admin 路由以 `/admin` 为前缀，由 `verify_admin_key` 保护（基于 `BOTFLOW_ADMIN_KEY`）。浏览器访问 `/admin/` 得到内置管理面板（HTML）。
+所有 admin 路由以 `/admin` 为前缀，由 `verify_admin_key` 保护（基于 `BOTFLOW_ADMIN_KEY`）。浏览器访问 `/admin/` 得到内置管理面板（HTML）。auth 4 端点（status/setup/login/logout）不受 `verify_admin_key` 保护：setup 凭据为启动时生成的一次性 setup token（明文见服务器 `.setup_token`，0600），`BOTFLOW_ADMIN_KEY` 只用于 Bearer 通道与会话签发期的管理面准入（`verify_admin_key` 双通道之一）。
 
 | 方法 | 路径 | 功能 |
 |------|------|------|
 | GET | `/admin/` | 内置管理面板 |
 | GET | `/admin/auth/status` | 管理员账号开通状态（免鉴权） |
-| POST | `/admin/auth/setup` | 用 Admin Token 开通 / 重置管理账号 |
+| POST | `/admin/auth/setup` | 用启动时自动生成的 setup token 开通 / 重置管理账号（明文见服务器 .setup_token，0600；开通成功即销毁） |
 | POST | `/admin/auth/login` | 账号密码登录，换取会话 token |
 | POST | `/admin/auth/logout` | 注销会话（带任意非空 token 即 200） |
 | POST / GET | `/admin/providers` | 创建 / 列出 Provider |

@@ -10,6 +10,9 @@
 """
 
 import asyncio
+import hashlib
+import json
+import time
 
 import pytest
 from fastapi import FastAPI
@@ -57,8 +60,29 @@ def client(tmp_path):
     set_config(None)
 
 
-def _setup(c):
-    r = c.post("/admin/auth/setup", json={"token": ADMIN_KEY, **USER})
+def _preset(c) -> str:
+    """R5⑦：预置 setup token —— 写 KV sha256 + 写 `.setup_token` 文件（tmp_path，
+    conftest ZG-2 隔离），返回明文。成功开通会双删凭证（F4），故每次 _setup 前
+    幂等重预置 —— TI.3 的第二次 setup（重置）才拿得到有效 token。
+    """
+    d = c.app.dependency_overrides[dbmod.get_db]()
+    token = auth_mod.generate_setup_token()
+    auth_mod.write_setup_token_file(auth_mod.get_config().setup_token_path, token)
+    asyncio.new_event_loop().run_until_complete(d.set_config(
+        auth_mod.SETUP_TOKEN_KEY,
+        json.dumps({
+            "hash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+            "created_at": time.time(),
+        }),
+    ))
+    return token
+
+
+def _setup(c, token=None):
+    # R5⑦：开通凭据从 BOTFLOW_ADMIN_KEY 切到 setup token（TI.1/TI.2/TI.3 前置适配）。
+    if token is None:
+        token = _preset(c)
+    r = c.post("/admin/auth/setup", json={"token": token, **USER})
     assert r.status_code == 200 and r.json()["success"] is True
     return r
 
@@ -77,7 +101,7 @@ class TestIntegration:
         # ① 未开通
         r = client.get("/admin/auth/status")
         assert r.status_code == 200 and r.json()["configured"] is False
-        # ② 开通（admin key）
+        # ② 开通（setup token）
         _setup(client)
         # ③ login 拿会话 token
         token = _login(client)
