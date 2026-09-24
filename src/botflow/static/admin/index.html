@@ -169,10 +169,7 @@ tr:hover td{background:#f8fafc}
           <div class="card">
             <div class="card-header">
               <h3>分组调用趋势图</h3>
-              <div style="display:flex;gap:6px">
-                <button class="btn btn-sm" :class="trendMetric==='calls'?'btn-primary':'btn-ghost'" @click="setTrendMetric('calls')">次数</button>
-                <button class="btn btn-sm" :class="trendMetric==='tokens'?'btn-primary':'btn-ghost'" @click="setTrendMetric('tokens')">tokens</button>
-              </div>
+              <span style="font-size:12px;color:var(--text2)">柱=次数（左轴） · 线=tokens（右轴）</span>
             </div>
             <div class="card-body">
               <div v-if="!echartsOk" class="empty">图表组件加载失败</div>
@@ -549,9 +546,8 @@ createApp({
       {v:'month', label:'当月'},
       {v:'d90', label:'近90天'},
     ];
-    const rangeSel = ref('week');           // 缺省当周（与后端 /stats/trend 缺省一致）
-    const trendMetric = ref('calls');       // 卡内 tab：calls=次数 / tokens
-    const trendRows = ref([]);              // /stats/trend 原始行（tab 切换复用，不重发请求）
+    const rangeSel = ref('month');          // 缺省当月：默认展示当月每日流量趋势（前端缺省；后端 /stats/trend API 缺省仍 week 不变）
+    const trendRows = ref([]);              // /stats/trend 原始行（组合图一次画完 calls+tokens，无需重发请求）
     const trendChartEl = ref(null);
     const echartsOk = typeof window !== 'undefined' && !!window.echarts; // CDN 挂了降级文本，不抛错
     // 竞态守卫（方案 B）：单调递增 requestId，趋势图与 Top10 共用同一批次号；
@@ -692,7 +688,7 @@ createApp({
       }
     }
 
-    // 分组调用趋势 —— 原始行存 trendRows，tab 切换只重新 pivot 不重发请求
+    // 分组调用趋势 —— 原始行存 trendRows，renderTrend 一次画组合图（柱=次数、线=tokens）
     async function loadTrend(rid){
       try{
         const r = await api('/stats/trend?range='+rangeSel.value);
@@ -714,10 +710,7 @@ createApp({
       refreshDashboard();
     }
 
-    function setTrendMetric(m){
-      trendMetric.value = m;
-      renderTrend();                  // 同一份 trendRows 重新 pivot，不发请求
-    }
+    // （原卡内 tab 已移除：组合图一次同时展示 次数柱 + tokens 线）
 
     // 东八今天（固定 +8 公式，浏览器时区无关，与后端同口径）
     function cnToday(){
@@ -745,22 +738,34 @@ createApp({
         d = new Date(d.getTime() + 86400000);
       }
       const groups = [...new Set(rows.map(r=>r.group_name))];
-      const key = trendMetric.value;   // 'calls' | 'tokens'
-      const val = new Map(rows.map(r=>[r.day+'\u0000'+r.group_name, r[key]||0]));
+      const callMap = new Map(rows.map(r=>[r.day+'\u0000'+r.group_name, r.calls||0]));
+      const tokMap  = new Map(rows.map(r=>[r.day+'\u0000'+r.group_name, r.tokens||0]));
       if(!trendChart || trendChartFor !== el){
         trendChart = window.echarts.init(el);
         trendChartFor = el;
       }
+      // 组合图：每组两条 series —— 次数柱状（左轴）+ tokens 折线（右轴），同图共用日轴
+      const series = [];
+      for(const g of groups){
+        series.push({
+          name:g+'·次数', type:'bar', yAxisIndex:0,
+          data: axis.map(day=>callMap.get(day+'\u0000'+g) || 0),
+        });
+        series.push({
+          name:g+'·tokens', type:'line', yAxisIndex:1, smooth:true,
+          data: axis.map(day=>tokMap.get(day+'\u0000'+g) || 0),
+        });
+      }
       trendChart.setOption({
         tooltip:{trigger:'axis'},
-        legend:{data:groups, type:'scroll', top:0},
-        grid:{left:60, right:20, top:36, bottom:40},
+        legend:{data:series.map(s=>s.name), type:'scroll', top:0},
+        grid:{left:60, right:64, top:36, bottom:40},
         xAxis:{type:'category', data:axis},
-        yAxis:{type:'value'},
-        series: groups.map(g=>({
-          name:g, type:'bar',
-          data: axis.map(day=>val.get(day+'\u0000'+g) || 0),
-        })),
+        yAxis:[
+          {type:'value', name:'次数', position:'left'},
+          {type:'value', name:'tokens', position:'right'},
+        ],
+        series,
       }, true);
     }
 
@@ -966,7 +971,7 @@ createApp({
       pages, page, currentPageLabel, toasts, modal,
       providers, models, groups, apikeys, logs, stats, strategies, summaries,
       rangeOptions, rangeSel, selectRange,
-      trendMetric, setTrendMetric, trendRows, trendChartEl, echartsOk,
+      trendRows, trendChartEl, echartsOk,
       loading, logFilters, summaryDate, newModelForGroup,
       doLogin, doLogout, switchPage, toast,
       openModal, closeModal, submitModal,
