@@ -160,16 +160,37 @@ tr:hover td{background:#f8fafc}
             <div class="stat-card"><div class="label">分组</div><div class="value">{{groups.length}}</div></div>
             <div class="stat-card"><div class="label">API Keys</div><div class="value">{{apikeys.length}}</div></div>
           </div>
+          <!-- 时间选择器：一处点选，趋势图 + Top10 同刷 -->
+          <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
+            <button v-for="r in rangeOptions" :key="r.v" class="btn btn-sm"
+              :class="rangeSel===r.v ? 'btn-primary' : 'btn-ghost'"
+              @click="selectRange(r.v)">{{r.label}}</button>
+          </div>
+          <div class="card">
+            <div class="card-header">
+              <h3>分组调用趋势图</h3>
+              <div style="display:flex;gap:6px">
+                <button class="btn btn-sm" :class="trendMetric==='calls'?'btn-primary':'btn-ghost'" @click="setTrendMetric('calls')">次数</button>
+                <button class="btn btn-sm" :class="trendMetric==='tokens'?'btn-primary':'btn-ghost'" @click="setTrendMetric('tokens')">tokens</button>
+              </div>
+            </div>
+            <div class="card-body">
+              <div v-if="!echartsOk" class="empty">图表组件加载失败</div>
+              <div v-else-if="!trendRows.length" class="empty">暂无趋势数据</div>
+              <div v-else ref="trendChartEl" style="width:100%;height:320px"></div>
+            </div>
+          </div>
           <div class="card">
             <div class="card-header"><h3>模型调用统计 (Top 10)</h3></div>
             <div class="card-body">
               <table v-if="stats.length">
-                <thead><tr><th>模型</th><th>调用次数</th><th>成功</th><th>失败</th><th>花费</th></tr></thead>
+                <thead><tr><th>模型</th><th>调用次数</th><th>成功</th><th>失败</th><th>tokens</th><th>花费</th></tr></thead>
                 <tbody><tr v-for="s in stats" :key="s.model_id">
                   <td><span class="code">{{s.model_name}}</span></td>
                   <td>{{s.total_calls}}</td>
                   <td><span class="badge badge-green">{{s.success_calls}}</span></td>
                   <td><span class="badge badge-red">{{s.error_calls}}</span></td>
+                  <td>{{s.total_tokens||0}}</td>
                   <td>¥{{(s.total_cost||0).toFixed(4)}}</td>
                 </tr></tbody>
               </table>
@@ -519,6 +540,24 @@ createApp({
     const strategies = ref([]);
     const summaries = ref([]);
 
+    // Dashboard 时间选择器 + 分组趋势图（六档共用一条选择器，点选两图齐刷）
+    const rangeOptions = [
+      {v:'half_hour', label:'最近半小时'},
+      {v:'hour', label:'最近一小时'},
+      {v:'today', label:'当天'},
+      {v:'week', label:'当周'},
+      {v:'month', label:'当月'},
+      {v:'d90', label:'近90天'},
+    ];
+    const rangeSel = ref('week');           // 缺省当周（与后端 /stats/trend 缺省一致）
+    const trendMetric = ref('calls');       // 卡内 tab：calls=次数 / tokens
+    const trendRows = ref([]);              // /stats/trend 原始行（tab 切换复用，不重发请求）
+    const trendChartEl = ref(null);
+    const echartsOk = typeof window !== 'undefined' && !!window.echarts; // CDN 挂了降级文本，不抛错
+    // 竞态守卫（方案 B）：单调递增 requestId，趋势图与 Top10 共用同一批次号；
+    // 响应回来时批次号已过期（< 最新）则整批丢弃，防连点乱序覆盖新数据。
+    let requestId = 0;
+
     // Loading states
     const loading = reactive({});
 
@@ -569,6 +608,7 @@ createApp({
         adminKey.value = r.token;
         authenticated.value = true;
         await loadAll();
+        await refreshDashboard();
       }catch(e){
         // 401 显示中性文案，不回显服务端细节、不区分是用户名还是密码错
         loginError.value = e.status===401 ? '用户名或密码错误' : e.message;
@@ -629,18 +669,99 @@ createApp({
         api('/models'),
         api('/groups'),
         api('/apikeys'),
-        api('/stats/models?limit=10'),
         api('/strategies'),
       ]);
-      const [p,m,g,k,s,st] = results;
+      const [p,m,g,k,st] = results;
       if(p.status==='fulfilled') providers.value = p.value.providers||[];
       if(m.status==='fulfilled') models.value = m.value.models||[];
       if(g.status==='fulfilled') groups.value = g.value.groups||[];
       if(k.status==='fulfilled') apikeys.value = k.value.api_keys||[];
-      if(s.status==='fulfilled') stats.value = s.value.model_stats||[];
       if(st.status==='fulfilled') strategies.value = st.value.strategies||[];
       const failed = results.find(r=>r.status==='rejected');
       if(failed) toast('部分数据加载失败: '+failed.reason.message, 'error');
+    }
+
+    // Top10 —— 与趋势图共用同一批次 requestId（selectRange 一次作废两图过期响应）
+    async function loadStats(rid){
+      try{
+        const r = await api('/stats/models?limit=10&range='+rangeSel.value);
+        if(rid < requestId) return;   // 过期响应丢弃
+        stats.value = r.model_stats||[];
+      }catch(e){
+        if(rid >= requestId) toast('加载模型统计失败: '+e.message, 'error');
+      }
+    }
+
+    // 分组调用趋势 —— 原始行存 trendRows，tab 切换只重新 pivot 不重发请求
+    async function loadTrend(rid){
+      try{
+        const r = await api('/stats/trend?range='+rangeSel.value);
+        if(rid < requestId) return;
+        trendRows.value = r.trend||[];
+        renderTrend();
+      }catch(e){
+        if(rid >= requestId) toast('加载趋势图失败: '+e.message, 'error');
+      }
+    }
+
+    function refreshDashboard(){
+      const rid = ++requestId;        // 两图共用一个批次号
+      return Promise.allSettled([loadStats(rid), loadTrend(rid)]);
+    }
+
+    function selectRange(v){
+      rangeSel.value = v;
+      refreshDashboard();
+    }
+
+    function setTrendMetric(m){
+      trendMetric.value = m;
+      renderTrend();                  // 同一份 trendRows 重新 pivot，不发请求
+    }
+
+    // 东八今天（固定 +8 公式，浏览器时区无关，与后端同口径）
+    function cnToday(){
+      return new Date(Date.now() + 8*3600*1000).toISOString().slice(0,10);
+    }
+
+    // ECharts 实例缓存：容器随 v-else 重建时须重新 init
+    let trendChart = null;
+    let trendChartFor = null;
+    async function renderTrend(){
+      if(!echartsOk) return;
+      const rows = trendRows.value;
+      await nextTick();               // trendRows 变化后 ref 指向的容器才挂上 DOM
+      const el = trendChartEl.value;
+      if(!rows.length || !el) return;
+      const days = [...new Set(rows.map(r=>r.day))].sort();
+      const today = cnToday();
+      const endDay = days[days.length-1] > today ? days[days.length-1] : today;
+      // 统一日轴：min(返回 day) … max(max(day), 东八今天)，逐日连续；所有 series 共用
+      const axis = [];
+      let d = new Date(days[0]+'T00:00:00Z');
+      const end = new Date(endDay+'T00:00:00Z');
+      while(d <= end){
+        axis.push(d.toISOString().slice(0,10));
+        d = new Date(d.getTime() + 86400000);
+      }
+      const groups = [...new Set(rows.map(r=>r.group_name))];
+      const key = trendMetric.value;   // 'calls' | 'tokens'
+      const val = new Map(rows.map(r=>[r.day+'\u0000'+r.group_name, r[key]||0]));
+      if(!trendChart || trendChartFor !== el){
+        trendChart = window.echarts.init(el);
+        trendChartFor = el;
+      }
+      trendChart.setOption({
+        tooltip:{trigger:'axis'},
+        legend:{data:groups, type:'scroll', top:0},
+        grid:{left:60, right:20, top:36, bottom:40},
+        xAxis:{type:'category', data:axis},
+        yAxis:{type:'value'},
+        series: groups.map(g=>({
+          name:g, type:'bar',
+          data: axis.map(day=>val.get(day+'\u0000'+g) || 0),
+        })),
+      }, true);
     }
 
     async function loadLogs(filters={}){
@@ -810,7 +931,11 @@ createApp({
     async function switchPage(p){
       page.value = p;
       if(p==='logs') loadLogs(logFilters);
-      if(p==='dashboard'||p==='providers'||p==='models') await loadAll();
+      if(p==='dashboard'){
+        await loadAll();
+        await refreshDashboard();   // 进概览页按当前选中档刷新两图
+      }
+      if(p==='providers'||p==='models') await loadAll();
       if(p==='groups'){
         await loadAll();
         for(const g of groups.value) await loadGroupDetails(g.id);
@@ -829,6 +954,7 @@ createApp({
       }catch(e){ /* status 取不到不阻塞启动：保留默认登录视图，token 有效性由首个 API 的 401 兜底 */ }
       if(authenticated.value){
         await loadAll();
+        await refreshDashboard();
         for(const g of groups.value) await loadGroupDetails(g.id);
       }
     });
@@ -839,6 +965,8 @@ createApp({
       loginUsername, loginPassword, doSetup, useTokenReset,
       pages, page, currentPageLabel, toasts, modal,
       providers, models, groups, apikeys, logs, stats, strategies, summaries,
+      rangeOptions, rangeSel, selectRange,
+      trendMetric, setTrendMetric, trendRows, trendChartEl, echartsOk,
       loading, logFilters, summaryDate, newModelForGroup,
       doLogin, doLogout, switchPage, toast,
       openModal, closeModal, submitModal,

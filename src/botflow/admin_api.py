@@ -7,7 +7,8 @@ by the admin key (BOTFLOW_ADMIN_KEY). Each route maps 1:1 to a former MCP tool.
 import hashlib
 import json
 import secrets
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
@@ -518,15 +519,59 @@ async def list_strategies(_=Depends(verify_admin_key)):
 # Stats
 # ---------------------------------------------------------------------------
 
+# Asia/Shanghai 固定 +8（1991 年后无夏令时）——用 stdlib timezone 而非
+# 时区数据库方案：Windows 无时区数据、需第三方包，零依赖硬约束下不可用。
+CN_TZ = timezone(timedelta(hours=8))
+RANGE_VALUES = ("half_hour", "hour", "today", "week", "month", "d90")
+RANGE_DEFAULT = "week"
+
+
+def _resolve_range(range: str, now: datetime | None = None) -> tuple[str, str]:
+    """把六档 range 预设解析为 UTC 窗口 (since_utc, until_utc)。
+
+    返回 UTC 空格格式 ``YYYY-MM-DD HH:MM:SS``（与 call_logs.created_at 一致，
+    字典序可比）。``now`` 仅测试注入用：生产调用不传、走
+    ``datetime.now(timezone.utc)``；注入时须为 aware UTC（不加运行时校验）。
+
+    六档语义：half_hour/hour/d90 为相对滑动窗口（UTC 直算）；today/week/month
+    为东八自然边界（now 转 +8 求边界再转回 UTC）。非法值已在端点层被
+    ``Literal[RANGE_VALUES]`` 422 拦截，本函数不设兜底分支。
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    until = now.strftime("%Y-%m-%d %H:%M:%S")
+    if range in ("today", "week", "month"):
+        # 东八自然边界：now 转 +8 取当日 00:00，再转回 UTC（created_at 存 UTC）
+        local = now.astimezone(CN_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        if range == "week":
+            local -= timedelta(days=local.weekday())  # 周一为一周之始（weekday: 周一=0）
+        elif range == "month":
+            local = local.replace(day=1)
+        since = local.astimezone(timezone.utc)
+    elif range == "half_hour":
+        since = now - timedelta(minutes=30)
+    elif range == "hour":
+        since = now - timedelta(minutes=60)
+    elif range == "d90":
+        since = now - timedelta(days=90)
+    return since.strftime("%Y-%m-%d %H:%M:%S"), until
+
 
 @admin_router.get("/stats/models")
 async def get_model_stats(
     limit: int = 20,
     api_key_id: Optional[int] = None,
+    range: Optional[Literal[RANGE_VALUES]] = None,
     _=Depends(verify_admin_key),
 ):
     db = get_db()
-    stats = await db.list_model_stats(limit=limit, api_key_id=api_key_id)
+    if range is not None:
+        since, until = _resolve_range(range)
+        stats = await db.list_model_stats(
+            limit=limit, api_key_id=api_key_id, since_utc=since, until_utc=until
+        )
+    else:
+        stats = await db.list_model_stats(limit=limit, api_key_id=api_key_id)
     return {"success": True, "model_stats": stats}
 
 
@@ -550,6 +595,22 @@ async def get_cost_summary(
     db = get_db()
     summary = await db.get_cost_summary(days=days, api_key_id=api_key_id)
     return {"success": True, "cost_summary": summary}
+
+
+@admin_router.get("/stats/trend")
+async def get_call_trend(
+    range: Literal[RANGE_VALUES] = RANGE_DEFAULT,
+    _=Depends(verify_admin_key),
+):
+    """分组按日调用趋势（东八日期分桶，range 六档窗口）。
+
+    行式响应，只含有数据的 (day, group) 行（空窗由前端 pivot 补 0）；
+    ``range`` 回显仅供调试/验收核对，前端竞态守卫不依赖它。
+    """
+    db = get_db()
+    since, until = _resolve_range(range)
+    rows = await db.list_group_trend(since, until)
+    return {"success": True, "range": range, "trend": rows}
 
 
 @admin_router.get("/logs")

@@ -1065,19 +1065,30 @@ class Database:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
-    async def list_model_stats(self, limit: int = 20, api_key_id: Optional[int] = None) -> list[dict]:
+    async def list_model_stats(
+        self,
+        limit: int = 20,
+        api_key_id: Optional[int] = None,
+        since_utc: Optional[str] = None,
+        until_utc: Optional[str] = None,
+    ) -> list[dict]:
         conn = await self._ensure_connection()
         where = "1=1"
         params: list[Any] = []
         if api_key_id is not None:
             where += " AND cl.api_key_id = ?"
             params.append(api_key_id)
+        # 成对传入才加时间窗（_resolve_range 输出即成对）；None = 全时间现行为
+        if since_utc is not None and until_utc is not None:
+            where += " AND cl.created_at >= ? AND cl.created_at <= ?"
+            params += [since_utc, until_utc]
         cursor = await conn.execute(
             f"""SELECT m.id AS model_id, m.name AS model_name,
                        COUNT(*) AS total_calls,
                        SUM(CASE WHEN cl.status='success' THEN 1 ELSE 0 END) AS success_calls,
                        SUM(CASE WHEN cl.status='error' THEN 1 ELSE 0 END) AS error_calls,
-                       COALESCE(SUM(cl.cost), 0.0) AS total_cost
+                       COALESCE(SUM(cl.cost), 0.0) AS total_cost,
+                       COALESCE(SUM(cl.total_tokens), 0) AS total_tokens
                 FROM call_logs cl JOIN models m ON m.id = cl.model_id
                 WHERE {where}
                 GROUP BY m.id, m.name
@@ -1104,6 +1115,26 @@ class Database:
                 GROUP BY mg.id, mg.name
                 ORDER BY total_calls DESC LIMIT ?""",
             params + [limit],
+        )
+        return [dict(r) for r in await cursor.fetchall()]
+
+    async def list_group_trend(self, since_utc: str, until_utc: str) -> list[dict]:
+        """按东八日期 × 分组的调用趋势行（闭区间窗口，只含有数据行，空窗不补零）。
+
+        INNER JOIN 与 list_group_stats 同口径：group_id 为 NULL 的行天然排除。
+        day 用 date(created_at, '+8 hours') 与 range 边界的东八换算同口径。
+        """
+        conn = await self._ensure_connection()
+        cursor = await conn.execute(
+            """SELECT date(cl.created_at,'+8 hours') AS day,
+                      mg.id AS group_id, mg.name AS group_name,
+                      COUNT(*) AS calls,
+                      COALESCE(SUM(cl.total_tokens), 0) AS tokens
+               FROM call_logs cl JOIN model_groups mg ON mg.id = cl.group_id
+               WHERE cl.created_at >= ? AND cl.created_at <= ?
+               GROUP BY day, mg.id, mg.name
+               ORDER BY day ASC, mg.id ASC""",
+            (since_utc, until_utc),
         )
         return [dict(r) for r in await cursor.fetchall()]
 
