@@ -161,8 +161,9 @@ class TestDashboardStatsIntegration:
         old6 = {"model_id", "model_name", "total_calls", "success_calls",
                 "error_calls", "total_cost"}
         for row in ball["model_stats"]:
-            # 除新增第 7 键 total_tokens 外形状同旧
-            assert set(row.keys()) == old6 | {"total_tokens"}
+            # 除 total_tokens + avg_latency_ms + error_rate 外形状同旧（9 键）
+            assert set(row.keys()) == old6 | {"total_tokens", "avg_latency_ms",
+                                              "error_rate"}
         ids_all = {r["model_id"] for r in ball["model_stats"]}
         ids_today = {r["model_id"] for r in btd["model_stats"]}
         assert ids_all == {w["m1"], w["m2"]}   # 全时间：两模型都有历史行

@@ -181,7 +181,7 @@ tr:hover td{background:#f8fafc}
             <div class="card-header"><h3>模型调用统计 (Top 10)</h3></div>
             <div class="card-body">
               <table v-if="stats.length">
-                <thead><tr><th>模型</th><th>调用次数</th><th>成功</th><th>失败</th><th>tokens</th><th>花费</th></tr></thead>
+                <thead><tr><th>模型</th><th>调用次数</th><th>成功</th><th>失败</th><th>tokens</th><th>花费</th><th>平均延时</th><th>差错率</th></tr></thead>
                 <tbody><tr v-for="s in stats" :key="s.model_id">
                   <td><span class="code">{{s.model_name}}</span></td>
                   <td>{{s.total_calls}}</td>
@@ -189,6 +189,8 @@ tr:hover td{background:#f8fafc}
                   <td><span class="badge badge-red">{{s.error_calls}}</span></td>
                   <td>{{s.total_tokens||0}}</td>
                   <td>¥{{(s.total_cost||0).toFixed(4)}}</td>
+                  <td>{{s.avg_latency_ms!=null?Math.round(s.avg_latency_ms)+'ms':'-'}}</td>
+                  <td><span :class="s.error_rate>0?'badge badge-red':'badge badge-green'">{{(s.error_rate*100).toFixed(1)}}%</span></td>
                 </tr></tbody>
               </table>
               <div v-else class="empty">暂无调用统计数据</div>

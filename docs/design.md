@@ -311,7 +311,7 @@ AuthMiddleware（客户端 Key 校验）
 | POST | `/admin/groups/{id}/models` | 添加 Model 到 Group |
 | PATCH / DELETE | `/admin/groups/{id}/models/{model_id}` | 调整权重 / 移出 |
 | GET | `/admin/strategies` | 列出可用策略名 |
-| GET | `/admin/stats/models` | 模型调用统计（可选 range 六档固定时间窗，缺省全时间） |
+| GET | `/admin/stats/models` | 模型调用统计（可选 range 六档固定时间窗，缺省全时间）；行内含 `avg_latency_ms`（成功行平均毫秒，无成功行时为 null）与 `error_rate`（非 success 占比 0~1） |
 | GET | `/admin/stats/groups` | 分组调用统计 |
 | GET | `/admin/stats/cost` | 成本汇总 |
 | GET | `/admin/stats/trend` | 分组按日调用趋势（range 六档，东八日期分桶） |

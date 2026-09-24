@@ -1088,7 +1088,9 @@ class Database:
                        SUM(CASE WHEN cl.status='success' THEN 1 ELSE 0 END) AS success_calls,
                        SUM(CASE WHEN cl.status='error' THEN 1 ELSE 0 END) AS error_calls,
                        COALESCE(SUM(cl.cost), 0.0) AS total_cost,
-                       COALESCE(SUM(cl.total_tokens), 0) AS total_tokens
+                       COALESCE(SUM(cl.total_tokens), 0) AS total_tokens,
+                       AVG(CASE WHEN cl.status='success' THEN cl.duration_ms END) AS avg_latency_ms,
+                       CAST((COUNT(*) - SUM(CASE WHEN cl.status='success' THEN 1 ELSE 0 END)) AS REAL) / COUNT(*) AS error_rate
                 FROM call_logs cl JOIN models m ON m.id = cl.model_id
                 WHERE {where}
                 GROUP BY m.id, m.name

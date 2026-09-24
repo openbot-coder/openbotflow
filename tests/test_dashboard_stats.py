@@ -1,9 +1,14 @@
-"""dashboard_stats 单测 D1.1–D4.4 共 32 条（契约：docs/tasks/dashboard_stats_features.md §3）。
+"""dashboard_stats 单测 D1.1–D4.4 共 37 条（契约：docs/tasks/dashboard_stats_features.md §3）。
 
-分组：D1×11 db 层（直调 ``list_group_trend`` / ``list_model_stats``）、
+分组：D1×15 db 层（直调 ``list_group_trend`` / ``list_model_stats``）、
 D2×8 range 解析（直调 ``_resolve_range`` 并注入固定 now）、
-D3×9 端点（TestClient HTTP 层）、D4×4 兼容回归（HTTP 层）。
+D3×10 端点（TestClient HTTP 层）、D4×4 兼容回归（HTTP 层）。
 编号与契约 §3 用例表 1:1 对表，无缺号无多重。
+
+行键契约（本任务新增两列）：``list_model_stats`` 行 = 既有 7 键
+[model_id, model_name, total_calls, success_calls, error_calls,
+total_cost, total_tokens] + avg_latency_ms + error_rate（共 9 键，
+顺序固定）；顶层键集 ``{success, model_stats}`` 零新增。
 
 seed 惯例（契约 §3）：需指定时刻的行用 ``execute_write`` 裸 SQL 直插 UTC 空格串
 ——``create_call_log`` 在 db.py:790 写死 ``datetime('now')`` 无法指定时刻；
@@ -99,23 +104,27 @@ async def _insert_at(
     total_tokens=None,
     cost: float = 0.0,
     api_key_id=None,
+    duration_ms=None,
 ):
     """裸 SQL 直插可控 ``created_at`` 的 call_log 行。
 
     ``create_call_log`` 把 ``created_at`` 写死为 ``datetime('now')``
     （db.py:790），指定时刻的用例必须直插——契约 §3 seed 惯例明示；
-    列与 call_logs DDL 对齐（db.py:96-117，total_tokens 列可空）。
+    列与 call_logs DDL 对齐（db.py:96-117，total_tokens/duration_ms 列可空）。
+    ``duration_ms`` 默认 None（既有调用点零修改），D1.12+ 延时用例显式传。
     """
     await db.execute_write(
         """INSERT INTO call_logs
-           (api_key_id, group_id, model_id, status, total_tokens, cost, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (api_key_id, group_id, model_id, status, total_tokens, cost, created_at),
+           (api_key_id, group_id, model_id, status, total_tokens, cost,
+            duration_ms, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (api_key_id, group_id, model_id, status, total_tokens, cost,
+         duration_ms, created_at),
     )
 
 
 # ---------------------------------------------------------------------------
-# D1.x db 层（11 条）
+# D1.x db 层（15 条）
 # ---------------------------------------------------------------------------
 
 
@@ -259,9 +268,10 @@ class TestD1DbLayer:
         rows = await db.list_model_stats()  # 不传两参 → 不加时间条件 = 全时间
         assert len(rows) == 1
         r = rows[0]
-        # 唯一允许差异 = 行内新增第 7 键 total_tokens（红线 §0.1）
+        # 行内 9 键恰集（7 旧键 + avg_latency_ms + error_rate，红线 §0.1）
         assert set(r.keys()) == {"model_id", "model_name", "total_calls", "success_calls",
-                                 "error_calls", "total_cost", "total_tokens"}
+                                 "error_calls", "total_cost", "total_tokens",
+                                 "avg_latency_ms", "error_rate"}
         assert r["total_calls"] == 2  # 2020 老行 + 当前行都计入（全时间）
         assert r["total_tokens"] == 18
         assert r["total_cost"] == pytest.approx(0.03)
@@ -295,6 +305,71 @@ class TestD1DbLayer:
             ("2026-09-22", w["g1"]),
             ("2026-09-22", w["g2"]),
         ]
+
+    async def test_d1_12_model_stats_avg_latency_excludes_error_and_error_rate(self, db):
+        """D1.12 正例：混合 success(100ms)+error(999ms) → avg 排除 error 耗时、rate=0.5。
+
+        同时钉死行键顺序 = 7 旧键 + avg_latency_ms + error_rate（共 9 键）。
+        """
+        w = await _seed_world(db)
+        await _insert_at(db, "2026-09-21 10:00:00", group_id=w["g1"], model_id=w["m1"],
+                         status="success", duration_ms=100)
+        await _insert_at(db, "2026-09-21 11:00:00", group_id=w["g1"], model_id=w["m1"],
+                         status="error", duration_ms=999)
+        rows = await db.list_model_stats(since_utc="2026-09-20 00:00:00",
+                                         until_utc="2026-09-22 00:00:00")
+        assert len(rows) == 1
+        r = rows[0]
+        # 行键顺序 = 既有 7 键 + avg_latency_ms + error_rate（契约行键序）
+        assert list(r.keys()) == ["model_id", "model_name", "total_calls",
+                                  "success_calls", "error_calls", "total_cost",
+                                  "total_tokens", "avg_latency_ms", "error_rate"]
+        assert r["avg_latency_ms"] == 100.0  # error 行 999ms 不计入平均
+        assert r["error_rate"] == 0.5        # 2 行中 1 行非 success
+
+    async def test_d1_13_model_stats_only_error_rows_avg_null_rate_one(self, db):
+        """D1.13 反例：仅 error 行（50ms）→ avg_latency_ms is None、error_rate==1.0。"""
+        w = await _seed_world(db)
+        await _insert_at(db, "2026-09-21 10:00:00", group_id=w["g1"], model_id=w["m1"],
+                         status="error", duration_ms=50)
+        rows = await db.list_model_stats(since_utc="2026-09-20 00:00:00",
+                                         until_utc="2026-09-22 00:00:00")
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["avg_latency_ms"] is None  # 全组无 success 行 → NULL（JSON null）
+        assert r["error_rate"] == 1.0
+
+    async def test_d1_14_model_stats_all_non_success_statuses_counted(self, db):
+        """D1.14 正例：timeout/cooldown/cancelled 各 1 + success 1 → error_rate==0.75。"""
+        w = await _seed_world(db)
+        for i, status in enumerate(("timeout", "cooldown", "cancelled")):
+            await _insert_at(db, f"2026-09-21 1{i}:00:00", group_id=w["g1"],
+                             model_id=w["m1"], status=status, duration_ms=700)
+        await _insert_at(db, "2026-09-21 14:00:00", group_id=w["g1"], model_id=w["m1"],
+                         status="success", duration_ms=200)
+        rows = await db.list_model_stats(since_utc="2026-09-20 00:00:00",
+                                         until_utc="2026-09-22 00:00:00")
+        assert len(rows) == 1
+        r = rows[0]
+        assert (r["total_calls"], r["success_calls"]) == (4, 1)
+        assert r["error_rate"] == 0.75  # 非 success 三态全算差错
+        assert r["avg_latency_ms"] == 200.0  # 仅 success 行的 200ms
+
+    async def test_d1_15_model_stats_all_success_rate_zero_avg_exact(self, db):
+        """D1.15 正例：全 success → error_rate==0.0、avg 为 float 精确值 (100+300)/2。"""
+        w = await _seed_world(db)
+        await _insert_at(db, "2026-09-21 10:00:00", group_id=w["g1"], model_id=w["m1"],
+                         status="success", duration_ms=100)
+        await _insert_at(db, "2026-09-21 11:00:00", group_id=w["g1"], model_id=w["m1"],
+                         status="success", duration_ms=300)
+        rows = await db.list_model_stats(since_utc="2026-09-20 00:00:00",
+                                         until_utc="2026-09-22 00:00:00")
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["error_rate"] == 0.0
+        assert r["avg_latency_ms"] == 200.0
+        assert isinstance(r["avg_latency_ms"], float)  # AVG() → REAL
+        assert isinstance(r["error_rate"], float)      # CAST AS REAL
 
 
 # ---------------------------------------------------------------------------
@@ -414,7 +489,7 @@ class TestD2ResolveRange:
 
 
 # ---------------------------------------------------------------------------
-# D3.x 端点（9 条，HTTP 层）
+# D3.x 端点（10 条，HTTP 层）
 #
 # AUTH 统一前置（契约 §3 D3 表）：除 D3.4 鉴权反例外，D3.1–D3.9 全部带
 # AUTH —— FastAPI 先跑 Depends(verify_admin_key) 后校验 query，不带 AUTH
@@ -488,7 +563,9 @@ class TestD3Endpoints:
         assert "range" not in body
         rows = body["model_stats"]
         assert len(rows) == 1  # 3 天前窗外行不计入
-        assert all("total_tokens" in row for row in rows)
+        # 行含既有 total_tokens + 新增 avg_latency_ms / error_rate 两键
+        assert all({"total_tokens", "avg_latency_ms", "error_rate"} <= set(row)
+                   for row in rows)
         assert rows[0]["total_calls"] == 1
         assert rows[0]["total_tokens"] == 42
         assert rows[0]["total_cost"] == pytest.approx(0.07)
@@ -530,6 +607,30 @@ class TestD3Endpoints:
         assert body["success"] is True and body["range"] == "week"
         assert isinstance(body["trend"], list)
 
+    def test_d3_10_models_avg_latency_and_error_rate_keys(self, client):
+        """D3.10 正例：响应行含两新键、9 键序列正确，值与直调 db 一致（同库双查）。"""
+        db = _db_of(client)
+        w = _run(_seed_world(db))
+        _run(_insert_at(db, _now_str(), group_id=w["g1"], model_id=w["m1"],
+                        status="success", duration_ms=100))
+        _run(_insert_at(db, _now_str(), group_id=w["g1"], model_id=w["m1"],
+                        status="error", duration_ms=999))
+        r = client.get("/admin/stats/models", headers=AUTH)
+        assert r.status_code == 200
+        body = r.json()
+        assert set(body.keys()) == {"success", "model_stats"}  # 顶层键集零新增
+        rows = body["model_stats"]
+        assert len(rows) == 1
+        row = rows[0]
+        # 9 键序列 = 7 旧键 + avg_latency_ms + error_rate
+        assert list(row.keys()) == ["model_id", "model_name", "total_calls",
+                                    "success_calls", "error_calls", "total_cost",
+                                    "total_tokens", "avg_latency_ms", "error_rate"]
+        assert row["avg_latency_ms"] == 100.0  # error 耗时被排除
+        assert row["error_rate"] == 0.5
+        # 同库双查法：端点输出 == 直调 db.list_model_stats()（同数据）
+        assert rows == _run(db.list_model_stats())
+
 
 # ---------------------------------------------------------------------------
 # D4.x 兼容回归（4 条，HTTP 层）
@@ -562,8 +663,9 @@ class TestD4CompatRegression:
         old6 = ["model_id", "model_name", "total_calls", "success_calls",
                 "error_calls", "total_cost"]
         for row in rows:
-            # 既有 6 键键名/顺序不变 + 行内新增第 7 键 total_tokens
-            assert list(row.keys()) == old6 + ["total_tokens"]
+            # 既有 6 键键名/顺序不变 + total_tokens + avg_latency_ms + error_rate（9 键）
+            assert list(row.keys()) == old6 + ["total_tokens", "avg_latency_ms",
+                                               "error_rate"]
         # ORDER BY total_calls DESC（m1=4 > m2=1）
         assert [row["model_id"] for row in rows] == [w["m1"], w["m2"]]
         a = rows[0]
