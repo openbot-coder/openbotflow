@@ -1183,6 +1183,7 @@ async def _drive_stream(
     while True:
         try:
             final_state = None
+            usage_final: dict | None = None  # SG-1 回归修复：流式 usage 累积
             gen = await engine.run(
                 None, group, mode="stream",
                 messages=internal["messages"],
@@ -1201,6 +1202,8 @@ async def _drive_stream(
                     chunk = payload
                     chunk["model"] = model_name
                     lines, _usage = _serialize(chunk)
+                    if _usage:
+                        usage_final = _usage  # 末次非空 usage（旧 SG-1 前语义）
                     for line in lines:
                         yield line
                 elif kind == "state":
@@ -1220,7 +1223,7 @@ async def _drive_stream(
                 provider_id=(final_state or {}).get("used_provider_id"),
                 request_body=_request_summary(internal),
                 response_body=None, status="success",
-                duration_ms=duration, usage=None,
+                duration_ms=duration, usage=usage_final,
             )
             yield done_signal
             return

@@ -1647,3 +1647,209 @@ async def test_handle_chat_non_stream_wraps_unexpected_error_as_502(monkeypatch)
 
     assert exc_info.value.status_code == 502
     assert "upstream down" in exc_info.value.detail
+
+
+# ===========================================================================
+# 12. SG-1 流式 usage 丢失回归修复（docs/tasks/stream_usage_features.md 用例 1-6）
+#     断言一律读 ``core._log_call``（``_drive_setup`` 装的 AsyncMock）的 call kwargs。
+# ===========================================================================
+
+_USAGE_A = {"prompt_tokens": 3, "completion_tokens": 5, "cache_tokens": 1, "total_tokens": 8}
+_USAGE_B = {"prompt_tokens": 7, "completion_tokens": 11, "cache_tokens": 0, "total_tokens": 18}
+
+_STATE_OK = ("state", {"recoverable": False, "used_model_id": 1, "used_provider_id": 2})
+
+
+def _stream_events(events):
+    """流式 behavior 工厂：``engine.run`` await 后返回事件 async gen（`("chunk", …)`/`("state", …)`）。"""
+    async def _fn(s, g, m):
+        async def _gen():
+            for ev in events:
+                yield ev
+        return _gen()
+    return _fn
+
+
+def _usage_serialize(chunk):
+    """桩 serialize：usage 取自 ``chunk["_u"]``（缺省 → None），精确控制每个 chunk 的 usage 返回值。"""
+    return [f"data: {chunk.get('c', '')}\n\n"], chunk.get("_u")
+
+
+async def _drive_stream_lines(internal=None, **kw):
+    return [
+        line
+        async for line in core._drive(
+            internal or {"model": "x", "messages": []}, mode="stream", **kw
+        )
+    ]
+
+
+def _logged_calls():
+    return [c.kwargs for c in core._log_call.call_args_list]
+
+
+async def test_stream_success_logs_usage_from_chunk(monkeypatch):
+    """用例 1 正例：流式成功且某 chunk 带 usage → _log_call 收到 status="success"
+    且 kwargs["usage"] 等于该 usage dict（四键齐全），不再是 None。"""
+    engine = _DriverEngine({
+        1: _stream_events([("chunk", {"c": "a", "_u": _USAGE_A}), _STATE_OK]),
+    })
+    _drive_setup(monkeypatch, engine, _make_group(1))
+    out = await _drive_stream_lines(serialize=_usage_serialize)
+    assert out[-1] == "data: [DONE]\n\n"
+
+    calls = _logged_calls()
+    assert len(calls) == 1
+    assert calls[0]["status"] == "success"
+    assert calls[0]["usage"] == _USAGE_A
+    assert set(calls[0]["usage"]) == {
+        "prompt_tokens", "completion_tokens", "cache_tokens", "total_tokens",
+    }
+
+
+async def test_stream_last_chunk_usage_wins(monkeypatch):
+    """用例 2 正例：多 chunk 仅末尾带 usage（stream_options.include_usage 的
+    usage-only 终局 chunk 形态）→ 落库取**末次非空**，不是首次、不是累加。"""
+    engine = _DriverEngine({
+        1: _stream_events([
+            ("chunk", {"c": "1"}),
+            ("chunk", {"c": "2"}),
+            ("chunk", {"c": "3", "_u": _USAGE_B}),
+            _STATE_OK,
+        ]),
+    })
+    _drive_setup(monkeypatch, engine, _make_group(1))
+    await _drive_stream_lines(serialize=_usage_serialize)
+
+    calls = _logged_calls()
+    assert len(calls) == 1
+    assert calls[0]["status"] == "success"
+    assert calls[0]["usage"] == _USAGE_B
+
+
+async def test_stream_no_usage_logs_null(monkeypatch):
+    """用例 3 反例：全流无 usage（serialize 恒返回 None）→ kwargs["usage"] is None
+    （_log_call 四列写 NULL，与修复前一致，防「无 usage 时写脏值」）。"""
+    engine = _DriverEngine({
+        1: _stream_events([("chunk", {"c": "1"}), ("chunk", {"c": "2"}), _STATE_OK]),
+    })
+    _drive_setup(monkeypatch, engine, _make_group(1))
+    await _drive_stream_lines(serialize=_usage_serialize)
+
+    calls = _logged_calls()
+    assert len(calls) == 1
+    assert calls[0]["status"] == "success"
+    assert calls[0]["usage"] is None
+
+
+async def test_stream_mid_usage_not_cleared_by_later_null(monkeypatch):
+    """用例 4 边界：中间 chunk 带 usage、其后 chunk usage=None → 落库仍是中间那个
+    （``if _usage:`` truthy 守卫：None/缺省不覆盖已累积值）。"""
+    engine = _DriverEngine({
+        1: _stream_events([
+            ("chunk", {"c": "1"}),
+            ("chunk", {"c": "2", "_u": _USAGE_A}),
+            ("chunk", {"c": "3", "_u": None}),
+            ("chunk", {"c": "4"}),
+            _STATE_OK,
+        ]),
+    })
+    _drive_setup(monkeypatch, engine, _make_group(1))
+    await _drive_stream_lines(serialize=_usage_serialize)
+
+    calls = _logged_calls()
+    assert len(calls) == 1
+    assert calls[0]["status"] == "success"
+    assert calls[0]["usage"] == _USAGE_A
+
+
+async def test_stream_fallback_resets_usage_per_group(monkeypatch):
+    """用例 5 边界：主组降级到备份组 → ``usage_final`` 在 while 循环内按组重置，
+    最终落库是**成功组**的 usage，主组已累积的残留值不得带过去。
+
+    两个场景：
+      A 备份组有自己的 usage → 落库等于备份组的；
+      B 备份组全程无 usage   → 落库为 None（若未按组重置，这里会残留主组的 _USAGE_A）。
+    """
+    # --- 场景 A：主组产出带 usage 的 chunk 后以 recoverable 终态触发降级 ---
+    engine_a = _DriverEngine({
+        1: _stream_events([
+            ("chunk", {"c": "p", "_u": _USAGE_A}),
+            ("state", {"recoverable": True}),
+        ]),
+        2: _stream_events([("chunk", {"c": "b", "_u": _USAGE_B}), _STATE_OK]),
+    })
+    _drive_setup(monkeypatch, engine_a, _make_group(1, fallback_gid=2), _make_group(2))
+    await _drive_stream_lines(serialize=_usage_serialize)
+
+    assert engine_a.run_calls == [(1, "stream"), (2, "stream")]
+    calls = _logged_calls()
+    assert len(calls) == 1
+    assert calls[0]["status"] == "success"
+    assert calls[0]["usage"] == _USAGE_B
+
+    # --- 场景 B：备份组全程无 usage → 不得残留主组的 _USAGE_A ---
+    engine_b = _DriverEngine({
+        1: _stream_events([
+            ("chunk", {"c": "p", "_u": _USAGE_A}),
+            ("state", {"recoverable": True}),
+        ]),
+        2: _stream_events([("chunk", {"c": "b"}), _STATE_OK]),
+    })
+    _drive_setup(monkeypatch, engine_b, _make_group(1, fallback_gid=2), _make_group(2))
+    await _drive_stream_lines(serialize=_usage_serialize)
+
+    assert engine_b.run_calls == [(1, "stream"), (2, "stream")]
+    calls = _logged_calls()
+    assert len(calls) == 1
+    assert calls[0]["status"] == "success"
+    assert calls[0]["usage"] is None
+
+
+async def test_stream_error_paths_keep_usage_none(monkeypatch):
+    """用例 6 反例：两条错误路径的 status="error" 行 kwargs["usage"] 必须为 None
+    —— 且是在**流里已累积过 usage** 的情况下断言，证明错误落库没被修复带偏：
+      ① 降级耗尽（主组已推 usage chunk → recoverable 终态 → 无备份组）；
+      ② 未预期异常（推 usage chunk 后 gen 内抛 ValueError）。
+    """
+    # ① 降级耗尽
+    engine_ex = _DriverEngine({
+        1: _stream_events([
+            ("chunk", {"c": "p", "_u": _USAGE_A}),
+            ("state", {"recoverable": True}),
+        ]),
+    })
+    _drive_setup(monkeypatch, engine_ex, _make_group(1))
+    out = await _drive_stream_lines(serialize=_usage_serialize)
+    assert out[-1] == "data: [DONE]\n\n"
+
+    calls = _logged_calls()
+    assert len(calls) == 1
+    assert calls[0]["status"] == "error"
+    assert calls[0]["error_type"] == "ProviderError"
+    assert calls[0]["usage"] is None
+
+    # ② 未预期异常（ValueError，gen 迭代中途抛出）
+    async def _boom(s, g, m):
+        async def _gen():
+            yield ("chunk", {"c": "p", "_u": _USAGE_A})
+            raise ValueError("unexpected boom")
+        return _gen()
+
+    engine_boom = _DriverEngine({1: _boom})
+    _drive_setup(monkeypatch, engine_boom, _make_group(1))
+    out = await _drive_stream_lines(serialize=_usage_serialize)
+    assert out[-1] == "data: [DONE]\n\n"
+    assert any("unexpected boom" in line for line in out)
+
+    calls = _logged_calls()
+    assert len(calls) == 1
+    assert calls[0]["status"] == "error"
+    assert calls[0]["error_type"] == "ValueError"
+    assert calls[0]["usage"] is None
+
+
+# 用例 7（回归锚点，非流式 usage 路径不受影响）不新写，引用已有测试：
+#   tests/test_core_units.py::test_log_call_uses_writer
+#   tests/test_core_endpoints.py::test_chat_completions_non_stream
+#   tests/test_core_endpoints.py::test_non_stream_response_byte_identical
