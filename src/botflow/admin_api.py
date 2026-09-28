@@ -23,7 +23,7 @@ from botflow.auth import (
     verify_admin_key,
     verify_password,
 )
-from botflow.config import get_config
+from botflow.config import ADMIN_SETTINGS_FIELDS, get_config
 from botflow.router import invalidate_endpoint_cache, invalidate_all_caches
 from botflow.storage.db import get_db
 from botflow.storage.models import ApiKey
@@ -46,6 +46,7 @@ class CreateProviderReq(BaseModel):
     api_key: str = ""
     type: str = "openai"
     is_enabled: bool = True
+    extra_config: dict = {}
 
 class CreateModelReq(BaseModel):
     provider_id: int
@@ -54,6 +55,7 @@ class CreateModelReq(BaseModel):
     context_window: int = 0
     api_format: str = ""
     is_enabled: bool = True
+    extra_config: dict = {}
 
 class CreateGroupReq(BaseModel):
     name: str
@@ -79,6 +81,8 @@ class UpdateProviderReq(BaseModel):
     api_key: Optional[str] = None
     type: Optional[str] = None
     is_enabled: Optional[bool] = None
+    # None = 不改；给出（含 {}）= 整体覆盖（后端不做键级合并，见文档 §4）
+    extra_config: Optional[dict] = None
 
 class UpdateModelReq(BaseModel):
     name: Optional[str] = None
@@ -89,6 +93,8 @@ class UpdateModelReq(BaseModel):
     cooldown_seconds: Optional[int] = None
     cooldown_failure_threshold: Optional[int] = None
     is_enabled: Optional[bool] = None
+    # None = 不改；给出（含 {}）= 整体覆盖（temperature/modalities 存这里，见文档 §5）
+    extra_config: Optional[dict] = None
 
 class UpdateGroupReq(BaseModel):
     name: Optional[str] = None
@@ -100,6 +106,21 @@ class UpdateGroupReq(BaseModel):
 
 class UpdateApiKeyReq(BaseModel):
     is_enabled: bool
+
+
+# 设置页参数（config 表 admin_settings 单 key 存 JSON）。字段全 Optional：
+# None/缺省 = 不改（部分更新），校验放在模型层 —— 非法值在端点执行前就被
+# pydantic 422 拦下，不会写进 KV。约束见 docs/tasks/admin_panel_features.md §2。
+class UpdateSettingsReq(BaseModel):
+    stream_timeout: Optional[float] = Field(default=None, gt=0)
+    upstream_semaphore_size: Optional[int] = Field(default=None, ge=0)
+    call_log_detail_days: Optional[int] = Field(default=None, ge=0)
+    raw_session_retention_days: Optional[int] = Field(default=None, ge=0)
+    call_logs_retention_days: Optional[int] = Field(default=None, ge=0)
+    daily_summary_hour: Optional[int] = Field(default=None, ge=0, le=23)
+    summary_group: Optional[str] = None
+    model_sync_interval: Optional[int] = Field(default=None, ge=0)
+    log_level: Optional[Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +263,51 @@ async def auth_logout(
 
 
 # ---------------------------------------------------------------------------
+# Settings（管理面板「设置」页：9 个纯管理参数的读写，绝不含密钥）
+# ---------------------------------------------------------------------------
+
+# 与 config.py 启动合并、core.create_app 共用同一个 key。
+SETTINGS_KEY = "admin_settings"
+
+
+def _settings_snapshot() -> dict:
+    """9 个参数的当前生效值（启动合并之后的读取结果）。"""
+    cfg = get_config()
+    return {k: getattr(cfg, k) for k in ADMIN_SETTINGS_FIELDS}
+
+
+@admin_router.get("/settings")
+async def get_settings(_=Depends(verify_admin_key)):
+    return {"success": True, "settings": _settings_snapshot()}
+
+
+@admin_router.patch("/settings")
+async def update_settings(req: UpdateSettingsReq, _=Depends(verify_admin_key)):
+    """部分更新并双写：KV `admin_settings` 持久化 + 内存单例立即生效。
+
+    内存单例与 ``core.create_app`` ``set_config(config)`` 注入的是**同一个对象**，
+    所以 setattr 之后所有 ``get_config()`` 读取点立刻看到新值；进程重启时由
+    ``create_app`` 的启动合并从 KV 再装载一次（页面值不会被 env 冲掉）。
+    """
+    changed = req.model_dump(exclude_unset=True, exclude_none=True)
+    if changed:
+        db = get_db()
+        raw = await db.get_config(SETTINGS_KEY)
+        try:
+            stored = json.loads(raw) if raw else {}
+        except ValueError:
+            stored = {}  # KV 被手改坏 → 以本次变更为准重建，不当场抛
+        if not isinstance(stored, dict):
+            stored = {}
+        stored.update(changed)
+        await db.set_config(SETTINGS_KEY, json.dumps(stored, ensure_ascii=False))
+        cfg = get_config()
+        for key, value in changed.items():
+            setattr(cfg, key, value)
+    return {"success": True, "settings": _settings_snapshot()}
+
+
+# ---------------------------------------------------------------------------
 # Providers
 # ---------------------------------------------------------------------------
 
@@ -255,6 +321,7 @@ async def create_provider(
     pid = await db.create_provider_raw(
         name=req.name, type=req.type, base_url=req.base_url,
         api_key=req.api_key, is_enabled=req.is_enabled,
+        extra_config=req.extra_config,
     )
     return {"success": True, "provider_id": pid, "name": req.name}
 
@@ -292,6 +359,7 @@ async def update_provider(
         api_key=req.api_key if req.api_key is not None else provider.api_key,
         type=req.type if req.type is not None else provider.provider_type,
         is_enabled=req.is_enabled if req.is_enabled is not None else provider.is_enabled,
+        extra_config=req.extra_config if req.extra_config is not None else provider.extra_config,
     )
     invalidate_all_caches()
     return {"success": True, "provider_id": provider_id}
@@ -306,6 +374,26 @@ async def delete_provider(provider_id: int, _=Depends(verify_admin_key)):
         raise HTTPException(status_code=404, detail={"success": False, "error": f"Provider {provider_id} not found"})
     invalidate_all_caches()
     return {"success": True, "provider_id": provider_id}
+
+
+@admin_router.post("/providers/{provider_id}/sync")
+async def sync_provider_models(provider_id: int, _=Depends(verify_admin_key)):
+    """拉取该供应商 /v1/models 并入库（只加新不改旧），单供应商粒度。"""
+    db = get_db()
+    provider = await db.get_provider_raw(provider_id)
+    if not provider:
+        raise HTTPException(status_code=404, detail={"success": False, "error": f"Provider {provider_id} not found"})
+    # 惰性导入：botflow.core 顶层已 import 本模块，模块级 import 会成环
+    from botflow.core import sync_models_from_provider
+    summary = await sync_models_from_provider(provider_id, db=db)
+    invalidate_all_caches()
+    errors = summary.get("errors") or []
+    return {
+        "success": not errors,
+        "added": summary.get("added", 0),
+        "skipped": summary.get("skipped", 0),
+        "errors": errors,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +413,7 @@ async def create_model(
     mid = await db.create_model_raw(
         provider_id=req.provider_id, name=req.name,
         context_window=req.context_window, api_format=req.api_format, is_enabled=req.is_enabled,
+        extra_config=req.extra_config,
     )
     return {"success": True, "model_id": mid, "name": req.name}
 
@@ -369,6 +458,7 @@ async def update_model(
         cooldown_seconds=req.cooldown_seconds if req.cooldown_seconds is not None else model.cooldown_seconds,
         cooldown_failure_threshold=req.cooldown_failure_threshold if req.cooldown_failure_threshold is not None else model.cooldown_failure_threshold,
         is_enabled=req.is_enabled if req.is_enabled is not None else model.is_enabled,
+        extra_config=req.extra_config if req.extra_config is not None else model.extra_config,
     )
     invalidate_all_caches()
     return {"success": True, "model_id": model_id}

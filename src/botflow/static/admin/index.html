@@ -208,20 +208,21 @@ tr:hover td{background:#f8fafc}
         <!-- ===== PROVIDERS ===== -->
         <div v-if="page==='providers'">
           <div style="margin-bottom:16px;text-align:right">
-            <button class="btn btn-primary" @click="openModal('新建供应商',{name:'',base_url:'',api_key:'',type:'openai'})">+ 新建供应商</button>
+            <button class="btn btn-primary" @click="openModal('新建供应商',{name:'',base_url:'',api_key:'',proxy:'',timeout:'',extraJson:'{}'})">+ 新建供应商</button>
           </div>
           <div class="card">
             <div class="card-body" style="padding:0">
               <table v-if="providers.length">
-                <thead><tr><th>ID</th><th>名称</th><th>类型</th><th>Base URL</th><th>状态</th><th>操作</th></tr></thead>
+                <thead><tr><th>ID</th><th>名称</th><th>Base URL</th><th>状态</th><th>操作</th></tr></thead>
                 <tbody><tr v-for="p in providers" :key="p.id">
                   <td>{{p.id}}</td>
                   <td><strong>{{p.name}}</strong></td>
-                  <td><span class="badge badge-blue">{{p.provider_type}}</span></td>
                   <td><span class="code">{{p.base_url}}</span></td>
                   <td><span :class="p.is_enabled?'badge badge-green':'badge badge-red'">{{p.is_enabled?'启用':'禁用'}}</span></td>
                   <td class="actions">
-                    <button class="btn btn-ghost btn-sm" @click="openModal('编辑供应商',{...p}, 'edit')">编辑</button>
+                    <button class="btn btn-ghost btn-sm" @click="syncProvider(p)" :disabled="loading['sync_'+p.id]">{{loading['sync_'+p.id] ? '获取中...' : '获取模型'}}</button>
+                    <button class="btn btn-ghost btn-sm" @click="openModal('编辑供应商',providerEditForm(p),'edit')">编辑</button>
+                    <button class="btn btn-ghost btn-sm" @click="toggleProvider(p)">{{p.is_enabled?'禁用':'启用'}}</button>
                     <button class="btn btn-danger btn-sm" @click="deleteProvider(p.id)">删除</button>
                   </td>
                 </tr></tbody>
@@ -239,7 +240,7 @@ tr:hover td{background:#f8fafc}
           <div class="card">
             <div class="card-body" style="padding:0">
               <table v-if="models.length">
-                <thead><tr><th>ID</th><th>名称</th><th>供应商</th><th>上下文窗口</th><th>重试</th><th>冷却</th><th>状态</th><th>操作</th></tr></thead>
+                <thead><tr><th>ID</th><th>名称</th><th>供应商</th><th>上下文窗口</th><th>重试</th><th>冷却</th><th>模态/温度</th><th>状态</th><th>操作</th></tr></thead>
                 <tbody><tr v-for="m in models" :key="m.id">
                   <td>{{m.id}}</td>
                   <td><strong>{{m.name}}</strong></td>
@@ -247,9 +248,10 @@ tr:hover td{background:#f8fafc}
                   <td>{{m.context_window||'-'}}</td>
                   <td>{{m.max_retries}}</td>
                   <td>{{m.cooldown_seconds}}s</td>
+                  <td style="font-size:12px;white-space:nowrap">{{modalityText(m)}}</td>
                   <td><span :class="m.is_enabled?'badge badge-green':'badge badge-red'">{{m.is_enabled?'启用':'禁用'}}</span></td>
                   <td class="actions">
-                    <button class="btn btn-ghost btn-sm" @click="openModal('编辑模型',{...m, provider_id:m.provider_id}, 'edit')">编辑</button>
+                    <button class="btn btn-ghost btn-sm" @click="openModal('编辑模型',modelEditForm(m),'edit')">编辑</button>
                     <button class="btn btn-ghost btn-sm" @click="toggleModel(m)">{{m.is_enabled?'禁用':'启用'}}</button>
                     <button class="btn btn-danger btn-sm" @click="deleteModel(m.id)">删除</button>
                   </td>
@@ -294,9 +296,13 @@ tr:hover td{background:#f8fafc}
                 </tbody>
               </table>
               <div style="padding:12px 20px;border-top:1px solid var(--border)">
-                <select v-model="newModelForGroup[g.id]" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;margin-right:8px">
-                  <option value="">选择模型...</option>
-                  <option v-for="m in models" :key="m.id" :value="m.id">{{m.name}}</option>
+                <select v-model="newProviderForGroup[g.id]" @change="newModelForGroup[g.id]=''" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;margin-right:8px">
+                  <option value="">选择供应商...</option>
+                  <option v-for="p in providers" :key="p.id" :value="p.id">{{p.name}}</option>
+                </select>
+                <select v-model="newModelForGroup[g.id]" :disabled="!newProviderForGroup[g.id]" style="padding:6px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;margin-right:8px">
+                  <option value="">{{newProviderForGroup[g.id] ? '选择模型...' : '先选供应商...'}}</option>
+                  <option v-for="m in groupPickModels(g.id)" :key="m.id" :value="m.id">{{m.name}} · {{m.context_window||'-'}}</option>
                 </select>
                 <button class="btn btn-ghost btn-sm" @click="doAddModelToGroup(g.id)" :disabled="!newModelForGroup[g.id]">添加</button>
               </div>
@@ -390,6 +396,48 @@ tr:hover td{background:#f8fafc}
           <div v-else class="card"><div class="card-body empty">选择日期查询日报</div></div>
         </div>
 
+        <!-- ===== SETTINGS ===== -->
+        <div v-if="page==='settings'">
+          <div class="card">
+            <div class="card-header">
+              <h3>运行参数</h3>
+              <span style="font-size:12px;color:var(--text2)">保存后写入数据库；重启后页面值仍生效（优先于 .env）</span>
+            </div>
+            <div class="card-body">
+              <h4 style="font-size:13px;color:var(--text2);margin-bottom:12px">请求与并发</h4>
+              <div class="form-group"><label>流式首包超时（秒） <span style="font-weight:400;color:#94a3b8">当前运行时未读取</span></label>
+                <input type="number" step="any" v-model.number="settings.stream_timeout"></div>
+              <div class="form-group"><label>上游并发上限（0 = 不限制） <span style="font-weight:400;color:#94a3b8">重启后生效</span></label>
+                <input type="number" step="1" v-model.number="settings.upstream_semaphore_size"></div>
+
+              <h4 style="font-size:13px;color:var(--text2);margin:20px 0 12px">日志与保留</h4>
+              <div class="form-group"><label>日志级别 <span style="font-weight:400;color:#94a3b8">重启后生效</span></label>
+                <select v-model="settings.log_level">
+                  <option>DEBUG</option><option>INFO</option><option>WARNING</option><option>ERROR</option><option>CRITICAL</option>
+                </select>
+              </div>
+              <div class="form-group"><label>日志明细保留天数 <span style="font-weight:400;color:#94a3b8">次日维护生效</span></label>
+                <input type="number" step="1" v-model.number="settings.call_log_detail_days"></div>
+              <div class="form-group"><label>原始会话保留天数 <span style="font-weight:400;color:#94a3b8">次日维护生效</span></label>
+                <input type="number" step="1" v-model.number="settings.raw_session_retention_days"></div>
+              <div class="form-group"><label>调用日志保留天数 <span style="font-weight:400;color:#94a3b8">次日维护生效</span></label>
+                <input type="number" step="1" v-model.number="settings.call_logs_retention_days"></div>
+
+              <h4 style="font-size:13px;color:var(--text2);margin:20px 0 12px">定时任务</h4>
+              <div class="form-group"><label>每日汇总执行小时（UTC，0-23） <span style="font-weight:400;color:#94a3b8">重启后生效</span></label>
+                <input type="number" step="1" v-model.number="settings.daily_summary_hour"></div>
+              <div class="form-group"><label>每日汇总分组 <span style="font-weight:400;color:#94a3b8">次日维护生效</span></label>
+                <input v-model="settings.summary_group" placeholder="留空 = 默认组"></div>
+              <div class="form-group"><label>模型自动同步间隔（分钟，0 = 停用） <span style="font-weight:400;color:#94a3b8">重启后生效</span></label>
+                <input type="number" step="1" v-model.number="settings.model_sync_interval"></div>
+
+              <div style="text-align:right;margin-top:8px">
+                <button class="btn btn-primary" @click="saveSettings" :disabled="loading.settings">{{loading.settings ? '保存中...' : '保存设置'}}</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
       </div>
 
       <!-- ===== MODAL ===== -->
@@ -400,9 +448,14 @@ tr:hover td{background:#f8fafc}
             <!-- Provider form -->
             <template v-if="modal.form.base_url!==undefined && modal.form.raw_key===undefined">
               <div class="form-group"><label>名称</label><input v-model="modal.form.name"></div>
-              <div class="form-group"><label>类型</label><select v-model="modal.form.type"><option>openai</option><option>anthropic</option></select></div>
               <div class="form-group"><label>Base URL</label><input v-model="modal.form.base_url" placeholder="https://api.example.com/v1/"></div>
               <div class="form-group"><label>API Key</label><input v-model="modal.form.api_key" type="password"></div>
+              <div class="form-group"><label>代理 proxy</label><input v-model="modal.form.proxy" placeholder="http://user:pass@host:port（留空 = 不使用代理）"></div>
+              <div class="form-group"><label>超时 timeout（秒）</label><input type="number" step="any" v-model="modal.form.timeout" placeholder="留空 = 用默认超时"></div>
+              <div class="form-group"><label>高级 extra_config（JSON）</label>
+                <textarea v-model="modal.form.extraJson" rows="4" style="width:100%;font-family:monospace" placeholder="{}"></textarea>
+                <small style="color:#94a3b8">proxy/timeout 输入框优先于 JSON 里的同名键；保存时整体覆盖</small>
+              </div>
             </template>
             <!-- Model form -->
             <template v-else-if="modal.form.context_window!==undefined && modal.form.raw_key===undefined && modal.form.fallback_group_id===undefined">
@@ -413,6 +466,24 @@ tr:hover td{background:#f8fafc}
               </div>
               <div class="form-group"><label>名称</label><input v-model="modal.form.name"></div>
               <div class="form-group"><label>上下文窗口</label><input type="number" v-model.number="modal.form.context_window"></div>
+              <!-- 编辑展开完整表单（创建保持精简 3 项） -->
+              <template v-if="modal.mode==='edit'">
+                <div class="form-group"><label>显示名</label><input v-model="modal.form.display_name" placeholder="留空 = 用名称"></div>
+                <div class="form-group"><label>API 格式</label><input v-model="modal.form.api_format" placeholder="留空 = 跟随供应商类型"></div>
+                <div class="form-group"><label>重试次数</label><input type="number" step="1" v-model.number="modal.form.max_retries"></div>
+                <div class="form-group"><label>冷却秒数</label><input type="number" step="1" v-model.number="modal.form.cooldown_seconds"></div>
+                <div class="form-group"><label>冷却触发阈值</label><input type="number" step="1" v-model.number="modal.form.cooldown_failure_threshold"></div>
+                <div class="form-group"><label>默认温度 temperature <span style="font-weight:400;color:#94a3b8">请求未传时生效</span></label>
+                  <input type="number" step="any" v-model="modal.form.temperature" placeholder="留空 = 不设默认"></div>
+                <div class="form-group"><label>模态（仅展示，不影响路由）</label>
+                  <label v-for="m in ['text','image','audio','video']" :key="m" style="margin-right:12px;font-weight:400">
+                    <input type="checkbox" :value="m" v-model="modal.form.modalities"> {{m}}
+                  </label>
+                </div>
+                <div class="form-group"><label>启用状态</label>
+                  <select v-model="modal.form.is_enabled"><option :value="true">启用</option><option :value="false">禁用</option></select>
+                </div>
+              </template>
             </template>
             <!-- Group form -->
             <template v-else-if="modal.form.fallback_group_id!==undefined">
@@ -495,6 +566,9 @@ createApp({
         const d = body.detail;
         let msg = r.statusText || ('HTTP '+r.status);
         if(typeof d === 'string') msg = d;
+        // pydantic 422 的 detail 是校验数组：拼成 "字段: 原因" 才看得懂，
+        // 否则会落进下面的 JSON.stringify 全串。
+        else if(Array.isArray(d)) msg = d.map(x=>((x.loc||[]).slice(1).join('.')||'body')+': '+(x.msg||'invalid')).join('; ');
         else if(d && typeof d === 'object') msg = d.error || d.message || JSON.stringify(d);
         const err = new Error(msg);
         err.status = r.status;
@@ -525,6 +599,7 @@ createApp({
       {id:'apikeys',label:'API Keys',icon:'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>'},
       {id:'logs',label:'调用日志',icon:'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>'},
       {id:'summary',label:'日报',icon:'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>'},
+      {id:'settings',label:'设置',icon:'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>'},
     ];
     const page = ref('dashboard');
     const currentPageLabel = computed(()=>pages.find(p=>p.id===page.value)?.label||'');
@@ -794,20 +869,85 @@ createApp({
       loading.summary = false;
     }
 
+    // Settings（设置页：9 个纯管理参数，键集由 GET /admin/settings 决定）
+    const settings = reactive({});
+    const SETTINGS_NUM_KEYS = ['stream_timeout','upstream_semaphore_size','call_log_detail_days',
+      'raw_session_retention_days','call_logs_retention_days','daily_summary_hour','model_sync_interval'];
+    const SETTINGS_LABELS = {
+      stream_timeout:'流式首包超时', upstream_semaphore_size:'上游并发上限',
+      call_log_detail_days:'日志明细保留天数', raw_session_retention_days:'原始会话保留天数',
+      call_logs_retention_days:'调用日志保留天数', daily_summary_hour:'每日汇总执行小时',
+      model_sync_interval:'模型自动同步间隔',
+    };
+    async function loadSettings(){
+      try{
+        const r = await api('/settings');
+        Object.assign(settings, r.settings||{});
+      }catch(e){ toast('加载设置失败: '+e.message, 'error'); }
+    }
+    async function saveSettings(){
+      const payload = {...settings};
+      // 数字字段先本地拦一道：空串/非数字直接 toast，不发请求（后端 422 只兜漏网）
+      for(const k of SETTINGS_NUM_KEYS){
+        if(!(typeof payload[k]==='number' && Number.isFinite(payload[k]))){
+          toast((SETTINGS_LABELS[k]||k)+' 必须是数字', 'error');
+          return;
+        }
+      }
+      payload.summary_group = payload.summary_group ?? '';
+      payload.log_level = payload.log_level || 'INFO';
+      loading.settings = true;
+      try{
+        const r = await apiPatch('/settings', payload);
+        Object.assign(settings, r.settings||{});
+        toast('设置已保存');
+      }catch(e){ toast(e.message, 'error'); }
+      loading.settings = false;
+    }
+
     // CRUD helpers
     async function apiPost(path, body){ return api(path, {method:'POST', body:JSON.stringify(body)}); }
     async function apiPatch(path, body){ return api(path, {method:'PATCH', body:JSON.stringify(body)}); }
     async function apiDelete(path){ return api(path, {method:'DELETE'}); }
 
     // CRUD: Providers
+    // 编辑回填：proxy/timeout 从 extra_config 拆成输入框，其余键留在 textarea
+    function providerEditForm(p){
+      const ec = p.extra_config || {};
+      return {...p, proxy: ec.proxy||'', timeout: ec.timeout ?? '', extraJson: JSON.stringify(ec, null, 2)};
+    }
+    // 合并规则（文档 §4）：textarea JSON 为底稿 → proxy/timeout 输入框为权威
+    // （空 = 删键）→ 整体提交（后端整列覆盖）
+    function buildProviderExtraConfig(f){
+      let base;
+      const raw = (f.extraJson||'').trim();
+      try{ base = raw ? JSON.parse(raw) : {}; }
+      catch(e){ toast('extra_config 不是合法 JSON', 'error'); return null; }
+      if(base===null || typeof base!=='object' || Array.isArray(base)){ toast('extra_config 必须是 JSON 对象', 'error'); return null; }
+      const proxy = (f.proxy||'').trim();
+      if(proxy) base.proxy = proxy; else delete base.proxy;
+      const timeout = (f.timeout===''||f.timeout===null||f.timeout===undefined) ? '' : String(f.timeout).trim();
+      if(timeout!==''){
+        const n = Number(timeout);
+        if(!Number.isFinite(n)){ toast('超时必须是数字', 'error'); return null; }
+        base.timeout = n;
+      }else delete base.timeout;
+      return base;
+    }
     async function saveProvider(){
       try{
         const f = modal.form;
-        if(modal.mode==='create') await apiPost('/providers', {req:{name:f.name, base_url:f.base_url, api_key:f.api_key, type:f.type||'openai'}});
-        else await apiPatch('/providers/'+f.id, {name:f.name, base_url:f.base_url, api_key:f.api_key, type:f.type});
+        const extra = buildProviderExtraConfig(f);
+        if(extra===null) return;   // 校验失败已 toast，不发请求
+        if(modal.mode==='create') await apiPost('/providers', {req:{name:f.name, base_url:f.base_url, api_key:f.api_key, extra_config:extra}});
+        else await apiPatch('/providers/'+f.id, {name:f.name, base_url:f.base_url, api_key:f.api_key, extra_config:extra});
         toast(modal.mode==='create'?'供应商已创建':'供应商已更新');
         closeModal(); await loadAll();
       }catch(e){ toast(e.message, 'error'); }
+    }
+    async function toggleProvider(p){
+      try{ await apiPatch('/providers/'+p.id, {is_enabled:!p.is_enabled}); toast('已更新'); await loadAll(); }
+      catch(e){ toast(e.message, 'error'); }
     }
     function deleteProvider(id){
       askConfirm('确定删除该供应商？关联的模型也会被删除。', async ()=>{
@@ -815,13 +955,58 @@ createApp({
         catch(e){ toast(e.message, 'error'); }
       });
     }
+    // 单供应商「获取模型」：POST /sync（无 body），完成后刷新全部列表
+    async function syncProvider(p){
+      if(loading['sync_'+p.id]) return;
+      loading['sync_'+p.id] = true;
+      try{
+        const r = await api('/providers/'+p.id+'/sync', {method:'POST'});
+        if(r.errors && r.errors.length) toast('同步失败: '+r.errors.join('; '), 'error');
+        else toast(`新增 ${r.added} · 跳过 ${r.skipped}`);
+        await loadAll();
+      }catch(e){ toast(e.message, 'error'); }
+      finally{ loading['sync_'+p.id] = false; }
+    }
 
     // CRUD: Models
+    // 编辑回填：temperature/modalities 从 extra_config 拆成表单字段
+    function modelEditForm(m){
+      const ec = m.extra_config || {};
+      return {...m, provider_id:m.provider_id,
+              temperature: ec.temperature ?? '',
+              modalities: [...(Array.isArray(ec.modalities) ? ec.modalities : [])]};
+    }
+    // 模型列表「模态/温度」列：两者皆空 → '-'
+    function modalityText(m){
+      const ec = m.extra_config || {};
+      const parts = [];
+      if(Array.isArray(ec.modalities) && ec.modalities.length) parts.push(ec.modalities.join(','));
+      if(ec.temperature != null) parts.push('temp='+ec.temperature);
+      return parts.length ? parts.join(' · ') : '-';
+    }
     async function saveModel(){
       try{
         const f = modal.form;
-        if(modal.mode==='create') await apiPost('/models', {req:{provider_id:+f.provider_id, name:f.name, context_window:+f.context_window||0}});
-        else await apiPatch('/models/'+f.id, {name:f.name, is_enabled:f.is_enabled!==false});
+        if(modal.mode==='create'){
+          await apiPost('/models', {req:{provider_id:+f.provider_id, name:f.name, context_window:+f.context_window||0}});
+        }else{
+          // extra_config 以打开编辑时的原对象为底（保住 proxy/strip_params 等既有键）
+          const base = (f.extra_config && typeof f.extra_config==='object') ? {...f.extra_config} : {};
+          const tRaw = (f.temperature===''||f.temperature===null||f.temperature===undefined) ? '' : String(f.temperature).trim();
+          if(tRaw!==''){
+            const n = Number(tRaw);
+            if(!Number.isFinite(n)){ toast('温度必须是数字', 'error'); return; }
+            base.temperature = n;
+          }else delete base.temperature;
+          const mods = Array.isArray(f.modalities) ? f.modalities : [];
+          if(mods.length) base.modalities = [...mods]; else delete base.modalities;
+          await apiPatch('/models/'+f.id, {
+            name:f.name, display_name:f.display_name||'', api_format:f.api_format||'',
+            context_window:+f.context_window||0, max_retries:+f.max_retries||0,
+            cooldown_seconds:+f.cooldown_seconds||0, cooldown_failure_threshold:+f.cooldown_failure_threshold||0,
+            is_enabled:f.is_enabled!==false, extra_config:base,
+          });
+        }
         toast(modal.mode==='create'?'模型已创建':'模型已更新');
         closeModal(); await loadAll();
       }catch(e){ toast(e.message, 'error'); }
@@ -883,6 +1068,8 @@ createApp({
     const logFilters = reactive({group_id:'', status:''});
     const summaryDate = ref(new Date().toISOString().slice(0,10));
     const newModelForGroup = reactive({});
+    // 分组添加模型的两级选择（⑥）：第一级供应商按 gid 存，变更时清空已选模型
+    const newProviderForGroup = reactive({});
     const groupDetailsCache = reactive({});
 
     function providerName(pid){
@@ -899,11 +1086,21 @@ createApp({
     }
     function fmtTime(t){
       if(!t) return '-';
-      try{ return new Date(t).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'}); }
-      catch(e){ return t; }
+      // DB 存的是 UTC 的 "YYYY-MM-DD HH:MM:SS"（sqlite datetime('now')），FastAPI 序列化后
+      // 可能是空格形或 T 形：replace 后补 Z → 按 UTC 解析，再固定用 Asia/Shanghai 展示，
+      // 显示与浏览器时区无关。解析失败回显原串（不显示 Invalid Date）。
+      const d = new Date(String(t).replace(' ','T')+'Z');
+      if(isNaN(d.getTime())) return t;
+      return d.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});
     }
     function groupModels(gid){
       return groupDetailsCache[gid] || [];
+    }
+    // 第二级候选：已选供应商下的模型；未选供应商 → 空数组（select 保持 disabled）
+    function groupPickModels(gid){
+      const pid = newProviderForGroup[gid];
+      if(!pid) return [];
+      return models.value.filter(m=>m.provider_id===pid);
     }
 
     async function loadGroupDetails(gid){
@@ -943,6 +1140,7 @@ createApp({
         await refreshDashboard();   // 进概览页按当前选中档刷新两图
       }
       if(p==='providers'||p==='models') await loadAll();
+      if(p==='settings') await loadSettings();
       if(p==='groups'){
         await loadAll();
         for(const g of groups.value) await loadGroupDetails(g.id);
@@ -974,16 +1172,17 @@ createApp({
       providers, models, groups, apikeys, logs, stats, strategies, summaries,
       rangeOptions, rangeSel, selectRange,
       trendRows, trendChartEl, echartsOk,
-      loading, logFilters, summaryDate, newModelForGroup,
+      loading, logFilters, summaryDate, newModelForGroup, newProviderForGroup,
       doLogin, doLogout, switchPage, toast,
       openModal, closeModal, submitModal,
       confirmState, confirmOk, confirmCancel,
-      saveProvider, deleteProvider,
-      saveModel, deleteModel, toggleModel,
+      saveProvider, deleteProvider, syncProvider, toggleProvider, providerEditForm,
+      saveModel, deleteModel, toggleModel, modelEditForm, modalityText,
       saveGroup, deleteGroup, addModelToGroup, removeModelFromGroup, doAddModelToGroup,
       saveApiKey, deleteApiKey, toggleApiKey,
       loadLogs, loadSummary,
-      providerName, groupIdToName, modelIdToName, fmtTime, groupModels,
+      settings, loadSettings, saveSettings,
+      providerName, groupIdToName, modelIdToName, fmtTime, groupModels, groupPickModels,
     };
   }
 }).mount('#app');

@@ -1144,9 +1144,11 @@ class Database:
     # Scalar-arg convenience CRUD (used by REST admin API)
     # ------------------------------------------------------------------
 
-    async def create_provider_raw(self, *, name, type, base_url, api_key="", is_enabled=True) -> Provider:
+    async def create_provider_raw(self, *, name, type, base_url, api_key="", is_enabled=True,
+                                  extra_config=None) -> Provider:
         return await self.create_provider(Provider(
-            name=name, provider_type=type, base_url=base_url, api_key=api_key, is_enabled=is_enabled
+            name=name, provider_type=type, base_url=base_url, api_key=api_key,
+            is_enabled=is_enabled, extra_config=extra_config or {},
         ))
 
     async def get_provider_raw(self, provider_id: int) -> Optional[Provider]:
@@ -1158,12 +1160,18 @@ class Database:
     async def list_providers_raw(self) -> list[Provider]:
         return await self.list_providers()
 
-    async def update_provider_raw(self, provider_id, *, name, type, base_url, api_key, is_enabled) -> None:
+    async def update_provider_raw(self, provider_id, *, name, type, base_url, api_key, is_enabled,
+                                  extra_config=None) -> None:
+        # extra_config=None → 不写该列（既有调用方不传参，行为不变）；给出（含 {}）→ 整体覆盖
         conn = await self._ensure_connection()
-        await conn.execute(
-            "UPDATE providers SET name=?, provider_type=?, base_url=?, api_key=?, is_enabled=? WHERE id=?",
-            (name, type, base_url, api_key, 1 if is_enabled else 0, provider_id),
-        )
+        sql = "UPDATE providers SET name=?, provider_type=?, base_url=?, api_key=?, is_enabled=?"
+        params: list = [name, type, base_url, api_key, 1 if is_enabled else 0]
+        if extra_config is not None:
+            sql += ", extra_config=?"
+            params.append(json.dumps(extra_config))
+        sql += " WHERE id=?"
+        params.append(provider_id)
+        await conn.execute(sql, params)
         await conn.commit()
 
     async def delete_provider_raw(self, provider_id: int) -> int:
@@ -1172,12 +1180,12 @@ class Database:
     async def create_model_raw(self, *, provider_id, name, context_window=0,
                               is_enabled=True, display_name="", api_format="",
                               max_retries=3, cooldown_seconds=60,
-                              cooldown_failure_threshold=3) -> Model:
+                              cooldown_failure_threshold=3, extra_config=None) -> Model:
         return await self.create_model(Model(
             provider_id=provider_id, name=name, display_name=display_name, api_format=api_format,
             max_retries=max_retries, cooldown_seconds=cooldown_seconds,
             cooldown_failure_threshold=cooldown_failure_threshold, is_enabled=is_enabled,
-            context_window=context_window,
+            context_window=context_window, extra_config=extra_config or {},
         ))
 
     async def get_model_raw(self, model_id: int) -> Optional[Model]:
@@ -1191,11 +1199,17 @@ class Database:
 
     async def update_model_raw(self, model_id, *, name, context_window=0, is_enabled=True,
                               display_name="", api_format="", max_retries=3, cooldown_seconds=60,
-                              cooldown_failure_threshold=3) -> None:
+                              cooldown_failure_threshold=3, extra_config=None) -> None:
+        # extra_config=None → 不写该列（既有调用方不传参，行为不变）；给出（含 {}）→ 整体覆盖
         conn = await self._ensure_connection()
-        sql = "UPDATE models SET name=?, display_name=?, api_format=?, max_retries=?, cooldown_seconds=?, cooldown_failure_threshold=?, context_window=?, is_enabled=? WHERE id=?"
-        params = (name, display_name, api_format, max_retries, cooldown_seconds, cooldown_failure_threshold,
-                  context_window, 1 if is_enabled else 0, model_id)
+        sql = "UPDATE models SET name=?, display_name=?, api_format=?, max_retries=?, cooldown_seconds=?, cooldown_failure_threshold=?, context_window=?, is_enabled=?"
+        params: list = [name, display_name, api_format, max_retries, cooldown_seconds, cooldown_failure_threshold,
+                        context_window, 1 if is_enabled else 0]
+        if extra_config is not None:
+            sql += ", extra_config=?"
+            params.append(json.dumps(extra_config))
+        sql += " WHERE id=?"
+        params.append(model_id)
         await conn.execute(sql, params)
         await conn.commit()
 

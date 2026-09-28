@@ -116,6 +116,55 @@ async def test_update_model_raw_keeps_existing_type(db):
     assert (await db.get_model_raw(mid)).name == "rm3"
 
 
+# --- §6.3/§6.4 用例 31-33/37：raw CRUD 的 extra_config 加参后行为边界 ---------
+
+async def test_update_provider_raw_default_keeps_extra_config(db):
+    """31（回归）：不传 extra_config（既有调用方形态）→ 该列不写，原值不变。"""
+    pid = await db.create_provider_raw(
+        name="rp", type="openai", base_url="http://x", api_key="k",
+        extra_config={"proxy": "http://p:1"},
+    )
+    await db.update_provider_raw(pid, name="rp2", type="openai", base_url="http://x",
+                                 api_key="k", is_enabled=True)
+    assert (await db.get_provider_raw(pid)).extra_config == {"proxy": "http://p:1"}
+
+
+async def test_update_provider_raw_writes_extra_config_when_given(db):
+    """32（正例）：给出 extra_config（含 {}）→ json.dumps 整列覆盖。"""
+    pid = await db.create_provider_raw(name="rp", type="openai", base_url="http://x",
+                                       api_key="k", extra_config={"proxy": "http://p:1"})
+    await db.update_provider_raw(pid, name="rp", type="openai", base_url="http://x",
+                                 api_key="k", is_enabled=True, extra_config={"a": 1})
+    assert (await db.get_provider_raw(pid)).extra_config == {"a": 1}
+    # {} 也必须写列（清空）
+    await db.update_provider_raw(pid, name="rp", type="openai", base_url="http://x",
+                                 api_key="k", is_enabled=True, extra_config={})
+    assert (await db.get_provider_raw(pid)).extra_config == {}
+
+
+async def test_create_provider_raw_with_extra_config(db):
+    """33（正例）：create 带 extra_config → 存该 dict；不传 → {}。"""
+    pid = await db.create_provider_raw(name="rp1", type="openai", base_url="http://x",
+                                       api_key="k", extra_config={"timeout": 9})
+    assert (await db.get_provider_raw(pid)).extra_config == {"timeout": 9}
+    pid2 = await db.create_provider_raw(name="rp2", type="openai", base_url="http://x", api_key="k")
+    assert (await db.get_provider_raw(pid2)).extra_config == {}
+
+
+async def test_update_model_raw_default_keeps_extra_config(db):
+    """37（回归）：不传 extra_config → 列不写原值不变；传了 → 整体覆盖。"""
+    pid = await db.create_provider_raw(name="rp", type="openai", base_url="http://x", api_key="k")
+    mid = await db.create_model_raw(provider_id=pid, name="rm",
+                                    extra_config={"temperature": 0.3, "proxy": "http://p:1"})
+    # 不传 → 原值不变（同 tests/test_db_full.py:106 的调用形态）
+    await db.update_model_raw(mid, name="rm2", is_enabled=True)
+    assert (await db.get_model_raw(mid)).extra_config == {"temperature": 0.3, "proxy": "http://p:1"}
+    # 传了 → 整体覆盖（proxy 键消失）
+    await db.update_model_raw(mid, name="rm2", is_enabled=True,
+                              extra_config={"temperature": 0.7})
+    assert (await db.get_model_raw(mid)).extra_config == {"temperature": 0.7}
+
+
 async def test_raw_group_crud(db):
     gid = await db.create_group_raw(name="rg", description="d", fallback_group_id=None)
     assert gid > 0

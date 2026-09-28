@@ -103,6 +103,123 @@ class TestModels:
         assert client.delete("/admin/models/9999", headers=AUTH).status_code == 404
 
 
+class TestProviderExtraConfig:
+    """§6.3 用例 24-30：供应商 extra_config 整体覆盖语义 + type(D1) + 启用禁用。"""
+
+    def test_create_provider_with_extra_config(self, client):
+        # 用例 24：create 带 extra_config → GET 原样返回
+        p = client.post("/admin/providers", json={"req": {
+            "name": "px", "base_url": "https://x",
+            "extra_config": {"proxy": "http://p:1", "timeout": 30},
+        }}, headers=AUTH)
+        assert p.status_code == 200
+        pid = p.json()["provider_id"]
+        got = client.get(f"/admin/providers/{pid}", headers=AUTH).json()["provider"]
+        assert got["extra_config"] == {"proxy": "http://p:1", "timeout": 30}
+
+    def test_create_provider_defaults_type_openai(self, client):
+        # 用例 25（D1 回归）：前端不再发 type → 后端默认 "openai"
+        p = client.post("/admin/providers", json={"req": {"name": "p25", "base_url": "https://x"}}, headers=AUTH)
+        assert p.status_code == 200
+        got = client.get(f"/admin/providers/{p.json()['provider_id']}", headers=AUTH).json()["provider"]
+        assert got["provider_type"] == "openai"
+
+    def test_patch_provider_extra_config_none_keeps_existing(self, client):
+        # 用例 26：PATCH 不带 extra_config → 原值不变
+        pid = client.post("/admin/providers", json={"req": {
+            "name": "p26", "base_url": "https://x", "extra_config": {"proxy": "http://p:1"},
+        }}, headers=AUTH).json()["provider_id"]
+        r = client.patch(f"/admin/providers/{pid}", json={"name": "p26-renamed"}, headers=AUTH)
+        assert r.status_code == 200
+        got = client.get(f"/admin/providers/{pid}", headers=AUTH).json()["provider"]
+        assert got["extra_config"] == {"proxy": "http://p:1"}
+        assert got["name"] == "p26-renamed"
+
+    def test_patch_provider_extra_config_replaces_whole_dict(self, client):
+        # 用例 27：整体覆盖（非键级合并）——proxy 键必须消失
+        pid = client.post("/admin/providers", json={"req": {
+            "name": "p27", "base_url": "https://x",
+            "extra_config": {"proxy": "http://p:1", "timeout": 30},
+        }}, headers=AUTH).json()["provider_id"]
+        r = client.patch(f"/admin/providers/{pid}", json={"extra_config": {"timeout": 5}}, headers=AUTH)
+        assert r.status_code == 200
+        got = client.get(f"/admin/providers/{pid}", headers=AUTH).json()["provider"]
+        assert got["extra_config"] == {"timeout": 5}
+
+    def test_patch_provider_empty_extra_config_clears(self, client):
+        # 用例 28：{} 是「给出」不是「不改」→ 必须写列清空
+        pid = client.post("/admin/providers", json={"req": {
+            "name": "p28", "base_url": "https://x", "extra_config": {"proxy": "http://p:1"},
+        }}, headers=AUTH).json()["provider_id"]
+        r = client.patch(f"/admin/providers/{pid}", json={"extra_config": {}}, headers=AUTH)
+        assert r.status_code == 200
+        got = client.get(f"/admin/providers/{pid}", headers=AUTH).json()["provider"]
+        assert got["extra_config"] == {}
+
+    def test_patch_provider_without_type_preserves_type(self, client):
+        # 用例 29（D1 回归）：PATCH 不带 type → provider_type 保持原值
+        pid = client.post("/admin/providers", json={"req": {
+            "name": "p29", "base_url": "https://x", "type": "anthropic",
+        }}, headers=AUTH).json()["provider_id"]
+        r = client.patch(f"/admin/providers/{pid}", json={"base_url": "https://y"}, headers=AUTH)
+        assert r.status_code == 200
+        got = client.get(f"/admin/providers/{pid}", headers=AUTH).json()["provider"]
+        assert got["provider_type"] == "anthropic"
+        assert got["base_url"] == "https://y"
+
+    def test_patch_provider_toggles_is_enabled(self, client):
+        # 用例 30：启用/禁用翻转
+        pid = client.post("/admin/providers", json={"req": {"name": "p30", "base_url": "https://x"}}, headers=AUTH).json()["provider_id"]
+        assert client.patch(f"/admin/providers/{pid}", json={"is_enabled": False}, headers=AUTH).status_code == 200
+        assert client.get(f"/admin/providers/{pid}", headers=AUTH).json()["provider"]["is_enabled"] is False
+        client.patch(f"/admin/providers/{pid}", json={"is_enabled": True}, headers=AUTH)
+        assert client.get(f"/admin/providers/{pid}", headers=AUTH).json()["provider"]["is_enabled"] is True
+
+
+class TestModelExtraConfig:
+    """§6.4 用例 34-36：模型 extra_config（temperature/modalities 存这里）。"""
+
+    def _create_provider(self, client):
+        return client.post("/admin/providers", json={"req": {"name": "pm", "base_url": "https://x"}}, headers=AUTH).json()["provider_id"]
+
+    def test_create_model_with_extra_config(self, client):
+        # 用例 34：create 带 extra_config → GET 返回；不传 → {}
+        pid = self._create_provider(client)
+        m = client.post("/admin/models", json={"req": {
+            "provider_id": pid, "name": "m34", "extra_config": {"temperature": 0.2},
+        }}, headers=AUTH)
+        assert m.status_code == 200
+        mid = m.json()["model_id"]
+        got = client.get(f"/admin/models/{mid}", headers=AUTH).json()["model"]
+        assert got["extra_config"] == {"temperature": 0.2}
+        # 不传 → 默认 {}
+        m2 = client.post("/admin/models", json={"req": {"provider_id": pid, "name": "m34b"}}, headers=AUTH)
+        got2 = client.get(f"/admin/models/{m2.json()['model_id']}", headers=AUTH).json()["model"]
+        assert got2["extra_config"] == {}
+
+    def test_patch_model_extra_config_replaces(self, client):
+        # 用例 35：PATCH extra_config → GET 原样返回（整体覆盖）
+        pid = self._create_provider(client)
+        mid = client.post("/admin/models", json={"req": {"provider_id": pid, "name": "m35"}}, headers=AUTH).json()["model_id"]
+        new_cfg = {"temperature": 0.7, "modalities": ["text", "image"]}
+        r = client.patch(f"/admin/models/{mid}", json={"extra_config": new_cfg}, headers=AUTH)
+        assert r.status_code == 200
+        got = client.get(f"/admin/models/{mid}", headers=AUTH).json()["model"]
+        assert got["extra_config"] == new_cfg
+
+    def test_patch_model_extra_config_none_keeps(self, client):
+        # 用例 36：PATCH 不带 extra_config → 原值不变
+        pid = self._create_provider(client)
+        mid = client.post("/admin/models", json={"req": {
+            "provider_id": pid, "name": "m36", "extra_config": {"temperature": 0.3},
+        }}, headers=AUTH).json()["model_id"]
+        r = client.patch(f"/admin/models/{mid}", json={"name": "m36-renamed"}, headers=AUTH)
+        assert r.status_code == 200
+        got = client.get(f"/admin/models/{mid}", headers=AUTH).json()["model"]
+        assert got["extra_config"] == {"temperature": 0.3}
+        assert got["name"] == "m36-renamed"
+
+
 class TestGroups:
     def test_crud(self, client):
         g = client.post("/admin/groups", json={"req": {"name": "prod", "description": "d"}}, headers=AUTH)

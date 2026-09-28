@@ -251,6 +251,19 @@ async def select_endpoints(state: RouteState) -> dict:
     }
 
 
+def _resolve_temperature(request_temperature: float | None, ep) -> float | None:
+    """D2 默认值语义：请求优先；未传(None) → 模型 extra_config.temperature；都没有 → None(不传)。
+
+    ``protocol_adapter`` 用 ``body.get("temperature")``，显式传 null 与未传都得到
+    None —— 无法区分，一律按「未传」处理回落模型默认值（见文档 §5）。
+    解析必须按 endpoint 做（同组不同模型各有各的默认值）。
+    """
+    if request_temperature is not None:
+        return request_temperature
+    t = (ep.detail.extra_config or {}).get("temperature")
+    return float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) else None
+
+
 async def try_call(state: RouteState) -> dict:
     """Attempt a non-streaming LLM call on each endpoint in order (SG-1 F3).
 
@@ -281,7 +294,7 @@ async def try_call(state: RouteState) -> dict:
         t0 = time.monotonic()
         resp, err = await call_llm(
             ep, truncated, group_id, ctx.cooldown,
-            temperature, max_tokens, **extra,
+            _resolve_temperature(temperature, ep), max_tokens, **extra,
         )
         duration_ms = int((time.monotonic() - t0) * 1000)
         if resp is not None:
@@ -388,7 +401,7 @@ async def try_stream(state: RouteState) -> dict:
                 gen = ep.provider.chat_stream(
                     messages=truncated,
                     model=ep.detail.model_name,
-                    temperature=temperature,
+                    temperature=_resolve_temperature(temperature, ep),
                     max_tokens=max_tokens,
                     **extra,
                 )

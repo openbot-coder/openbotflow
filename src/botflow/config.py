@@ -86,6 +86,22 @@ class BotflowSettings(BaseSettings):
         return path if path.is_absolute() else root / path
 
 
+# 管理面板「设置」页可页面化的参数白名单：config 表 admin_settings（单 key 存 JSON）
+# 只允许写这 9 个键 —— 启动合并按本白名单 setattr（不用 hasattr，防止 KV 里混进
+# admin_key 之类的密钥键被覆盖）。全部是纯管理参数，不含任何密钥。
+ADMIN_SETTINGS_FIELDS: tuple[str, ...] = (
+    "stream_timeout",
+    "upstream_semaphore_size",
+    "call_log_detail_days",
+    "raw_session_retention_days",
+    "call_logs_retention_days",
+    "daily_summary_hour",
+    "summary_group",
+    "model_sync_interval",
+    "log_level",
+)
+
+
 def load_config(workspace_path: Optional[Path] = None) -> BotflowSettings:
     """Load configuration with workspace-aware .env loading.
 

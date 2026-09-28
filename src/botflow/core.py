@@ -27,7 +27,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from botflow.admin_api import admin_router
+from botflow.admin_api import admin_router, SETTINGS_KEY
 from botflow.auth import ApiKey, ensure_setup_token, resolve_api_key, verify_admin_key, verify_llm_key
 from botflow.common.exceptions import (
     AllModelsCooldownError,
@@ -36,7 +36,7 @@ from botflow.common.exceptions import (
 )
 from botflow.pipeline import PipelineEngine
 from botflow.common.logger import get_logger, setup_logging
-from botflow.config import BotflowSettings, get_config, set_config
+from botflow.config import ADMIN_SETTINGS_FIELDS, BotflowSettings, get_config, set_config
 from botflow.protocol_adapter import (
     anthropic_to_internal,
     internal_chunk_to_anthropic_sse,
@@ -1460,6 +1460,22 @@ async def create_app(
     await _db.initialize()
 
     log.info("Database initialized at: {}", db_path)
+
+    # 启动合并：管理面板「设置」页存的值（config 表 admin_settings）覆盖 env/.env 初值，
+    # 页面是权威。优先级：env/.env 初值 → 本合并 → 运行期 PATCH 再覆盖（再启动仍由本合并
+    # 装回页面值）。按 ADMIN_SETTINGS_FIELDS 白名单 setattr —— 不用 hasattr，防止 KV 里
+    # 混进 admin_key 之类的密钥键；时机在 lifespan 的 setup_logging/后台任务读取之前。
+    # ``config`` 即上面 set_config 注入的同一对象，setattr 对 get_config() 即时可见。
+    raw_settings = await _db.get_config(SETTINGS_KEY)
+    if raw_settings:
+        try:
+            saved = json.loads(raw_settings)
+        except ValueError:
+            saved = {}  # KV 手改坏 → 保持 env 初值，不让启动失败
+        if isinstance(saved, dict):
+            for key, value in saved.items():
+                if key in ADMIN_SETTINGS_FIELDS:
+                    setattr(config, key, value)
 
     return app
 

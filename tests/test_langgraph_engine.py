@@ -32,8 +32,10 @@ from botflow.pipeline.base import StrategyError
 from botflow.pipeline.langgraph_engine import (
     GraphContext,
     LangGraphEngine,
+    _resolve_temperature,
     finalize_error,
     select_endpoints,
+    try_call,
     try_stream,
 )
 from botflow.pipeline.strategies import RandomWeightsStrategy
@@ -59,8 +61,12 @@ def _group(gid=1, type_="random_weights", fallback_gid=None):
                       fallback_group_id=fallback_gid, params={})
 
 
-def _ep(model_name="m1", model_id=1, provider_id=10):
-    """Create a ModelEndpoint with GroupModelWithDetails (Pydantic model)."""
+def _ep(model_name="m1", model_id=1, provider_id=10, extra_config=None):
+    """Create a ModelEndpoint with GroupModelWithDetails (Pydantic model).
+
+    ``extra_config`` 供 F5 的 ``_resolve_temperature`` 用例注入模型默认温度
+    （缺省 ``None`` → 模型层默认 ``{}``，与既有用例行为一致）。
+    """
     detail = GroupModelWithDetails(
         id=model_id,
         group_id=1,
@@ -77,6 +83,7 @@ def _ep(model_name="m1", model_id=1, provider_id=10):
         cooldown_seconds=30,
         cooldown_failure_threshold=3,
         context_window=8192,
+        extra_config=extra_config or {},
     )
     mock_provider = MagicMock()
     return ModelEndpoint(model_detail=detail, provider_instance=mock_provider)
@@ -418,9 +425,11 @@ class _StreamingProvider:
         self.calls = 0
         self.aclose_called = False
         self.streams: list[_TrackedStream] = []
+        self.kwargs_log: list[dict] = []  # 每次 chat_stream 收到的 kwargs（F5 temperature 断言用）
 
     def chat_stream(self, *args, **kwargs):
         self.calls += 1
+        self.kwargs_log.append(kwargs)
         result = self.behavior[min(self.calls - 1, len(self.behavior) - 1)]
         items = [result] if isinstance(result, Exception) else list(result)
         stream = _TrackedStream(items, lambda: setattr(self, "aclose_called", True))
@@ -428,12 +437,13 @@ class _StreamingProvider:
         return stream
 
 
-def _ep_stream(model_id=1, provider=None):
+def _ep_stream(model_id=1, provider=None, extra_config=None):
     detail = GroupModelWithDetails(
         id=model_id, group_id=1, model_id=model_id, weight=1.0, is_enabled=True,
         model_name=f"m{model_id}", display_name=f"m{model_id}", api_format="openai",
         provider_id=1, provider_name="p", provider_type="openai", max_retries=3,
         cooldown_seconds=30, cooldown_failure_threshold=3, context_window=8192,
+        extra_config=extra_config or {},
     )
     return ModelEndpoint(model_detail=detail, provider_instance=provider or MagicMock())
 
@@ -931,3 +941,211 @@ async def test_run_chat_mode_returns_result_dict():
 
     assert result["choices"][0]["message"]["content"] == "hi"
     assert result["_attempts"] == []
+
+
+# ===========================================================================
+# F5：_resolve_temperature 默认值语义（D2）+ 两个调用点注入
+# 用例 38-47（docs/tasks/admin_panel_features.md §6.4）
+# ===========================================================================
+
+
+def _ep_with_temp(extra_config):
+    """构造带 extra_config 的 endpoint（temperature/modalities 存模型 extra_config）。"""
+    return _ep(extra_config=extra_config)
+
+
+def test_resolve_temperature_request_wins():
+    """38（正例）：请求给了 temperature（含 0.0）→ 用请求值，模型默认值被忽略。"""
+    ep = _ep_with_temp({"temperature": 0.1})
+    assert _resolve_temperature(0.9, ep) == 0.9
+    # 0.0 是合法请求值（不是「未传」）——D2 请求优先分支必须放行 0.0
+    assert _resolve_temperature(0.0, ep) == 0.0
+
+
+def test_resolve_temperature_falls_back_to_model_default():
+    """39（正例）：请求未传（None）→ 回落模型 extra_config.temperature。"""
+    ep = _ep_with_temp({"temperature": 0.1})
+    assert _resolve_temperature(None, ep) == 0.1
+
+
+def test_resolve_temperature_absent_returns_none():
+    """40（边界）：两边都没有 → None（上游不带该字段，与现状一致）。"""
+    ep = _ep_with_temp({})
+    assert _resolve_temperature(None, ep) is None
+    # extra_config 本身为 None（pydantic 默认 {}，但防御分支同样回 None）
+    ep_none = _ep()
+    ep_none.detail.extra_config = None
+    assert _resolve_temperature(None, ep_none) is None
+
+
+def test_resolve_temperature_ignores_non_number():
+    """41（反例）：DB 里手填字符串（如 "hot"）不外泄到上游 → None。"""
+    ep = _ep_with_temp({"temperature": "hot"})
+    assert _resolve_temperature(None, ep) is None
+
+
+def test_resolve_temperature_ignores_bool():
+    """42（反例）：bool 是 int 子类，必须显式排除（True 不是温度 1.0）。"""
+    ep = _ep_with_temp({"temperature": True})
+    assert _resolve_temperature(None, ep) is None
+
+
+@pytest.mark.asyncio
+async def test_try_call_injects_model_default_temperature():
+    """43（正例）：mode="chat" 请求未传 temperature + 模型默认 0.3 → call_llm 收到 0.3。"""
+    engine = _engine()
+    group = _group()
+    ep = _ep_with_temp({"temperature": 0.3})
+    resp = {"choices": [], "_routing": {}}
+    seen: list = []
+
+    async def capture(ep_, messages, group_id, cooldown, temperature=None, max_tokens=None, **kw):
+        seen.append(temperature)
+        return (resp, None)
+
+    with patch("botflow.pipeline._shared.load_endpoints", new_callable=AsyncMock, return_value=[ep]), \
+         patch("botflow.pipeline._shared.filter_available", new=lambda eps, cd, gid: eps), \
+         patch("botflow.pipeline.langgraph_engine.call_llm", side_effect=capture):
+        await engine.run(
+            group=group, messages=[{"role": "user", "content": "hi"}], mode="chat",
+        )
+
+    assert seen == [0.3]
+
+
+@pytest.mark.asyncio
+async def test_try_call_request_overrides_model_default():
+    """44（正例）：请求传 0.9 + 模型默认 0.3 → call_llm 收到 0.9（请求优先）。"""
+    engine = _engine()
+    group = _group()
+    ep = _ep_with_temp({"temperature": 0.3})
+    resp = {"choices": [], "_routing": {}}
+    seen: list = []
+
+    async def capture(ep_, messages, group_id, cooldown, temperature=None, max_tokens=None, **kw):
+        seen.append(temperature)
+        return (resp, None)
+
+    with patch("botflow.pipeline._shared.load_endpoints", new_callable=AsyncMock, return_value=[ep]), \
+         patch("botflow.pipeline._shared.filter_available", new=lambda eps, cd, gid: eps), \
+         patch("botflow.pipeline.langgraph_engine.call_llm", side_effect=capture):
+        await engine.run(
+            group=group, messages=[{"role": "user", "content": "hi"}],
+            mode="chat", temperature=0.9,
+        )
+
+    assert seen == [0.9]
+
+
+@pytest.mark.asyncio
+async def test_try_stream_injects_model_default_temperature(monkeypatch):
+    """45（正例）：try_stream 调用点同样注入 —— 模型默认 0.3 → chat_stream 收到 0.3；
+    请求给了 0.9 → 收到 0.9（两个调用点都要走到）。"""
+    pushed: list = []
+    monkeypatch.setattr(
+        "botflow.pipeline.langgraph_engine.get_stream_writer",
+        lambda: (lambda p: pushed.append(p)),
+    )
+    ctx = GraphContext(db=MagicMock(spec=Database), cooldown=MagicMock())
+    chunk = [{"choices": [{"delta": {"content": "a"}}]}]
+
+    # a) 请求未传 → 模型默认 0.3
+    provider = _StreamingProvider([chunk])
+    state = {
+        "group": _group(), "messages": [{"role": "user", "content": "hi"}],
+        "endpoints": [_ep_stream(1, provider, extra_config={"temperature": 0.3})],
+        "current_ep_idx": 0, "attempt": 0,
+        "extra_kwargs": {}, "stream": True, "attempts": [], "model_name": "",
+        "temperature": None,
+    }
+    await _run_try_stream_node(state, ctx, None)
+    assert provider.kwargs_log[0]["temperature"] == 0.3
+
+    # b) 请求传 0.9 → 请求优先
+    provider2 = _StreamingProvider([chunk])
+    state2 = dict(state, endpoints=[_ep_stream(1, provider2, extra_config={"temperature": 0.3})],
+                  temperature=0.9)
+    await _run_try_stream_node(state2, ctx, None)
+    assert provider2.kwargs_log[0]["temperature"] == 0.9
+
+
+@pytest.mark.asyncio
+async def test_no_temperature_anywhere_sends_none(monkeypatch):
+    """46（回归）：请求与模型都没有 → 两个调用点都收到 None（与现状逐字节一致）。"""
+    # try_call 侧
+    engine = _engine()
+    group = _group()
+    ep = _ep()  # extra_config == {}
+    resp = {"choices": [], "_routing": {}}
+    seen: list = []
+
+    async def capture(ep_, messages, group_id, cooldown, temperature=None, max_tokens=None, **kw):
+        seen.append(temperature)
+        return (resp, None)
+
+    with patch("botflow.pipeline._shared.load_endpoints", new_callable=AsyncMock, return_value=[ep]), \
+         patch("botflow.pipeline._shared.filter_available", new=lambda eps, cd, gid: eps), \
+         patch("botflow.pipeline.langgraph_engine.call_llm", side_effect=capture):
+        await engine.run(group=group, messages=[{"role": "user", "content": "hi"}], mode="chat")
+    assert seen == [None]
+
+    # try_stream 侧
+    monkeypatch.setattr(
+        "botflow.pipeline.langgraph_engine.get_stream_writer",
+        lambda: (lambda p: None),
+    )
+    ctx = GraphContext(db=MagicMock(spec=Database), cooldown=MagicMock())
+    provider = _StreamingProvider([[{"choices": [{"delta": {"content": "a"}}]}]])
+    state = {
+        "group": _group(), "messages": [{"role": "user", "content": "hi"}],
+        "endpoints": [_ep_stream(1, provider)],  # extra_config == {}
+        "current_ep_idx": 0, "attempt": 0,
+        "extra_kwargs": {}, "stream": True, "attempts": [], "model_name": "",
+        "temperature": None,
+    }
+    await _run_try_stream_node(state, ctx, None)
+    assert provider.kwargs_log[0]["temperature"] is None
+
+
+@pytest.mark.asyncio
+async def test_per_endpoint_temperature_in_same_group():
+    """47（边界）：同组两个 endpoint 各有各的默认温度 → 逐 endpoint 解析
+    （证明解析在 try_call 的 while 循环体内，不是组级一次）。
+
+    直接驱动 try_call 节点（同 T4.x 手法）而不走 engine.run —— 策略层的
+    weighted_random_select 会随机排序两个等权 endpoint，节点级驱动才让
+    「a 先失败 → b 成功」的顺序确定。
+    """
+    from botflow.pipeline.langgraph_engine import RouteState as _RS
+
+    ep_a = _ep("a", model_id=1, extra_config={"temperature": 0.1})
+    ep_b = _ep("b", model_id=2, extra_config={"temperature": 0.7})
+    resp = {"choices": [], "_routing": {}}
+    seen: list = []
+
+    async def capture(ep_, messages, group_id, cooldown, temperature=None, max_tokens=None, **kw):
+        seen.append((ep_.detail.model_name, temperature))
+        # 第一个端点失败 → while 循环推进到第二个端点，各自解析各自默认值
+        if ep_.detail.model_name == "a":
+            return (None, ProviderError("first failed"))
+        return (resp, None)
+
+    graph = StateGraph(_RS)
+    graph.add_node("try_call", try_call)
+    graph.set_entry_point("try_call")
+    graph.add_edge("try_call", END)
+
+    ctx = GraphContext(db=MagicMock(spec=Database), cooldown=MagicMock())
+    with patch("botflow.pipeline.langgraph_engine.call_llm", side_effect=capture):
+        out = await graph.compile().ainvoke(
+            {
+                "group": _group(), "messages": [{"role": "user", "content": "hi"}],
+                "endpoints": [ep_a, ep_b], "current_ep_idx": 0, "attempt": 0,
+                "extra_kwargs": {}, "stream": False, "attempts": [],
+                "temperature": None, "max_tokens": None,
+            },
+            config={"configurable": {"ctx": ctx}},
+        )
+
+    assert seen == [("a", 0.1), ("b", 0.7)]
+    assert out["result"] is resp  # b 成功返回
