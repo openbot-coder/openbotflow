@@ -11,8 +11,10 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from botflow import auth as auth_mod
 from botflow.admin_dashboard import mount_admin_ui
 from botflow.admin_api import admin_router
+from botflow.auth import create_session, hash_password, verify_password
 from botflow.config import BotflowSettings, set_config
 from botflow.storage import db as dbmod
 from botflow.storage.db import Database
@@ -552,3 +554,379 @@ class TestAttemptQueries:
         body = r.json()
         assert body["success"] is True
         assert body["attempts"] == []
+
+
+# ---------------------------------------------------------------------------
+# 需求1：GET /admin/models{,/{id}} 附带 provider_enabled（显示层有效状态）
+# 契约 docs/tasks/provider_cascade_pwd_features.md §3.1 P1-1 ~ P1-11（D1 零写库）
+# ---------------------------------------------------------------------------
+
+
+def _run(coro):
+    return asyncio.new_event_loop().run_until_complete(coro)
+
+
+def _detail_locs(body: dict) -> list[str]:
+    """422 detail 里各字段的 loc 路径（如 'body.new_password'）。"""
+    return [".".join(str(x) for x in item.get("loc", ())) for item in body.get("detail", [])]
+
+
+class TestModelsProviderEnabled:
+    """P1-1 ~ P1-11：模型按「显示层有效状态」返回 provider_enabled。
+
+    硬约束：不写库（P1-8）、不动路由层 SQL（P1-9）、enabled_only 语义不变
+    （P1-10）、孤儿 provider_id 不崩（P1-5）。
+    """
+
+    def _mk_provider(self, client, name="prov", enabled=True):
+        pid = client.post("/admin/providers", json={"req": {
+            "name": name, "base_url": "https://x"}}, headers=AUTH).json()["provider_id"]
+        if not enabled:
+            r = client.patch(f"/admin/providers/{pid}", json={"is_enabled": False}, headers=AUTH)
+            assert r.status_code == 200
+        return pid
+
+    def _mk_model(self, client, pid, name="m", enabled=True):
+        mid = client.post("/admin/models", json={"req": {
+            "provider_id": pid, "name": name, "is_enabled": enabled}}, headers=AUTH).json()["model_id"]
+        return mid
+
+    def _db(self, client):
+        return client.app.dependency_overrides[dbmod.get_db]()
+
+    def _find(self, client, mid):
+        models = client.get("/admin/models", headers=AUTH).json()["models"]
+        return next(m for m in models if m["id"] == mid)
+
+    def test_p1_1_provider_on_model_on(self, client):
+        # P1-1：双启用 → provider_enabled=true、is_enabled=true、其余键与改前一致
+        pid = self._mk_provider(client)
+        mid = self._mk_model(client, pid)
+        m = self._find(client, mid)
+        assert m["provider_enabled"] is True
+        assert m["is_enabled"] is True
+        # 「其余键与改前一致」= model_dump 的全部键原样保留，仅新增一个键
+        assert set(m) == set(Model.model_fields) | {"provider_enabled"}
+
+    def test_p1_2_provider_off_model_on(self, client):
+        # P1-2：供应商停用 + 模型自身启用 → 两字段独立
+        pid = self._mk_provider(client, enabled=False)
+        mid = self._mk_model(client, pid)
+        m = self._find(client, mid)
+        assert m["provider_enabled"] is False
+        assert m["is_enabled"] is True
+
+    def test_p1_3_provider_off_model_off(self, client):
+        # P1-3：双停用
+        pid = self._mk_provider(client, enabled=False)
+        mid = self._mk_model(client, pid, enabled=False)
+        m = self._find(client, mid)
+        assert m["provider_enabled"] is False
+        assert m["is_enabled"] is False
+
+    def test_p1_4_provider_on_model_off(self, client):
+        # P1-4：供应商启用 + 模型自身停用
+        pid = self._mk_provider(client)
+        mid = self._mk_model(client, pid, enabled=False)
+        m = self._find(client, mid)
+        assert m["provider_enabled"] is True
+        assert m["is_enabled"] is False
+
+    def test_p1_5_orphan_provider_id(self, client):
+        # P1-5：孤儿 provider_id → provider_enabled=false，200 不崩
+        pid = self._mk_provider(client)
+        mid = self._mk_model(client, pid)
+        d = self._db(client)
+        # 关连接级外键后删供应商行 → 模型成孤儿引用（用完立即复原）
+        _run(d.execute_write("PRAGMA foreign_keys=OFF"))
+        _run(d.execute_write("DELETE FROM providers WHERE id = ?", (pid,)))
+        _run(d.execute_write("PRAGMA foreign_keys=ON"))
+        r = client.get("/admin/models", headers=AUTH)
+        assert r.status_code == 200
+        m = next(x for x in r.json()["models"] if x["id"] == mid)
+        assert m["provider_enabled"] is False
+
+    def test_p1_6_detail_same_semantics(self, client):
+        # P1-6：单模型详情同口径（停用/启用两种组合都取一遍）
+        off_pid = self._mk_provider(client, name="prov-off", enabled=False)
+        off_mid = self._mk_model(client, off_pid, name="m-off")
+        on_pid = self._mk_provider(client, name="prov-on")
+        on_mid = self._mk_model(client, on_pid, name="m-on", enabled=False)
+        got_off = client.get(f"/admin/models/{off_mid}", headers=AUTH).json()["model"]
+        got_on = client.get(f"/admin/models/{on_mid}", headers=AUTH).json()["model"]
+        assert got_off["provider_enabled"] is False and got_off["is_enabled"] is True
+        assert got_on["provider_enabled"] is True and got_on["is_enabled"] is False
+        assert set(got_off) == set(Model.model_fields) | {"provider_enabled"}
+
+    def test_p1_7_detail_404(self, client):
+        # P1-7：id 不存在 → 404，既有文案形状 {"success":false,"error":...}
+        r = client.get("/admin/models/9999", headers=AUTH)
+        assert r.status_code == 404
+        detail = r.json()["detail"]
+        assert detail["success"] is False
+        assert "Model 9999 not found" in detail["error"]
+
+    def test_p1_8_zero_write(self, client):
+        # P1-8：GET 前后 models 表逐行一致（GET 不产生任何 UPDATE，含 updated_at）
+        pid = self._mk_provider(client, enabled=False)
+        mid = self._mk_model(client, pid)
+        d = self._db(client)
+
+        def dump():
+            rows = _run(d.execute_read("SELECT * FROM models ORDER BY id"))
+            return [tuple(r) for r in rows]
+
+        before = dump()
+        assert client.get("/admin/models", headers=AUTH).status_code == 200
+        assert dump() == before
+        assert client.get(f"/admin/models/{mid}", headers=AUTH).status_code == 200
+        assert dump() == before
+
+    def test_p1_9_route_layer_still_excludes_disabled_provider(self, client):
+        # P1-9：回归确认 —— 分组加载 SQL 的 AND p.is_enabled = 1 未被改动
+        pid = self._mk_provider(client)
+        mid = self._mk_model(client, pid, name="gpt-4")
+        gid = client.post("/admin/groups", json={"req": {"name": "g"}},
+                          headers=AUTH).json()["group_id"]
+        assert client.post(f"/admin/groups/{gid}/models",
+                           params={"model_id": mid, "weight": 1}, headers=AUTH).status_code == 200
+        d = self._db(client)
+        groups = _run(d.list_groups_with_models())
+        assert groups and groups[0]["model_names"] == ["gpt-4"]  # 供应商启用时在
+        assert client.patch(f"/admin/providers/{pid}",
+                            json={"is_enabled": False}, headers=AUTH).status_code == 200
+        # 供应商停用 → 该模型仍被路由层 JOIN 排除（分组整行消失）
+        assert _run(d.list_groups_with_models()) == []
+
+    def test_p1_10_enabled_only_semantics_unchanged(self, client):
+        # P1-10：enabled_only 只看 models 表 —— 供应商停用的启用模型仍在结果里
+        pid = self._mk_provider(client, enabled=False)
+        kept = self._mk_model(client, pid, name="kept")
+        dropped = self._mk_model(client, pid, name="dropped", enabled=False)
+        r = client.get("/admin/models", params={"enabled_only": True}, headers=AUTH)
+        assert r.status_code == 200
+        ids = [m["id"] for m in r.json()["models"]]
+        assert kept in ids and dropped not in ids
+        m = next(x for x in r.json()["models"] if x["id"] == kept)
+        assert m["provider_enabled"] is False and m["is_enabled"] is True
+
+    def test_p1_11_unauthorized(self, client):
+        # P1-11：无 Bearer/无 token → 401 Invalid admin key.（依赖未变）
+        r = client.get("/admin/models")
+        assert r.status_code == 401
+        assert r.json()["detail"] == "Invalid admin key."
+
+
+# ---------------------------------------------------------------------------
+# 需求2：POST /admin/auth/change-password
+# 契约 docs/tasks/provider_cascade_pwd_features.md §3.3 P2-1 ~ P2-18（D2 不吊销会话）
+# ---------------------------------------------------------------------------
+
+
+class TestChangePassword:
+    """P2-1 ~ P2-18：改密码端点（分支顺序 404 → 401 → 400 → 200，不吊销会话）。"""
+
+    CUR = "OldPass123"
+    NEW = "NewPass456"
+    CHG = "/admin/auth/change-password"
+
+    @pytest.fixture(autouse=True)
+    def fast_pbkdf2(self, monkeypatch):
+        # 与 test_admin_auth.py 同口径：单测把 600k 迭代调低，否则套件明显变慢。
+        monkeypatch.setattr(auth_mod, "PBKDF2_ITERATIONS", 1000)
+
+    def _seed(self, client, username="alice", password=None, raw=None):
+        """造 admin_account 状态：raw 给定则原样写入（损坏行用），否则按正常账号写。"""
+        d = client.app.dependency_overrides[dbmod.get_db]()
+        if raw is not None:
+            _run(d.set_config("admin_account", raw))
+            return
+        _run(d.set_config("admin_account", json.dumps({
+            "username": username,
+            "pwd_hash": hash_password(password if password is not None else self.CUR),
+        })))
+
+    def _account(self, client):
+        d = client.app.dependency_overrides[dbmod.get_db]()
+        return _run(d.get_config("admin_account"))
+
+    def _sess_count(self, client):
+        d = client.app.dependency_overrides[dbmod.get_db]()
+        rows = _run(d.execute_read("SELECT key FROM config WHERE key LIKE 'admin_sess:%'"))
+        return len(rows)
+
+    def _login(self, client, password, username="alice"):
+        return client.post("/admin/auth/login",
+                           json={"username": username, "password": password})
+
+    def _change(self, client, current, new, headers=None):
+        return client.post(self.CHG, json={
+            "current_password": current, "new_password": new,
+        }, headers=AUTH if headers is None else headers)
+
+    def test_p2_1_success_full_cycle(self, client):
+        # P2-1：200 + pwd_hash 换 salt + username 不变 + 会话行数不变 + 新旧密码登录
+        self._seed(client)
+        d = client.app.dependency_overrides[dbmod.get_db]()
+        _run(create_session(d, "alice"))  # 预置一条会话，验证不被吊销
+        raw_before = self._account(client)
+        n_before = self._sess_count(client)
+        r = self._change(client, self.CUR, self.NEW)
+        assert r.status_code == 200 and r.json() == {"success": True}
+        raw_after = self._account(client)
+        acct = json.loads(raw_after)
+        assert acct["username"] == "alice"  # username 保留
+        assert acct["pwd_hash"] != json.loads(raw_before)["pwd_hash"]  # 新 salt 重新 hash
+        assert acct["pwd_hash"].startswith("pbkdf2_sha256$")
+        assert verify_password(self.NEW, acct["pwd_hash"]) is True
+        assert self._sess_count(client) == n_before  # admin_sess:* 行数不变（D2）
+        assert self._login(client, self.CUR).status_code == 401  # 旧密码失效
+        assert self._login(client, self.NEW).status_code == 200  # 新密码可用
+
+    def test_p2_2_wrong_current_401(self, client):
+        # P2-2：当前密码错 → 401；admin_account 不变；会话不吊销
+        self._seed(client)
+        _run(create_session(client.app.dependency_overrides[dbmod.get_db](), "alice"))
+        raw_before = self._account(client)
+        n_before = self._sess_count(client)
+        r = self._change(client, "wrong-pass-x", self.NEW)
+        assert r.status_code == 401
+        assert r.json()["detail"] == "Invalid current password."
+        assert self._account(client) == raw_before
+        assert self._sess_count(client) == n_before
+
+    def test_p2_3_account_missing_404(self, client):
+        # P2-3：账号行不存在 → 404（鉴权另走 admin key）
+        r = self._change(client, self.CUR, self.NEW)
+        assert r.status_code == 404
+        assert r.json()["detail"] == "Admin account not configured."
+
+    def test_p2_4_account_json_corrupt_404_row_untouched(self, client):
+        # P2-4：JSON 损坏 → 404；损坏行不被修复/覆盖
+        self._seed(client, raw="{not json")
+        r = self._change(client, self.CUR, self.NEW)
+        assert r.status_code == 404
+        assert r.json()["detail"] == "Admin account not configured."
+        assert self._account(client) == "{not json"
+
+    def test_p2_5_account_not_dict_404(self, client):
+        # P2-5：account 非 dict（[1,2]）→ 404 同上
+        self._seed(client, raw="[1,2]")
+        r = self._change(client, self.CUR, self.NEW)
+        assert r.status_code == 404
+        assert r.json()["detail"] == "Admin account not configured."
+        assert self._account(client) == "[1,2]"
+
+    def test_p2_6_same_password_400_no_write(self, client):
+        # P2-6：新旧相同 → 400；verify 之后才判（未发生写库，pwd_hash 逐字节不变）
+        self._seed(client)
+        raw_before = self._account(client)
+        r = self._change(client, self.CUR, self.CUR)
+        assert r.status_code == 400
+        assert r.json()["detail"] == "New password must differ from current password."
+        assert self._account(client) == raw_before
+
+    def test_p2_7_new_password_too_short_422_before_pbkdf2(self, client, monkeypatch):
+        # P2-7：7 位 → pydantic 422，端点不执行、不跑 pbkdf2
+        self._seed(client)
+        calls = []
+        monkeypatch.setattr("botflow.admin_api.verify_password",
+                            lambda p, s: calls.append(("v", p)) or True)
+        monkeypatch.setattr("botflow.admin_api.hash_password",
+                            lambda p: calls.append(("h", p)) or "")
+        r = self._change(client, self.CUR, "1234567")
+        assert r.status_code == 422
+        assert "body.new_password" in _detail_locs(r.json())
+        assert calls == []
+
+    def test_p2_8_new_password_overlong_422_before_hash(self, client, monkeypatch):
+        # P2-8：129 位 → 422，不进哈希计算（契约 §0-6）
+        self._seed(client)
+        calls = []
+        monkeypatch.setattr("botflow.admin_api.hash_password",
+                            lambda p: calls.append(p) or "")
+        r = self._change(client, self.CUR, "x" * 129)
+        assert r.status_code == 422
+        assert "body.new_password" in _detail_locs(r.json())
+        assert calls == []
+
+    def test_p2_9_current_password_empty_422(self, client):
+        # P2-9：current 空串 → 422（min_length=1），不落 401
+        self._seed(client)
+        r = self._change(client, "", self.NEW)
+        assert r.status_code == 422
+        assert "body.current_password" in _detail_locs(r.json())
+
+    def test_p2_10_missing_fields_422(self, client):
+        # P2-10：缺字段 → 422（{} 与缺 new_password 两种形态）
+        self._seed(client)
+        r0 = client.post(self.CHG, json={}, headers=AUTH)
+        assert r0.status_code == 422
+        assert set(_detail_locs(r0.json())) >= {"body.current_password", "body.new_password"}
+        r1 = client.post(self.CHG, json={"current_password": self.CUR}, headers=AUTH)
+        assert r1.status_code == 422
+        assert "body.new_password" in _detail_locs(r1.json())
+
+    def test_p2_11_body_is_json_body_not_query_param(self, client):
+        # P2-11：显式 Pydantic body —— JSON body 被读到（非 query 参数坑）
+        self._seed(client)
+        spec = client.get("/openapi.json").json()
+        op = spec["paths"][self.CHG]["post"]
+        assert "requestBody" in op  # body 声明存在，不是 query-only 端点
+        # body 正确读到 → 不是「422 缺 body.current_password」而是走完分支 200
+        assert self._change(client, self.CUR, self.NEW).status_code == 200
+
+    def test_p2_12_unauthorized_401(self, client):
+        # P2-12：无 Bearer、无 token → 401 Invalid admin key.
+        r = client.post(self.CHG, json={"current_password": self.CUR,
+                                        "new_password": self.NEW})
+        assert r.status_code == 401
+        assert r.json()["detail"] == "Invalid admin key."
+
+    def test_p2_13_admin_key_channel_200(self, client):
+        # P2-13：Authorization: Bearer <BOTFLOW_ADMIN_KEY> → 200
+        self._seed(client)
+        assert self._change(client, self.CUR, self.NEW, headers=AUTH).status_code == 200
+
+    def test_p2_14_session_token_channel_and_stays_valid(self, client):
+        # P2-14：会话 token 通道 → 200，且该 token 改密后仍有效（D2）
+        self._seed(client)
+        token = self._login(client, self.CUR).json()["token"]
+        h = {"Authorization": f"Bearer {token}"}
+        assert self._change(client, self.CUR, self.NEW, headers=h).status_code == 200
+        assert client.get("/admin/providers", headers=h).status_code == 200
+
+    def test_p2_15_other_sessions_not_revoked(self, client):
+        # P2-15：会话 A 改密 → 会话 B 继续 200（不被 DELETE）
+        self._seed(client)
+        tok_a = self._login(client, self.CUR).json()["token"]
+        tok_b = self._login(client, self.CUR).json()["token"]
+        ha = {"Authorization": f"Bearer {tok_a}"}
+        hb = {"Authorization": f"Bearer {tok_b}"}
+        assert self._change(client, self.CUR, self.NEW, headers=ha).status_code == 200
+        assert client.get("/admin/providers", headers=hb).status_code == 200
+        assert client.get("/admin/providers", headers=ha).status_code == 200
+
+    def test_p2_16_pwd_hash_key_missing_401_no_crash(self, client):
+        # P2-16：{"username":"a"} 缺 pwd_hash → verify_password("") 返回 False → 401 不崩
+        self._seed(client, raw=json.dumps({"username": "a"}))
+        r = self._change(client, self.CUR, self.NEW)
+        assert r.status_code == 401
+        assert r.json()["detail"] == "Invalid current password."
+
+    def test_p2_17_non_ascii_passwords(self, client):
+        # P2-17：非 ASCII → compare_digest 走 utf-8 bytes：改密 200 而非 TypeError 500；
+        # 新旧相同（非 ASCII）也必须 400 而非 500。
+        self._seed(client, password="中文密码旧123")
+        r = self._change(client, "中文密码旧123", "新密码新12345")
+        assert r.status_code == 200
+        r2 = self._change(client, "新密码新12345", "新密码新12345")
+        assert r2.status_code == 400
+        assert r2.json()["detail"] == "New password must differ from current password."
+
+    def test_p2_18_401_takes_priority_over_400(self, client):
+        # P2-18：current 错 + new == current 两者皆违 → 401 优先（verify 在 same 检查之前）
+        self._seed(client)
+        r = self._change(client, "wrong-pass-abc", "wrong-pass-abc")
+        assert r.status_code == 401
+        assert r.json()["detail"] == "Invalid current password."

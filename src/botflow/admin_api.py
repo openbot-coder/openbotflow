@@ -149,6 +149,14 @@ class LogoutReq(BaseModel):
     token: str = ""
 
 
+# 改密码 body（docs/tasks/provider_cascade_pwd_features.md §2 F3）。
+# 约束与 AuthReq.password 同口径：422 必须拦在 pbkdf2 之前（P1-6），超长
+# 密码进不到哈希计算；current_password 下限 1 是让空串以 422 拦截而非 401。
+class ChangePasswordReq(BaseModel):
+    current_password: str = Field(..., min_length=1, max_length=128)
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+
 # ---------------------------------------------------------------------------
 # Auth endpoints
 # ---------------------------------------------------------------------------
@@ -258,6 +266,50 @@ async def auth_logout(
         raise HTTPException(status_code=401, detail="Missing session token.")
     await get_db().execute_write(
         "DELETE FROM config WHERE key = ?", (session_config_key(token),)
+    )
+    return {"success": True}
+
+
+@admin_router.post("/auth/change-password")
+async def auth_change_password(req: ChangePasswordReq, _=Depends(verify_admin_key)):
+    """admin 自助改密码（已过鉴权：admin key 或会话 token 任一通道）。
+
+    语义（分支顺序写死，见 docs/tasks/provider_cascade_pwd_features.md §2 F3）：
+    404 账号不存在/损坏 → 401 当前密码错 → 400 新旧相同 → 200 只更新
+    ``pwd_hash``（username 原样保留、新 salt 重新 hash）。
+
+    **不吊销任何会话**（用户拍板 D2）：``admin_sess:*`` 一行不动，改密后
+    所有已登录会话继续有效；这与 ``auth_setup`` 的全量吊销（:206）刻意不同。
+    """
+    db = get_db()
+    raw = await db.get_config("admin_account")
+    account = None
+    if raw:
+        try:
+            account = json.loads(raw)
+        except ValueError:
+            account = None
+    if not isinstance(account, dict):
+        # 调用者已过鉴权，404 不算信息泄露；损坏行不当场修数据（与 login 一致）。
+        raise HTTPException(status_code=404, detail="Admin account not configured.")
+    # verify 无条件跑完 pbkdf2 再判（不靠耗时区分失败原因，与 auth_login 同理）。
+    if not verify_password(req.current_password, str(account.get("pwd_hash", ""))):
+        raise HTTPException(status_code=401, detail="Invalid current password.")
+    # 新旧相同 → 拒绝：省掉 hash_password 的 600k 迭代 + 一次写库。放 verify
+    # 之后让 401 语义优先（当前密码错时先报 401，不因「新旧相同」提前泄底）。
+    # compare_digest 一律转 utf-8 bytes：非 ASCII 密码不吃 TypeError（P2-17）。
+    if secrets.compare_digest(
+        req.current_password.encode("utf-8"), req.new_password.encode("utf-8")
+    ):
+        raise HTTPException(
+            status_code=400, detail="New password must differ from current password."
+        )
+    await db.set_config(
+        "admin_account",
+        json.dumps(
+            {"username": str(account.get("username", "")),
+             "pwd_hash": hash_password(req.new_password)}
+        ),
     )
     return {"success": True}
 
@@ -401,6 +453,22 @@ async def sync_provider_models(provider_id: int, _=Depends(verify_admin_key)):
 # ---------------------------------------------------------------------------
 
 
+async def _models_with_provider_enabled(db, models) -> list[dict]:
+    """每个 model 附带 ``provider_enabled``（显示层有效状态，**不写库**）。
+
+    供应商停用后路由层已排除其模型（db.py group 加载 SQL 的
+    ``AND p.is_enabled = 1``），但 /admin/models 只回模型自身的 is_enabled，
+    前端看不出「实际不可用」——本函数按 model.provider_id 查一次 providers
+    表补上该字段。孤儿 provider_id（供应商行不存在）按 False 处理、不崩；
+    只进 HTTP 响应，绝不写 models/providers 表（D1，见 features doc §2 F1）。
+    """
+    enabled_by_id = {p.id: bool(p.is_enabled) for p in await db.list_providers_raw()}
+    return [
+        {**m.model_dump(), "provider_enabled": enabled_by_id.get(m.provider_id, False)}
+        for m in models
+    ]
+
+
 @admin_router.post("/models")
 async def create_model(
     req: CreateModelReq = Body(embed=True),
@@ -426,7 +494,10 @@ async def list_models(
 ):
     db = get_db()
     models = await db.list_models_raw(provider_id=provider_id, enabled_only=enabled_only)
-    return {"success": True, "models": [m.model_dump() for m in models]}
+    return {
+        "success": True,
+        "models": await _models_with_provider_enabled(db, models),
+    }
 
 
 @admin_router.get("/models/{model_id}")
@@ -435,7 +506,8 @@ async def get_model(model_id: int, _=Depends(verify_admin_key)):
     model = await db.get_model_raw(model_id)
     if not model:
         raise HTTPException(status_code=404, detail={"success": False, "error": f"Model {model_id} not found"})
-    return {"success": True, "model": model.model_dump()}
+    enriched = await _models_with_provider_enabled(db, [model])
+    return {"success": True, "model": enriched[0]}
 
 
 @admin_router.patch("/models/{model_id}")

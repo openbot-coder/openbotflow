@@ -249,7 +249,7 @@ tr:hover td{background:#f8fafc}
                   <td>{{m.max_retries}}</td>
                   <td>{{m.cooldown_seconds}}s</td>
                   <td style="font-size:12px;white-space:nowrap">{{modalityText(m)}}</td>
-                  <td><span :class="m.is_enabled?'badge badge-green':'badge badge-red'">{{m.is_enabled?'启用':'禁用'}}</span></td>
+                  <td><span :class="modelStatus(m).cls">{{modelStatus(m).text}}</span></td>
                   <td class="actions">
                     <button class="btn btn-ghost btn-sm" @click="openModal('编辑模型',modelEditForm(m),'edit')">编辑</button>
                     <button class="btn btn-ghost btn-sm" @click="toggleModel(m)">{{m.is_enabled?'禁用':'启用'}}</button>
@@ -436,6 +436,25 @@ tr:hover td{background:#f8fafc}
               </div>
             </div>
           </div>
+
+          <!-- 账号：独立 card，避免与上方「保存设置」按钮混在一起（该按钮只提交运行参数） -->
+          <div class="card">
+            <div class="card-header">
+              <h3>账号</h3>
+              <span style="font-size:12px;color:var(--text2)">修改后已登录会话不受影响</span>
+            </div>
+            <div class="card-body">
+              <div class="form-group"><label>当前密码</label>
+                <input v-model="pwdForm.current" type="password" autocomplete="current-password"></div>
+              <div class="form-group"><label>新密码</label>
+                <input v-model="pwdForm.next" type="password" placeholder="至少 8 位" autocomplete="new-password"></div>
+              <div class="form-group"><label>确认新密码</label>
+                <input v-model="pwdForm.confirm" type="password" placeholder="至少 8 位" autocomplete="new-password"></div>
+              <div style="text-align:right;margin-top:8px">
+                <button class="btn btn-primary" @click="changePassword" :disabled="loading.changePwd">{{loading.changePwd ? '修改中...' : '修改密码'}}</button>
+              </div>
+            </div>
+          </div>
         </div>
 
       </div>
@@ -574,7 +593,9 @@ createApp({
         err.status = r.status;
         // 已登录态吃到 401 = 会话已失效（过期 / 被重置 / 被踢）：清 token 回登录页，
         // 否则用户对着一个全空的面板反复点刷新。登录/开通走原生 authPost，进不到这里。
-        if(r.status===401 && authenticated.value){
+        // 例外：请求级 kickOn401:false（改密码的「当前密码错」也是 401，不是会话失效），
+        // 跳过踢出但错误照常 throw。不传该标志时本分支行为逐字节不变。
+        if(r.status===401 && authenticated.value && opts.kickOn401 !== false){
           clearSession();
           toast('登录已失效，请重新登录', 'error');
         }
@@ -905,6 +926,28 @@ createApp({
       loading.settings = false;
     }
 
+    // 账号：修改密码（不吊销任何会话，只换 admin_account.pwd_hash）
+    const pwdForm = reactive({current:'', next:'', confirm:''});
+    async function changePassword(){
+      // 本地校验顺序按契约 F4.2，命中即 toast 且不发请求
+      if(!pwdForm.current){ toast('请输入当前密码', 'error'); return; }
+      if(pwdForm.next.length < 8){ toast('新密码至少 8 位', 'error'); return; }
+      if(pwdForm.next !== pwdForm.confirm){ toast('两次输入的新密码不一致', 'error'); return; }
+      if(pwdForm.next === pwdForm.current){ toast('新密码不能与当前密码相同', 'error'); return; }
+      loading.changePwd = true;
+      try{
+        // kickOn401:false —— 「当前密码错」的 401 不是会话失效，不能被踢回登录页
+        await api('/auth/change-password', {
+          method:'POST',
+          body: JSON.stringify({current_password: pwdForm.current, new_password: pwdForm.next}),
+          kickOn401: false,
+        });
+        toast('密码已修改');
+        pwdForm.current = ''; pwdForm.next = ''; pwdForm.confirm = '';
+      }catch(e){ toast(e.message, 'error'); }
+      loading.changePwd = false;
+    }
+
     // CRUD helpers
     async function apiPost(path, body){ return api(path, {method:'POST', body:JSON.stringify(body)}); }
     async function apiPatch(path, body){ return api(path, {method:'PATCH', body:JSON.stringify(body)}); }
@@ -983,6 +1026,14 @@ createApp({
       if(Array.isArray(ec.modalities) && ec.modalities.length) parts.push(ec.modalities.join(','));
       if(ec.temperature != null) parts.push('temp='+ec.temperature);
       return parts.length ? parts.join(' · ') : '-';
+    }
+    // 模型页状态列 = 显示层「有效状态」：供应商停用时其下模型虽 is_enabled=true
+    // 但路由层已排除，显示灰色「随供应商」。只认显式 false——provider_enabled
+    // 字段缺失（旧缓存/后端未返回）按正常处理，不误报。不改动模型自身开关语义。
+    function modelStatus(m){
+      if(m.provider_enabled === false && m.is_enabled) return {cls:'badge badge-gray', text:'已禁用（随供应商）'};
+      if(!m.is_enabled) return {cls:'badge badge-red', text:'已禁用'};
+      return {cls:'badge badge-green', text:'启用'};
     }
     async function saveModel(){
       try{
@@ -1177,11 +1228,12 @@ createApp({
       openModal, closeModal, submitModal,
       confirmState, confirmOk, confirmCancel,
       saveProvider, deleteProvider, syncProvider, toggleProvider, providerEditForm,
-      saveModel, deleteModel, toggleModel, modelEditForm, modalityText,
+      saveModel, deleteModel, toggleModel, modelEditForm, modalityText, modelStatus,
       saveGroup, deleteGroup, addModelToGroup, removeModelFromGroup, doAddModelToGroup,
       saveApiKey, deleteApiKey, toggleApiKey,
       loadLogs, loadSummary,
       settings, loadSettings, saveSettings,
+      pwdForm, changePassword,
       providerName, groupIdToName, modelIdToName, fmtTime, groupModels, groupPickModels,
     };
   }
