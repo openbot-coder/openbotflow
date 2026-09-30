@@ -82,6 +82,12 @@ class AnthropicProvider(BaseProvider):
             )
         return self._client
 
+    async def _close_client(self) -> None:
+        """Close the Anthropic SDK client and its connection pool."""
+        if self._client is not None:
+            await self._client.close()
+        self._client = None
+
     async def chat(
         self,
         messages: list[dict[str, Any]],

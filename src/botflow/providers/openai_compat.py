@@ -126,6 +126,14 @@ class OpenAICompatProvider(BaseProvider):
             )
         return self._client
 
+    async def _close_client(self) -> None:
+        """Close the OpenAI/Azure SDK clients and their connection pools."""
+        for sdk_client in (self._client, self._azure_client):
+            if sdk_client is not None:
+                await sdk_client.close()
+        self._client = None
+        self._azure_client = None
+
     async def chat(
         self,
         messages: list[dict[str, Any]],

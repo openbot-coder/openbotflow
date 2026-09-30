@@ -33,6 +33,23 @@ class BaseProvider(ABC):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.extra_config = extra_config or {}
+        self._closed = False
+
+    async def aclose(self) -> None:
+        """Release the SDK client(s) / connection pools held by this instance.
+
+        Idempotent: calling twice is a no-op. The router calls this on replaced
+        cache entries (P0-1 fd-leak fix) after a grace period, so instances may
+        be closed concurrently with in-flight requests that already hold them —
+        the flag guarantees the actual teardown runs exactly once.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        await self._close_client()
+
+    async def _close_client(self) -> None:
+        """Hook: close concrete SDK clients. Default no-op (no client held)."""
 
     @abstractmethod
     async def chat(

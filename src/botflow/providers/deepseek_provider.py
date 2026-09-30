@@ -99,6 +99,11 @@ class DeepSeekProvider(BaseProvider):
             http_client=_make_http_client(self.extra_config),
         )
 
+    async def _close_client(self) -> None:
+        """Close the AsyncOpenAI client and its connection pool."""
+        await self._client.close()
+        self._client = None
+
     # ------------------------------------------------------------------
     # chat()
     # ------------------------------------------------------------------

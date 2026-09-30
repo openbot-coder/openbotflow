@@ -47,6 +47,18 @@ class GoogleProvider(BaseProvider):
             self._client = genai.Client(api_key=self.api_key)
         return self._client
 
+    async def _close_client(self) -> None:
+        """Close the genai async client and its connection pool.
+
+        The aio path is what this provider actually uses, and the connection
+        pool lives on ``client.aio`` (``Client.close()`` only closes the sync
+        side); it exposes ``aclose()``.
+        """
+        if self._client is None:
+            return
+        await self._client.aio.aclose()
+        self._client = None
+
     async def chat(
         self,
         messages: list[dict[str, Any]],

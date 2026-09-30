@@ -184,6 +184,63 @@ PROVIDER_TYPE_MAP: dict[str, type[BaseProvider]] = {
 _provider_cache: dict[tuple[int, str], tuple[BaseProvider, float]] = {}
 _PROVIDER_CACHE_TTL = 300  # 5 minutes
 
+# ---------------------------------------------------------------------------
+# Retired provider instances (P0-1 fd-leak fix)
+# ---------------------------------------------------------------------------
+# Replaced cache entries are closed *deferred*: each retired instance gets a
+# background task that closes its connection pool after _STALE_CLOSE_GRACE
+# seconds. The grace period guarantees we never tear down a pool that in-flight
+# requests (or endpoints still referenced by the 60s _endpoint_cache) are
+# using: new requests switch to the replacement instance immediately, old ones
+# finish on the retired instance, and the pool is released afterwards — the
+# leak becomes a bounded ≤300s delay instead of "never closed".
+
+_pending_provider_closes: list[BaseProvider] = []
+_STALE_CLOSE_GRACE = 300.0
+
+
+def _retire_provider(instance: BaseProvider) -> None:
+    """Schedule a replaced provider instance for deferred close.
+
+    Safe to call with an already-closed instance (no-op). When there is no
+    running event loop (sync callers/tests), the instance is queued and
+    flushed by the next retirement that runs inside a loop — so every retired
+    instance is eventually closed either way.
+    """
+    if getattr(instance, "_closed", False):
+        return
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        _pending_provider_closes.append(instance)
+        return
+    while _pending_provider_closes:
+        _spawn_delayed_close(_pending_provider_closes.pop(0))
+    _spawn_delayed_close(instance)
+
+
+# The event loop only keeps weak references to tasks — a fire-and-forget task
+# sleeping in _delayed_close could be garbage-collected before firing, leaving
+# the retired instance unclosed again. Hold strong references until done.
+_close_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_delayed_close(instance: BaseProvider) -> None:
+    task = asyncio.create_task(_delayed_close(instance))
+    _close_tasks.add(task)
+    task.add_done_callback(_close_tasks.discard)
+
+
+async def _delayed_close(instance: BaseProvider) -> None:
+    """Close a retired provider instance after the grace period elapses."""
+    try:
+        await asyncio.sleep(_STALE_CLOSE_GRACE)
+        await instance.aclose()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.warning("Failed to close retired provider instance: {}", e)
+
 # Cache: group_id -> (list[ModelEndpoint], create_time)
 _endpoint_cache: dict[int, tuple[list["ModelEndpoint"], float]] = {}
 _ENDPOINT_CACHE_TTL = 60  # 1 minute
@@ -222,6 +279,10 @@ def _get_cached_provider(provider_id: int, provider_type: str, api_key: str, bas
     if cls is None:
         raise ValueError(f"Unsupported provider type: {resolved_type}")
     instance = cls(api_key=api_key, base_url=base_url, extra_config=merged_config)
+    if cached:
+        # TTL expired: the old instance is being replaced — retire it instead
+        # of dropping it on the floor (its connection pool would leak).
+        _retire_provider(cached[0])
     _provider_cache[cache_key] = (instance, now)
     return instance
 
@@ -272,11 +333,14 @@ def invalidate_provider_cache(provider_id: int | None = None) -> None:
     key[0] == provider_id 的所有条目（同 provider 跨 type/proxy 的所有实例）。
     """
     if provider_id is None:
+        for instance, _ in _provider_cache.values():
+            _retire_provider(instance)
         _provider_cache.clear()
         return
     for key in list(_provider_cache.keys()):
         if key[0] == provider_id:
-            _provider_cache.pop(key, None)
+            instance, _ = _provider_cache.pop(key)
+            _retire_provider(instance)
 
 
 def invalidate_all_caches() -> None:
@@ -286,6 +350,8 @@ def invalidate_all_caches() -> None:
     （信号量对象身份不能打断，否则并发上限被绕过）。
     """
     _endpoint_cache.clear()
+    for instance, _ in _provider_cache.values():
+        _retire_provider(instance)
     _provider_cache.clear()
 
 
