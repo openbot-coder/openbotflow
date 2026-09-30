@@ -714,14 +714,18 @@ class LangGraphEngine:
         max_tokens: int | None,
         request: Any | None,
         extra: dict[str, Any],
+        preselected=None,
     ) -> dict:
         """Run the graph once (non-streaming) and return the result dict.
+
+        ``preselected`` (when ``run()`` has already done eager selection) is
+        threaded into the initial state so ``select_endpoints`` skips re-selection.
 
         Raises the stored error with its original type on failure so the caller
         can decide on group-level fallback.
         """
         ctx = GraphContext(db=self.db, cooldown=self.cooldown, request=request)
-        initial = self._initial_state(group, messages, "chat", temperature, max_tokens, extra)
+        initial = self._initial_state(group, messages, "chat", temperature, max_tokens, extra, preselected)
         final = await self._graph.ainvoke(initial, config={"configurable": {"ctx": ctx}})
 
         if final.get("error") is None and final.get("result") is not None:
@@ -784,6 +788,218 @@ class LangGraphEngine:
             )
         yield ("state", final_state)
 
+    # -- direct fast path (perf §七#2, bypass pregel dispatch) -----------------
+
+    async def _run_one_fast(
+        self,
+        group: ModelGroup,
+        messages: list[dict] | None,
+        temperature: float | None,
+        max_tokens: int | None,
+        request: Any | None,
+        extra: dict[str, Any],
+        preselected,
+    ) -> dict:
+        """Non-streaming fast path: selection already done, walk the endpoint queue.
+
+        Mirrors the ``try_call`` graph node exactly — same endpoint order, same
+        per-endpoint ``call_llm`` invocation, same SG-0 attempt trail
+        (``endpoint_idx`` = real queue position, ``attempt_no`` = ``ep.max_retries``)
+        and the same group-failure ``ProviderError("All endpoints in group failed")``
+        with the last attempted endpoint smuggled on. So the returned dict / raised
+        error is byte-for-byte identical to what ``_run_one`` yields for the same
+        ``preselected``, while skipping the pregel ``ainvoke`` dispatch entirely.
+        """
+        group_id = group.id
+        truncated = preselected.messages
+        attempts: list[dict] = []
+        last_model_id = None
+        last_provider_id = None
+
+        for idx, ep in enumerate(preselected.endpoints):
+            t0 = time.monotonic()
+            resp, err = await call_llm(
+                ep, truncated, group_id, self.cooldown,
+                _resolve_temperature(temperature, ep), max_tokens, **extra,
+            )
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            if resp is not None:
+                result_dict = dict(resp)
+                result_dict["_attempts"] = attempts
+                return result_dict
+            # Failed endpoint — one attempt row per endpoint (call_llm already
+            # hides endpoint-internal retries), keyed by its real queue index.
+            last_model_id = ep.model_id
+            last_provider_id = ep.detail.provider_id
+            attempts.append({
+                "group_id": group_id,
+                "model_id": ep.model_id,
+                "provider_id": ep.detail.provider_id,
+                "stage": "call",
+                "endpoint_idx": idx,
+                "attempt_no": ep.max_retries,
+                "error_type": type(err).__name__ if err is not None else "UnknownError",
+                "error_message": str(err) if err is not None else "All retries exhausted",
+                "duration_ms": duration_ms,
+            })
+
+        # Every endpoint failed → replicate try_call's group-failure exit so the
+        # driver sees the same ProviderError (message + attempt trail + last
+        # endpoint attribution) as the graph path.
+        exc = ProviderError("All endpoints in group failed")
+        exc.attempts = attempts
+        exc.used_model_id = last_model_id
+        exc.used_provider_id = last_provider_id
+        raise exc
+
+    async def _run_stream_fast(
+        self,
+        group: ModelGroup,
+        messages: list[dict] | None,
+        temperature: float | None,
+        max_tokens: int | None,
+        request: Any | None,
+        extra: dict[str, Any],
+        preselected,
+    ):
+        """Streaming fast path: selection already done, walk the endpoint queue.
+
+        Mirrors the ``try_stream`` graph node's outer endpoint loop exactly:
+        per-endpoint first-chunk retry/backoff (timeout / retryable / non-retryable
+        / empty stream) → next endpoint; first chunk acquired → ``record_success``
+        + push the whole stream via ``_chain_first``; every endpoint failing before
+        any chunk → a recoverable group-failure state. Emits the same
+        ``("chunk", c)`` / ``("state", s)`` sequence ``_run_stream`` would yield
+        for the same ``preselected``; the only difference is that chunks are
+        yielded directly instead of through LangGraph's custom stream writer —
+        ``_run_stream`` turns the writer payload back into ``("chunk", c)``, so
+        the downstream ``_drive_stream`` sees identical events either way.
+
+        ``attempts[].endpoint_idx`` is the literal ``0`` the graph's ``try_stream``
+        node emits (it loops ``for ep in endpoints`` without enumerating), kept
+        identical here so the two paths stay byte-for-byte equivalent.
+        """
+        group_id = group.id
+        truncated = preselected.messages
+        attempts: list[dict] = []
+        last_model_id = None
+        last_provider_id = None
+
+        for ep in preselected.endpoints:
+            max_retries = max(getattr(ep, "max_retries", 1), 1)
+            first: dict | None = None
+            gen = None
+
+            # First-chunk acquisition with endpoint-level retry/backoff.
+            for attempt in range(max_retries):
+                try:
+                    gen = ep.provider.chat_stream(
+                        messages=truncated,
+                        model=ep.detail.model_name,
+                        temperature=_resolve_temperature(temperature, ep),
+                        max_tokens=max_tokens,
+                        **extra,
+                    )
+                    first = await gen.__anext__()
+                    break
+                except asyncio.TimeoutError:
+                    last_model_id = ep.model_id
+                    last_provider_id = ep.detail.provider_id
+                    attempts.append({
+                        "group_id": group_id, "model_id": ep.model_id, "provider_id": ep.detail.provider_id,
+                        "stage": "stream", "endpoint_idx": 0, "attempt_no": attempt + 1,
+                        "error_type": "TimeoutError",
+                        "error_message": f"{ep.detail.model_name} timed out waiting for first chunk",
+                        "duration_ms": 0,
+                    })
+                    if gen is not None:
+                        await gen.aclose()
+                        gen = None
+                    if attempt < max_retries - 1:
+                        await exponential_backoff(attempt)
+                        continue
+                    break
+                except StopAsyncIteration:
+                    # Empty stream → cool it down and move to the next endpoint.
+                    last_model_id = ep.model_id
+                    last_provider_id = ep.detail.provider_id
+                    attempts.append({
+                        "group_id": group_id, "model_id": ep.model_id, "provider_id": ep.detail.provider_id,
+                        "stage": "stream", "endpoint_idx": 0, "attempt_no": attempt + 1,
+                        "error_type": "EmptyStream",
+                        "error_message": f"{ep.detail.model_name} returned an empty stream",
+                        "duration_ms": 0,
+                    })
+                    self.cooldown.record_failure(
+                        group_id, ep.model_id, ep.cooldown_threshold, ep.cooldown_seconds,
+                    )
+                    if gen is not None:
+                        await gen.aclose()
+                        gen = None
+                    break
+                except Exception as e:
+                    last_model_id = ep.model_id
+                    last_provider_id = ep.detail.provider_id
+                    retryable = isinstance(e, asyncio.TimeoutError) or is_retryable_error(e)
+                    attempts.append({
+                        "group_id": group_id, "model_id": ep.model_id, "provider_id": ep.detail.provider_id,
+                        "stage": "stream", "endpoint_idx": 0, "attempt_no": attempt + 1,
+                        "error_type": type(e).__name__, "error_message": str(e), "duration_ms": 0,
+                    })
+                    if gen is not None:
+                        await gen.aclose()
+                        gen = None
+                    if retryable and attempt < max_retries - 1:
+                        await exponential_backoff(attempt)
+                        continue
+                    break
+
+            if first is None:
+                # This endpoint failed every attempt — try the next one.
+                continue
+
+            # First chunk acquired: the stream has started.
+            self.cooldown.record_success(group_id, ep.model_id)
+            try:
+                async for chunk in _chain_first(first, gen):
+                    if request is not None and await request.is_disconnected():
+                        await gen.aclose()
+                        yield ("state", {
+                            "stream_started": True,
+                            "recoverable": False,  # committed — cannot fall back
+                            "used_model_id": ep.model_id, "used_provider_id": ep.detail.provider_id,
+                            "attempts": attempts, "endpoints": [], "current_ep_idx": 0,
+                        })
+                        return
+                    yield ("chunk", chunk)
+                yield ("state", {
+                    "result": {"stream": "ok"}, "stream_started": True, "recoverable": False,
+                    "used_model_id": ep.model_id, "used_provider_id": ep.detail.provider_id,
+                    "attempts": attempts, "endpoints": [], "current_ep_idx": 0,
+                })
+                return
+            except Exception:
+                # Mid-stream failure after content was already sent — unrecoverable.
+                if gen is not None:
+                    await gen.aclose()
+                yield ("state", {
+                    "stream_started": True, "recoverable": False,
+                    "used_model_id": ep.model_id, "used_provider_id": ep.detail.provider_id,
+                    "attempts": attempts, "endpoints": [], "current_ep_idx": 0,
+                })
+                return
+            finally:
+                if gen is not None:
+                    await gen.aclose()
+
+        # All endpoints failed before any chunk was emitted → group-level
+        # fallback is possible (recoverable).
+        yield ("state", {
+            "endpoints": [], "current_ep_idx": 0, "attempts": attempts,
+            "used_model_id": last_model_id, "used_provider_id": last_provider_id,
+            "error": None, "recoverable": True,
+        })
+
     async def run(
         self,
         strategy: Any = None,
@@ -802,18 +1018,36 @@ class LangGraphEngine:
         ``mode="stream"`` → returns an async generator of ``("chunk", c)`` /
         ``("state", s)`` events.
 
-        For ``mode="stream"`` a selection is performed eagerly so a clean error
-        (``NoAvailableModelError`` / ``AllModelsCooldownError`` / …) surfaces on
-        ``await run(...)`` rather than only when the returned generator is
-        iterated (test_route_stream_no_endpoints_raises).  The selected endpoints
-        are handed to the graph to avoid a second selection.
+        A selection is performed eagerly for **both** modes (a clean selection
+        error surfaces on ``await run(...)`` for streaming; a successful selection
+        lets us run the group directly — see below).
+
+        **Direct fast path (perf §七#2):** the slim graph is just ``select →
+        call/stream → END`` and ``try_call`` / ``try_stream`` already loop over
+        every endpoint inline, so the full LangGraph ``StateGraph`` dispatch
+        (pregel ``tick`` / ``prepare_next_tasks`` / ``prepare_single_task`` /
+        ``merge_configs`` — ~56% of per-request CPU per py-spy) is pure overhead
+        for ANY single-group request. Once the strategy has selected a queue, we
+        replicate that execution directly (``_run_one_fast`` /
+        ``_run_stream_fast``), skipping ``ainvoke`` / ``astream`` entirely, while
+        producing a byte-for-byte identical result / event stream to the graph
+        path (proven by the fast-vs-graph equivalence tests). Because both fast
+        paths walk the whole ``[primary] + fallback`` queue, this covers the
+        multi-endpoint queues the production strategies return — not just the
+        single-endpoint case.
+
+        Capability is never silently lost: a selection error still propagates
+        unchanged (before the fast path is entered), and group-level fallback
+        stays in the driver (``core._drive`` / legacy ``route``), outside the
+        graph.
         """
+        preselected = await _select_endpoints(
+            group, messages, temperature, max_tokens, kwargs or {}, self.db, self.cooldown,
+        )
+        # Selection succeeded → run the group directly, bypassing pregel dispatch.
         if mode == "stream":
-            preselected = await _select_endpoints(
-                group, messages, temperature, max_tokens, kwargs or {}, self.db, self.cooldown,
-            )
-            return self._run_stream(strategy, group, messages, temperature, max_tokens, request, kwargs, preselected)
-        return await self._run_one(strategy, group, messages, mode, temperature, max_tokens, request, kwargs)
+            return self._run_stream_fast(group, messages, temperature, max_tokens, request, kwargs, preselected)
+        return await self._run_one_fast(group, messages, temperature, max_tokens, request, kwargs, preselected)
 
     async def stream_events(self, strategy: Any = None, group: ModelGroup | None = None, **kwargs: Any):
         """Alias for ``run(mode="stream")`` used by the transport layer.

@@ -728,23 +728,21 @@ async def test_recoverable_key_always_present_on_failure(scenario, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stream_events_alias_yields_event_generator(monkeypatch):
+async def test_stream_events_alias_yields_event_generator():
     """SG-1 F5：``engine.stream_events(...)`` 是 ``run(mode="stream")`` 的别名，
     **一次 await 必须拿到事件异步生成器**（与驱动 ``gen = await engine.run(...)`` 同契约），
     产出 ``("chunk", c)`` / ``("state", s)``。
 
     少写 ``await`` 时这里拿到的是协程而非异步迭代器，``async for`` 会直接报
     ``'async for' requires an object with __aiter__ method, got coroutine``。
+
+    §七#2：单组流式选择成功即走直连快路径，chunk 由生成器**直接**产出，
+    不再经图节点的 ``writer``（故这里断言事件流本身，而非 pushed payload）。
     """
     engine = _engine()
     group = _group()
     provider = _StreamingProvider(
         [[{"choices": [{"delta": {"role": "assistant", "content": "a"}}]}]]
-    )
-    pushed: list = []
-    monkeypatch.setattr(
-        "botflow.pipeline.langgraph_engine.get_stream_writer",
-        lambda: (lambda p: pushed.append(p)),
     )
     with patch("botflow.pipeline._shared.load_endpoints", new_callable=AsyncMock,
                return_value=[_ep_stream(1, provider)]), \
@@ -754,9 +752,10 @@ async def test_stream_events_alias_yields_event_generator(monkeypatch):
         )
         events = [ev async for ev in gen]
 
-    # 端点级流式调用真的发生了，且 chunk 经 writer 推出
-    assert len(pushed) == 1
+    # 端点级流式调用真的发生了，chunk 作为 ("chunk", c) 事件产出
     assert provider.calls == 1
+    assert events[0][0] == "chunk"
+    assert events[0][1]["choices"][0]["delta"]["content"] == "a"
     # 最后一个事件是图出口 state，且已写好 recoverable（已提交 → False）
     assert events[-1][0] == "state"
     assert events[-1][1] is not None

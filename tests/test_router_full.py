@@ -412,28 +412,21 @@ async def test_route_stream_returns_ordered_endpoints(monkeypatch):
     captured: dict = {}
     orig = RandomWeightsStrategy.select_endpoints
 
-    async def _spy(self_, *a, **k):
-        res = await orig(self_, *a, **k)
-        captured["endpoints"] = res.endpoints
-        return res
-
-    monkeypatch.setattr(RandomWeightsStrategy, "select_endpoints", _spy)
-
     class _Done(Exception):
         pass
 
-    def _abort_writer():
+    # 中止点放在策略选择之后：对图路径与「直连快路径」（§七#2，选择成功即绕 pregel）
+    # 都成立，不再依赖图内部的 get_stream_writer()；也避免任何真实 provider 调用。
+    async def _spy(self_, *a, **k):
+        res = await orig(self_, *a, **k)
+        captured["endpoints"] = res.endpoints
         raise _Done()
 
-    # SG-1: 流式图不再调用 call_llm（端点级流式调用在图内直接用 provider.chat_stream），
-    # 中止点改到 try_stream 最早期执行的 get_stream_writer()。
-    monkeypatch.setattr(
-        "botflow.pipeline.langgraph_engine.get_stream_writer", _abort_writer,
-    )
+    monkeypatch.setattr(RandomWeightsStrategy, "select_endpoints", _spy)
+
     with pytest.raises(_Done):
-        # run(mode="stream") 为 async def，需先 await 取事件异步生成器（与 core._drive 一致）
-        async for _ in await engine.run(group=group, mode="stream", messages=[{"role": "user", "content": "hi"}]):
-            pass
+        # run(mode="stream") 为 async def，需先 await（与 core._drive 一致）
+        await engine.run(group=group, mode="stream", messages=[{"role": "user", "content": "hi"}])
     assert len(captured["endpoints"]) == 2
 
 
@@ -479,24 +472,18 @@ async def test_route_stream_context_window_truncation(monkeypatch):
     captured: dict = {}
     orig = RandomWeightsStrategy.select_endpoints
 
-    async def _spy(self_, *a, **k):
-        res = await orig(self_, *a, **k)
-        captured["messages"] = res.messages
-        return res
-
-    monkeypatch.setattr(RandomWeightsStrategy, "select_endpoints", _spy)
-
     class _Done(Exception):
         pass
 
-    def _abort_writer():
+    # 见 test_route_stream_returns_ordered_endpoints：中止点放在策略选择之后
+    # （对图路径与直连快路径都成立，且避免真实 provider 调用）。
+    async def _spy(self_, *a, **k):
+        res = await orig(self_, *a, **k)
+        captured["messages"] = res.messages
         raise _Done()
 
-    # 见 test_route_stream_returns_ordered_endpoints：中止点迁到 get_stream_writer()。
-    monkeypatch.setattr(
-        "botflow.pipeline.langgraph_engine.get_stream_writer", _abort_writer,
-    )
+    monkeypatch.setattr(RandomWeightsStrategy, "select_endpoints", _spy)
+
     with pytest.raises(_Done):
-        async for _ in await engine.run(group=group, mode="stream", messages=big):
-            pass
+        await engine.run(group=group, mode="stream", messages=big)
     assert captured["messages"] == [{"role": "system", "content": "s"}]

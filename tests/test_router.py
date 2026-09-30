@@ -291,6 +291,12 @@ class TestPipelineEngineRouting:
         captured: dict = {}
         orig = RandomWeightsStrategy.select_endpoints
 
+        class _SelectionDone(Exception):
+            pass
+
+        # 阻止真实流式网络调用：selection 捕获后立即抛哨兵中断。中止点放在策略里
+        # （而不是图内部的 ``get_stream_writer()``）后，对「图路径」与「直连快路径」
+        # 都成立 —— §七#2 起 ``run(mode="stream")`` 选择成功即走快路径，不再经图节点。
         async def _spy(self_, *args, **kwargs):
             res = await orig(self_, *args, **kwargs)
             captured.update(
@@ -298,33 +304,17 @@ class TestPipelineEngineRouting:
                 max_tokens=res.max_tokens, extra_kwargs=res.extra_kwargs,
                 messages=res.messages,
             )
-            return res
+            raise _SelectionDone()
 
         monkeypatch.setattr(RandomWeightsStrategy, "select_endpoints", _spy)
 
-        # 阻止真实流式网络调用：selection 已捕获后，在 ``try_stream`` 的**最早期**抛哨兵中断。
-        # SG-1 后流式不再经过 ``call_llm``（端点级流式调用在图内直接走 provider.chat_stream），
-        # 故中止点从 ``call_llm`` 改到 ``get_stream_writer()``：它在任何 provider 调用之前被调用，
-        # 且 ``try_stream`` 只兜底 ``RuntimeError``，``_SelectionDone`` 会正常外泄。
-        class _SelectionDone(Exception):
-            pass
-
-        def _abort_writer():
-            raise _SelectionDone()
-
-        monkeypatch.setattr(
-            "botflow.pipeline.langgraph_engine.get_stream_writer", _abort_writer,
-        )
-
         msgs = [{"role": "user", "content": "hi"}]
         with pytest.raises(_SelectionDone):
-            # SG-1: run(mode="stream") 是 async def（与 core._drive 的 await 契约一致），
-            # 先 await 拿到事件异步生成器，再 async for 迭代。
-            async for _ in await engine.run(
+            # SG-1: run(mode="stream") 是 async def（与 core._drive 的 await 契约一致）。
+            await engine.run(
                 group=group, mode="stream", messages=msgs,
                 temperature=0.5, max_tokens=100, tools=[{"type": "function"}],
-            ):
-                pass
+            )
 
         assert {ep.model_id for ep in captured["endpoints"]} == {1, 2}
         assert captured["temperature"] == 0.5
@@ -348,28 +338,20 @@ class TestPipelineEngineRouting:
         captured: dict = {}
         orig = RandomWeightsStrategy.select_endpoints
 
-        async def _spy(self_, *args, **kwargs):
-            res = await orig(self_, *args, **kwargs)
-            captured["endpoints"] = res.endpoints
-            return res
-
-        monkeypatch.setattr(RandomWeightsStrategy, "select_endpoints", _spy)
-
         class _SelectionDone(Exception):
             pass
 
-        def _abort_writer():
+        # 见 test_route_stream_returns_all_available：中止点放在策略选择之后，
+        # 对图路径与快路径都成立（不再依赖图内部的 get_stream_writer()）。
+        async def _spy(self_, *args, **kwargs):
+            res = await orig(self_, *args, **kwargs)
+            captured["endpoints"] = res.endpoints
             raise _SelectionDone()
 
-        # 见 test_route_stream_returns_all_available：流式中止点已从 call_llm 迁到
-        # get_stream_writer()（流式图不再调用 call_llm）。
-        monkeypatch.setattr(
-            "botflow.pipeline.langgraph_engine.get_stream_writer", _abort_writer,
-        )
+        monkeypatch.setattr(RandomWeightsStrategy, "select_endpoints", _spy)
 
         with pytest.raises(_SelectionDone):
-            async for _ in await engine.run(group=group, mode="stream", messages=[{"role": "user", "content": "hi"}]):
-                pass
+            await engine.run(group=group, mode="stream", messages=[{"role": "user", "content": "hi"}])
         assert [ep.model_id for ep in captured["endpoints"]] == [1]
 
     @pytest.mark.asyncio
