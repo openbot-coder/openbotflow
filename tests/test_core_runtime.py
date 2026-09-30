@@ -26,7 +26,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import botflow.core as core
-from botflow.config import BotflowSettings, set_config
+from botflow.config import BotflowSettings, get_config, set_config
 from botflow.common.exceptions import (
     AllModelsCooldownError,
     ConfigurationError,
@@ -648,6 +648,33 @@ class TestDeduplicationHelpers:
             ),
         )
         await core._cache_request_result("rid", {"ok": 1})  # must not raise
+
+    async def test_check_ttl_defaults_to_settings(self, monkeypatch):
+        # Entry is fresh in absolute terms, but the configured TTL is shorter
+        # than its age -> treated as expired. Proves the TTL comes from
+        # get_config().dedup_ttl_seconds instead of a hardcoded 300.
+        import json as _json
+        import time as _time
+        payload = _json.dumps({"result": {"ok": 1}, "timestamp": _time.time() - 120})
+        monkeypatch.setattr(
+            core, "_get_db", lambda: MagicMock(get_config=AsyncMock(return_value=payload)),
+        )
+        saved = get_config()
+        set_config(BotflowSettings(dedup_ttl_seconds=60))
+        try:
+            assert await core._check_request_deduplication("rid") is None
+        finally:
+            set_config(saved)
+
+    async def test_check_explicit_ttl_overrides_settings(self, monkeypatch):
+        # Explicit ttl_seconds argument still wins over the configured value.
+        import json as _json
+        import time as _time
+        payload = _json.dumps({"result": {"ok": 1}, "timestamp": _time.time() - 120})
+        monkeypatch.setattr(
+            core, "_get_db", lambda: MagicMock(get_config=AsyncMock(return_value=payload)),
+        )
+        assert await core._check_request_deduplication("rid", ttl_seconds=600) == {"ok": 1}
 
 
 # ===========================================================================

@@ -21,6 +21,23 @@ def test_defaults(tmp_path, monkeypatch):
     assert s.summary_group == ""
     assert s.llm_key == ""
     assert s.admin_key == ""
+    assert s.rate_limit_max_requests == 300
+    assert s.rate_limit_window_seconds == 60
+    assert s.rate_limit_max_keys == 10000
+    assert s.dedup_ttl_seconds == 300
+
+
+def test_rate_limit_and_dedup_env_override(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("BOTFLOW_RATE_LIMIT_MAX_REQUESTS", "42")
+    monkeypatch.setenv("BOTFLOW_RATE_LIMIT_WINDOW_SECONDS", "7")
+    monkeypatch.setenv("BOTFLOW_RATE_LIMIT_MAX_KEYS", "123")
+    monkeypatch.setenv("BOTFLOW_DEDUP_TTL_SECONDS", "9")
+    s = BotflowSettings()
+    assert s.rate_limit_max_requests == 42
+    assert s.rate_limit_window_seconds == 7
+    assert s.rate_limit_max_keys == 123
+    assert s.dedup_ttl_seconds == 9
 
 
 def test_load_config_no_workspace():

@@ -49,6 +49,19 @@ class BotflowSettings(BaseSettings):
     # 0 disables the semaphore (unlimited concurrency, the historical default).
     upstream_semaphore_size: int = 0
 
+    # ── Rate limiting (per client key, RateLimitMiddleware in core.py) ──
+    # Max requests allowed per key within the sliding window.
+    rate_limit_max_requests: int = 300
+    # Sliding window length in seconds.
+    rate_limit_window_seconds: int = 60
+    # Max number of keys tracked by the limiter before old keys are evicted.
+    rate_limit_max_keys: int = 10000
+
+    # ── Request deduplication ──
+    # How long (seconds) a cached request result is considered valid for
+    # non-streaming request deduplication.
+    dedup_ttl_seconds: int = 300
+
     # ── Call-log retention ──
     # Detailed call_logs are kept for this many days, then big fields are purged
     # but the stats columns are retained.

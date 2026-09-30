@@ -596,8 +596,14 @@ class RateLimitMiddleware:
         return await self.app(scope, receive, send)
 
 
-# 添加速率限制中间件（每个 KEY 300 次/分钟）
-app.add_middleware(RateLimitMiddleware, max_requests=300, window_seconds=60, max_keys=10000)
+# 添加速率限制中间件（每个 KEY 限流参数可通过 BOTFLOW_RATE_LIMIT_* 配置）
+_cfg = get_config()
+app.add_middleware(
+    RateLimitMiddleware,
+    max_requests=_cfg.rate_limit_max_requests,
+    window_seconds=_cfg.rate_limit_window_seconds,
+    max_keys=_cfg.rate_limit_max_keys,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -828,9 +834,11 @@ def _generate_request_id(body: dict, api_key_id: int | None = None) -> str:
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 
-async def _check_request_deduplication(request_id: str, ttl_seconds: int = 300) -> Optional[dict]:
+async def _check_request_deduplication(request_id: str, ttl_seconds: int | None = None) -> Optional[dict]:
     """Check if request has been processed recently. Returns cached result if found."""
     import json
+    if ttl_seconds is None:
+        ttl_seconds = get_config().dedup_ttl_seconds
     try:
         cached = await _get_db().get_config(f"dedup:{request_id}")
         if cached:
@@ -843,8 +851,13 @@ async def _check_request_deduplication(request_id: str, ttl_seconds: int = 300) 
     return None
 
 
-async def _cache_request_result(request_id: str, result: dict, ttl_seconds: int = 300) -> None:
-    """Cache request result for deduplication."""
+async def _cache_request_result(request_id: str, result: dict, ttl_seconds: int | None = None) -> None:
+    """Cache request result for deduplication.
+
+    Note: the TTL itself is enforced at read time by
+    ``_check_request_deduplication`` (from ``BOTFLOW_DEDUP_TTL_SECONDS``);
+    this parameter is accepted for API compatibility and currently unused.
+    """
     import json
     try:
         data = {

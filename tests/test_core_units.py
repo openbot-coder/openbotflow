@@ -67,6 +67,21 @@ def test_get_request_ctx_default():
     assert core._request_ctx.get() is None
 
 
+def test_rate_limit_middleware_wired_from_settings():
+    # core.py registers RateLimitMiddleware at import time from get_config()
+    # values (core._cfg). Assert the registered kwargs match that settings
+    # object so the middleware can never silently drift back to hardcoded
+    # limits.
+    mw = next(m for m in core.app.user_middleware if m.cls is core.RateLimitMiddleware)
+    cfg = core._cfg
+    assert isinstance(cfg, BotflowSettings)
+    assert mw.kwargs == {
+        "max_requests": cfg.rate_limit_max_requests,
+        "window_seconds": cfg.rate_limit_window_seconds,
+        "max_keys": cfg.rate_limit_max_keys,
+    }
+
+
 # ---------------------------------------------------------------------------
 # RateLimitMiddleware (unit, no ASGI stack)
 # ---------------------------------------------------------------------------

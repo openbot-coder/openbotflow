@@ -374,6 +374,10 @@ version
 | `cors_origins` | str | `*` | CORS 允许来源，为 `*` 时自动禁用 credentials |
 | `stream_timeout` | float | `30.0` | 流式等待首个 chunk 的超时秒数 |
 | `upstream_semaphore_size` | int | `0` | 每 Provider 上游并发上限，0 = 不限 |
+| `rate_limit_max_requests` | int | `300` | 每 Key 滑动窗口内最大请求数 |
+| `rate_limit_window_seconds` | int | `60` | 限流滑动窗口长度（秒） |
+| `rate_limit_max_keys` | int | `10000` | 限流器追踪的最大 Key 数，超限淘汰旧 Key |
+| `dedup_ttl_seconds` | int | `300` | 非流式请求去重缓存的有效期（秒） |
 | `call_log_detail_days` | int | `1` | 调用明细保留天数 |
 | `raw_session_retention_days` | int | `7` | 原始会话保留天数 |
 | `call_logs_retention_days` | int | `180` | call_logs 整行删除天数 |

@@ -90,6 +90,10 @@ botflow set admin-key your-admin-key
 | `BOTFLOW_CORS_ORIGINS` | `*` | CORS 允许来源（逗号分隔；为 `*` 时自动禁用 credentials） |
 | `BOTFLOW_STREAM_TIMEOUT` | `30.0` | 流式等待首个 chunk 的超时秒数 |
 | `BOTFLOW_UPSTREAM_SEMAPHORE_SIZE` | `0` | 每 Provider 的上游并发上限，`0` = 不限 |
+| `BOTFLOW_RATE_LIMIT_MAX_REQUESTS` | `300` | 每 Key 滑动窗口内最大请求数 |
+| `BOTFLOW_RATE_LIMIT_WINDOW_SECONDS` | `60` | 限流滑动窗口长度（秒） |
+| `BOTFLOW_RATE_LIMIT_MAX_KEYS` | `10000` | 限流器追踪的最大 Key 数 |
+| `BOTFLOW_DEDUP_TTL_SECONDS` | `300` | 非流式请求去重缓存有效期（秒） |
 | `BOTFLOW_CALL_LOG_DETAIL_DAYS` | `1` | 调用明细保留天数（过期仅清大字段，保留统计列） |
 | `BOTFLOW_RAW_SESSION_RETENTION_DAYS` | `7` | 原始会话压缩包保留天数 |
 | `BOTFLOW_CALL_LOGS_RETENTION_DAYS` | `180` | call_logs 整行删除天数 |
