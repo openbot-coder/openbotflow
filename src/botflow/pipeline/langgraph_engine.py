@@ -37,7 +37,7 @@ from botflow.common.exceptions import (
     ProviderError,
 )
 from botflow.common.logger import get_logger
-from botflow.pipeline._shared import call_llm
+from botflow.pipeline._shared import call_llm, semaphore_guarded_stream
 from botflow.pipeline.base import STRATEGY_REGISTRY, StrategyError
 from botflow.router import CooldownManager, exponential_backoff, is_retryable_error
 from botflow.storage.db import Database
@@ -398,12 +398,15 @@ async def try_stream(state: RouteState) -> dict:
         # First-chunk acquisition with endpoint-level retry/backoff.
         for attempt in range(max_retries):
             try:
-                gen = ep.provider.chat_stream(
-                    messages=truncated,
-                    model=ep.detail.model_name,
-                    temperature=_resolve_temperature(temperature, ep),
-                    max_tokens=max_tokens,
-                    **extra,
+                gen = semaphore_guarded_stream(
+                    ep.provider.chat_stream(
+                        messages=truncated,
+                        model=ep.detail.model_name,
+                        temperature=_resolve_temperature(temperature, ep),
+                        max_tokens=max_tokens,
+                        **extra,
+                    ),
+                    ep.detail.provider_id,
                 )
                 first = await gen.__anext__()
                 break
@@ -893,12 +896,15 @@ class LangGraphEngine:
             # First-chunk acquisition with endpoint-level retry/backoff.
             for attempt in range(max_retries):
                 try:
-                    gen = ep.provider.chat_stream(
-                        messages=truncated,
-                        model=ep.detail.model_name,
-                        temperature=_resolve_temperature(temperature, ep),
-                        max_tokens=max_tokens,
-                        **extra,
+                    gen = semaphore_guarded_stream(
+                        ep.provider.chat_stream(
+                            messages=truncated,
+                            model=ep.detail.model_name,
+                            temperature=_resolve_temperature(temperature, ep),
+                            max_tokens=max_tokens,
+                            **extra,
+                        ),
+                        ep.detail.provider_id,
                     )
                     first = await gen.__anext__()
                     break

@@ -89,7 +89,7 @@ botflow set admin-key your-admin-key
 | `BOTFLOW_LOG_LEVEL` | `INFO` | 日志级别 |
 | `BOTFLOW_CORS_ORIGINS` | `*` | CORS 允许来源（逗号分隔；为 `*` 时自动禁用 credentials） |
 | `BOTFLOW_STREAM_TIMEOUT` | `30.0` | 流式等待首个 chunk 的超时秒数 |
-| `BOTFLOW_UPSTREAM_SEMAPHORE_SIZE` | `0` | 每 Provider 的上游并发上限，`0` = 不限 |
+| `BOTFLOW_UPSTREAM_SEMAPHORE_SIZE` | `0` | 每 Provider 的上游并发上限，`0` = 不限（详见下文「上游并发限制」） |
 | `BOTFLOW_RATE_LIMIT_MAX_REQUESTS` | `300` | 每 Key 滑动窗口内最大请求数 |
 | `BOTFLOW_RATE_LIMIT_WINDOW_SECONDS` | `60` | 限流滑动窗口长度（秒） |
 | `BOTFLOW_RATE_LIMIT_MAX_KEYS` | `10000` | 限流器追踪的最大 Key 数 |
@@ -100,6 +100,14 @@ botflow set admin-key your-admin-key
 | `BOTFLOW_DAILY_SUMMARY_HOUR` | `0` | 每日摘要任务的 UTC 小时（0-23） |
 | `BOTFLOW_SUMMARY_GROUP` | （空） | 摘要使用的分组名，空 = 默认分组 |
 | `BOTFLOW_MODEL_SYNC_INTERVAL` | `60` | 模型自动同步间隔（分钟，0 = 禁用） |
+
+### 上游并发限制（`BOTFLOW_UPSTREAM_SEMAPHORE_SIZE`）
+
+按 provider 限制同时发往单个上游的请求数，跨所有分组共享，非流式 `chat` 与流式 `chat_stream` 均计入（流式从获取首块起持有额度，直到流结束/出错/被关闭）。用途是防止突发流量打爆单个上游（thundering herd 导致整批在途请求同时超时）。`0` = 不限（历史默认）。
+
+- **size 估算**：取上游的并发配额（如供应商控制台的并发上限，或 RPM 限额 × 平均请求时长）；无明确配额时从小值起步，观察上游 429/超时再逐步上调。
+- **生效语义**：provider 首次被调用时按当时配置创建信号量并长期复用；`0 → N` 对尚未建信号量的 provider 立即生效；已以 `N > 0` 运行的 provider 调整数值需重启进程（信号量对象身份不可打断，admin 缓存清理也不会重置它）。
+- **边界**：它限制的是「对单个上游的并发」，不是「网关总并发」——网关自身 CPU 饱和导致的吞吐下滑（见 `docs/perf-load-test-2026-09-30.md` §一#2）不属于它的职责范围。
 
 ## API 接口
 

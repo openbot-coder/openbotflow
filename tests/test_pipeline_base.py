@@ -771,3 +771,41 @@ async def test_TC39_ensure_provider_semaphore_cached():
     sem1 = _ensure_provider_semaphore(provider_id=997, size=3)
     sem2 = _ensure_provider_semaphore(provider_id=997, size=3)
     assert sem1 is sem2
+
+
+# TC-40: 0→N 热生效——已按 size=0 缓存 None 的 provider，改传 size>0 会新建信号量
+async def test_TC40_ensure_provider_semaphore_hot_apply_from_unlimited():
+    assert _ensure_provider_semaphore(provider_id=996, size=0) is None
+    sem = _ensure_provider_semaphore(provider_id=996, size=4)
+    assert isinstance(sem, asyncio.Semaphore)
+    assert _provider_semaphores[996] is sem
+
+
+# TC-41: size 变更不刷新已建信号量（身份稳定；调数值需重启进程，属既定设计）
+async def test_TC41_ensure_provider_semaphore_size_change_keeps_identity():
+    sem = _ensure_provider_semaphore(provider_id=995, size=2)
+    assert _ensure_provider_semaphore(provider_id=995, size=10) is sem
+
+
+# TC-42: call_llm 真实门控——size=2 时 6 个并发调用最多 2 个同时进 provider.chat
+async def test_TC42_call_llm_semaphore_gates_upstream_concurrency(sample_endpoint, cooldown):
+    state = {"inflight": 0, "max": 0}
+
+    async def chat(**kwargs):
+        state["inflight"] += 1
+        state["max"] = max(state["max"], state["inflight"])
+        await asyncio.sleep(0.01)
+        state["inflight"] -= 1
+        return {"ok": True}
+
+    sample_endpoint.provider.chat = chat
+    sem = asyncio.Semaphore(2)
+
+    with patch("botflow.pipeline._shared._ensure_provider_semaphore", return_value=sem):
+        results = await asyncio.wait_for(asyncio.gather(*[
+            call_llm(sample_endpoint, messages=[], group_id=1, cooldown=cooldown)
+            for _ in range(6)
+        ]), timeout=5)
+
+    assert all(err is None for _, err in results)
+    assert state["max"] == 2

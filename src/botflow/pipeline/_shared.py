@@ -62,6 +62,37 @@ def _noop_asynccontext() -> Any:
     return nullcontext()
 
 
+def semaphore_guarded_stream(gen: Any, provider_id: int) -> Any:
+    """Wrap a ``chat_stream`` generator so the provider semaphore is held for
+    the stream's lifetime.
+
+    ``call_llm`` covers non-streaming calls; without this wrapper streaming
+    calls escape the per-provider limit entirely — even though a live stream
+    holds an upstream connection far longer than a chat call. The semaphore is
+    acquired on the first chunk and released when the stream ends, errors out,
+    or is closed (the engine ``aclose()``-es generators on every exit path).
+
+    With the limit disabled (``upstream_semaphore_size == 0``, the default) the
+    original generator is returned untouched.
+    """
+    sem = _ensure_provider_semaphore(
+        provider_id, get_config().upstream_semaphore_size
+    )
+    if sem is None:
+        return gen
+
+    async def _guarded():
+        await sem.acquire()
+        try:
+            async for chunk in gen:
+                yield chunk
+        finally:
+            sem.release()
+            await gen.aclose()
+
+    return _guarded()
+
+
 # ---------------------------------------------------------------------------
 # Model extra config filtering (from router.py)
 # ---------------------------------------------------------------------------

@@ -373,7 +373,7 @@ version
 | `log_level` | str | `INFO` | 日志级别 |
 | `cors_origins` | str | `*` | CORS 允许来源，为 `*` 时自动禁用 credentials |
 | `stream_timeout` | float | `30.0` | 流式等待首个 chunk 的超时秒数 |
-| `upstream_semaphore_size` | int | `0` | 每 Provider 上游并发上限，0 = 不限 |
+| `upstream_semaphore_size` | int | `0` | 每 Provider 上游并发上限（`chat` 与 `chat_stream` 均计入；流式持有至流结束），0 = 不限。`0→N` 对未建信号量的 provider 立即生效，`N` 调整需重启；sizing 见 README「上游并发限制」 |
 | `rate_limit_max_requests` | int | `300` | 每 Key 滑动窗口内最大请求数 |
 | `rate_limit_window_seconds` | int | `60` | 限流滑动窗口长度（秒） |
 | `rate_limit_max_keys` | int | `10000` | 限流器追踪的最大 Key 数，超限淘汰旧 Key |

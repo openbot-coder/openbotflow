@@ -22,8 +22,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from botflow.common.exceptions import NoAvailableModelError, ProviderError
+from botflow.pipeline._shared import semaphore_guarded_stream
 from botflow.pipeline.langgraph_engine import LangGraphEngine, _select_endpoints
-from botflow.router import CooldownManager, ModelEndpoint
+from botflow.router import CooldownManager, ModelEndpoint, _provider_semaphores
 from botflow.storage.db import Database
 from botflow.storage.models import GroupModelWithDetails, ModelGroup
 
@@ -709,3 +710,131 @@ async def test_fast_vs_graph_stream_multi_all_fail():
     assert [a["endpoint_idx"] for a in state["attempts"]] == [0, 0]
     assert state["used_model_id"] == 2
     assert state["used_provider_id"] == ep_b.detail.provider_id
+
+
+# ---------------------------------------------------------------------------
+# 上游并发信号量（perf 报告 §七#6）：流式 chat_stream 接入 per-provider 信号量
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _clear_provider_semaphores():
+    _provider_semaphores.clear()
+    yield
+    _provider_semaphores.clear()
+
+
+async def test_stream_semaphore_passthrough_when_disabled():
+    """size=0（默认）→ 原样返回同一生成器，无任何包装（行为不变）。"""
+    gen = _async_gen([1, 2])
+    with patch("botflow.pipeline._shared.get_config") as cfg:
+        cfg.return_value = MagicMock(upstream_semaphore_size=0)
+        assert semaphore_guarded_stream(gen, 9000) is gen
+
+
+async def test_stream_semaphore_gates_concurrent_streams():
+    """size=2 → 5 个并发流最多 2 个同时在上游产出（真实门控，非仅身份注入）。"""
+    state = {"inflight": 0, "max": 0}
+
+    def make_gen():
+        async def gen():
+            state["inflight"] += 1
+            state["max"] = max(state["max"], state["inflight"])
+            try:
+                yield 1
+                await asyncio.sleep(0.01)
+                yield 2
+            finally:
+                state["inflight"] -= 1
+        return gen()
+
+    async def drain(g):
+        return [c async for c in g]
+
+    with patch("botflow.pipeline._shared.get_config") as cfg:
+        cfg.return_value = MagicMock(upstream_semaphore_size=2)
+        streams = [semaphore_guarded_stream(make_gen(), 9001) for _ in range(5)]
+        results = await asyncio.wait_for(
+            asyncio.gather(*[drain(g) for g in streams]), timeout=5)
+
+    assert results == [[1, 2]] * 5
+    assert state["max"] == 2
+
+
+async def test_stream_semaphore_released_on_early_close():
+    """消费方提前 aclose → 信号量立即归还（引擎所有退出路径都会 aclose）。"""
+    state = {"inflight": 0}
+
+    async def gen():
+        state["inflight"] += 1
+        try:
+            yield 1
+            yield 2  # 不可达
+        finally:
+            state["inflight"] -= 1
+
+    with patch("botflow.pipeline._shared.get_config") as cfg:
+        cfg.return_value = MagicMock(upstream_semaphore_size=1)
+        guarded = semaphore_guarded_stream(gen(), 9002)
+        assert await asyncio.wait_for(guarded.__anext__(), timeout=2) == 1
+        assert state["inflight"] == 1
+        await guarded.aclose()
+        assert state["inflight"] == 0
+
+        # 额度已归还：新流可立即拿到首块（若泄漏，这里会 TimeoutError）
+        g2 = semaphore_guarded_stream(_async_gen([9]), 9002)
+        assert await asyncio.wait_for(g2.__anext__(), timeout=2) == 9
+
+
+async def test_stream_semaphore_released_on_upstream_error():
+    """上游中途抛错 → 信号量在异常传播前归还，额度可被后续流立即复用。"""
+    async def gen():
+        yield 1
+        raise RuntimeError("mid-stream")
+
+    with patch("botflow.pipeline._shared.get_config") as cfg:
+        cfg.return_value = MagicMock(upstream_semaphore_size=1)
+        guarded = semaphore_guarded_stream(gen(), 9003)
+        assert await asyncio.wait_for(guarded.__anext__(), timeout=2) == 1
+        with pytest.raises(RuntimeError):
+            await asyncio.wait_for(guarded.__anext__(), timeout=2)
+
+        g2 = semaphore_guarded_stream(_async_gen([9]), 9003)
+        assert await asyncio.wait_for(g2.__anext__(), timeout=2) == 9
+
+
+async def test_run_stream_respects_provider_semaphore(_clear_provider_semaphores):
+    """集成：size=1 时两条并发 _run_stream_fast 流在上游侧完全串行
+    （修复前 chat_stream 完全绕过信号量，max 会是 2）。"""
+    engine = _engine()
+    group = _group()
+    ep = _ep()
+    state = {"inflight": 0, "max": 0}
+
+    def make_gen():
+        async def gen():
+            state["inflight"] += 1
+            state["max"] = max(state["max"], state["inflight"])
+            try:
+                yield {"choices": [{"delta": {"content": "a"}}]}
+                await asyncio.sleep(0.02)
+                yield {"choices": [{"delta": {"content": "b"}}]}
+            finally:
+                state["inflight"] -= 1
+        return gen()
+
+    ep.provider.chat_stream = MagicMock(side_effect=lambda **kw: make_gen())
+
+    async def one():
+        g = await engine.run(
+            group=group, messages=[{"role": "user", "content": "hi"}], mode="stream")
+        return await _collect(g)
+
+    # patch 必须在 gather 外层只进一次：并发任务各自进 patch 会把
+    # _shared.load_endpoints 的 AsyncMock 泄漏到模块外（patch 栈错乱）。
+    with _patch_select([ep]), \
+         patch("botflow.pipeline._shared.get_config") as cfg:
+        cfg.return_value = MagicMock(upstream_semaphore_size=1)
+        await asyncio.wait_for(asyncio.gather(one(), one()), timeout=5)
+
+    assert state["max"] == 1
