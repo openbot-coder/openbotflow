@@ -12,6 +12,7 @@ import botflow.core as core
 from botflow.config import BotflowSettings, set_config
 from botflow.common.exceptions import ProviderError
 from botflow.router import ModelEndpoint
+from botflow.storage.models import CallAttempt, CallLog
 
 
 def test_filter_safe_extra():
@@ -112,7 +113,6 @@ def test_cleanup_old_keys():
 
 
 def _fake_call_log_entry():
-    from botflow.storage.models import CallLog
     return CallLog(api_key_id=1, group_id=1, model_id=1, status="success",
                    request_body="{}", response_body="{}")
 
@@ -147,7 +147,6 @@ async def test_call_log_writer_flush_error_logged(caplog):
 
 
 def _fake_call_attempt():
-    from botflow.storage.models import CallAttempt
     return CallAttempt(request_id="req-1", stage="non_stream",
                        error_type="ProviderError", error_message="boom")
 
@@ -221,3 +220,94 @@ async def test_log_call_fallback_direct_write(monkeypatch):
                          request_body="{}", response_body="{}", status="success",
                          duration_ms=1, usage=None)
     assert len(db.written) == 1
+
+
+# ---------------------------------------------------------------------------
+# _log_attempts (SG-0) — 失败尝试批量留痕
+# ---------------------------------------------------------------------------
+
+
+class _FakeWriter:
+    """Minimal CallLogWriter stand-in for _log_attempts tests (no real flush)."""
+
+    def __init__(self):
+        self.entries = []
+        self.attempts = []
+
+    async def log(self, entry):
+        self.entries.append(entry)
+
+    async def log_attempt(self, attempt):
+        self.attempts.append(attempt)
+
+
+def _sample_attempt() -> dict:
+    return {
+        "group_id": 1,
+        "model_id": 2,
+        "provider_id": 3,
+        "stage": "call",
+        "error_type": "ProviderError",
+        "error_message": "boom",
+        "duration_ms": 9,
+    }
+
+
+async def test_log_attempts_uses_writer(monkeypatch):
+    # 每请求失败尝试经 CallAttempt.model_construct 构造后送入 writer 缓冲。
+    writer = _FakeWriter()
+    old_writer = core._log_writer
+    try:
+        core._log_writer = writer
+        await core._log_attempts([_sample_attempt()])
+        assert len(writer.attempts) == 1
+        a = writer.attempts[0]
+        assert isinstance(a, CallAttempt)
+        assert a.stage == "call" and a.error_type == "ProviderError" and a.duration_ms == 9
+        # model_construct 跳过校验：缺失字段由默认值补齐（created_at 由 default_factory 生成）。
+        assert a.created_at is not None
+    finally:
+        core._log_writer = old_writer
+
+
+async def test_log_attempts_fallback_direct_write(monkeypatch):
+    # writer 未初始化时回退到直接落库（与 _log_call 同构）。
+    db = _FakeDB()
+    old_writer = core._log_writer
+    old_db = core._db
+    try:
+        core._log_writer = None
+        core._db = db
+        await core._log_attempts([_sample_attempt()])
+        assert len(db.attempts_written) == 1
+        assert isinstance(db.attempts_written[0], CallAttempt)
+    finally:
+        core._log_writer = old_writer
+        core._db = old_db
+
+
+async def test_log_attempts_empty_list_is_noop(monkeypatch):
+    # 空列表是 no-op：不触 writer、不落库。
+    writer = _FakeWriter()
+    old_writer = core._log_writer
+    try:
+        core._log_writer = writer
+        await core._log_attempts([])
+        assert writer.attempts == []
+    finally:
+        core._log_writer = old_writer
+
+
+async def test_log_attempts_swallows_writer_failure(monkeypatch):
+    # 留痕失败只记日志、绝不上抛（SG-0 硬约束 3）。
+    class BoomWriter:
+        async def log_attempt(self, attempt):
+            raise RuntimeError("boom")
+
+    old_writer = core._log_writer
+    try:
+        core._log_writer = BoomWriter()
+        await core._log_attempts([_sample_attempt()])  # 不得抛异常
+    finally:
+        core._log_writer = old_writer
+

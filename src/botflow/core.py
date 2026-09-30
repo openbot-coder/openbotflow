@@ -709,7 +709,12 @@ async def _log_call(
         api_key_id = ctx.get("api_key_id")
     if request_id is None:
         request_id = ctx.get("request_id")
-    log_entry = CallLog(
+    # 调用日志来自网关内部可信数据（非外部输入），无需 pydantic 校验。
+    # 用 model_construct 跳过 __init__ 校验与类型内省，减少每请求 CPU
+    # （py-spy self TOP：pydantic __init__ 7.5% + get_origin/__instancecheck__ ~5%）。
+    # 缺失字段由模型默认值补齐（id=0 / cost=None / created_at=now），
+    # 与 create_call_log 的 INSERT（created_at 用 datetime('now')、id 自增）等价。
+    log_entry = CallLog.model_construct(
         api_key_id=api_key_id,
         group_id=group_id,
         model_id=model_id,
@@ -750,8 +755,9 @@ async def _log_attempts(attempts: list[dict]) -> None:
     try:
         ctx = _request_ctx.get() or {}
         request_id = ctx.get("request_id")
+        # 失败尝试来自网关内部可信数据，用 model_construct 跳过校验（同 _log_call）。
         entries = [
-            CallAttempt(
+            CallAttempt.model_construct(
                 request_id=request_id,
                 group_id=a.get("group_id"),
                 model_id=a.get("model_id"),
