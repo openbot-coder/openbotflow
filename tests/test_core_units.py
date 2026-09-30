@@ -74,29 +74,63 @@ def test_get_request_ctx_default():
 
 def test_rate_limit_key_bearer():
     rm = core.RateLimitMiddleware(core.app)
-    class Req:
-        headers = {"authorization": "Bearer abc"}
-        query_params = {}
-        client = None
-    assert rm._get_rate_limit_key(Req()) == "abc"
+    scope = {
+        "headers": [(b"authorization", b"Bearer abc")],
+        "query_string": b"",
+        "client": None,
+    }
+    assert rm._get_rate_limit_key(scope) == "abc"
 
 
 def test_rate_limit_key_query():
     rm = core.RateLimitMiddleware(core.app)
-    class Req:
-        headers = {}
-        query_params = {"api_key": "qk"}
-        client = None
-    assert rm._get_rate_limit_key(Req()) == "qk"
+    scope = {
+        "headers": [],
+        "query_string": b"api_key=qk",
+        "client": None,
+    }
+    assert rm._get_rate_limit_key(scope) == "qk"
+
+
+def test_rate_limit_key_query_duplicate_last_wins():
+    # Mirrors starlette QueryParams.get semantics (dict: last duplicate wins).
+    rm = core.RateLimitMiddleware(core.app)
+    scope = {
+        "headers": [],
+        "query_string": b"api_key=first&api_key=qk",
+        "client": ("1.2.3.4", 5),
+    }
+    assert rm._get_rate_limit_key(scope) == "qk"
+
+
+def test_rate_limit_key_query_blank_falls_through_to_client():
+    rm = core.RateLimitMiddleware(core.app)
+    scope = {
+        "headers": [],
+        "query_string": b"api_key=&x=1",
+        "client": ("1.2.3.4", 5),
+    }
+    assert rm._get_rate_limit_key(scope) == "1.2.3.4"
 
 
 def test_rate_limit_key_anonymous():
     rm = core.RateLimitMiddleware(core.app)
-    class Req:
-        headers = {}
-        query_params = {}
-        client = type("C", (), {"host": "1.2.3.4"})()
-    assert rm._get_rate_limit_key(Req()) == "1.2.3.4"
+    scope = {
+        "headers": [],
+        "query_string": b"",
+        "client": ("1.2.3.4", 12345),
+    }
+    assert rm._get_rate_limit_key(scope) == "1.2.3.4"
+
+
+def test_asgi_header_first_match_and_missing_default():
+    scope = {
+        "headers": [(b"x-a", b"1"), (b"x-a", b"2")],
+        "query_string": b"",
+        "client": None,
+    }
+    assert core._asgi_header(scope, "x-a") == "1"
+    assert core._asgi_header(scope, "x-missing") == ""
 
 
 def test_cleanup_old_keys():

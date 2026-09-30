@@ -22,6 +22,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Optional
+from urllib.parse import parse_qsl
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -505,6 +506,21 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 
 
+def _asgi_header(scope: dict, name: str) -> str:
+    """First-match header lookup straight on the ASGI scope.
+
+    Mirrors starlette ``Headers.get`` semantics: the lookup key is lowercase
+    (ASGI server header names are lowercase) and compared byte-exactly, the
+    first match wins, values are latin-1 decoded. Avoids building a
+    Request/Headers object per middleware per request.
+    """
+    key = name.lower().encode("latin-1")
+    for header_key, header_value in scope["headers"]:
+        if header_key == key:
+            return header_value.decode("latin-1")
+    return ""
+
+
 class RateLimitMiddleware:
     """Rate limiter middleware using fixed-size deque per API key.
 
@@ -522,17 +538,24 @@ class RateLimitMiddleware:
         self._last_access: dict[str, float] = {}  # Track last access time for cleanup
         self._request_count: int = 0  # Counter for periodic cleanup
 
-    def _get_rate_limit_key(self, request) -> str:
-        """Extract rate limit key from request (LLM key or MCP key)."""
-        auth = request.headers.get("authorization", "")
+    def _get_rate_limit_key(self, scope: dict) -> str:
+        """Extract rate limit key from scope (LLM key or MCP key)."""
+        auth = _asgi_header(scope, "authorization")
         if auth.startswith("Bearer "):
             return auth[7:]
 
-        api_key = request.query_params.get("api_key")
+        api_key = ""
+        # Same parsing as starlette QueryParams (parse_qsl with blank values,
+        # last duplicate wins); only runs when there is no Bearer header.
+        for k, v in parse_qsl(scope.get("query_string", b"").decode("latin-1"),
+                              keep_blank_values=True):
+            if k == "api_key":
+                api_key = v
         if api_key:
             return api_key
 
-        return request.client.host if request.client else "anonymous"
+        client = scope.get("client")
+        return client[0] if client else "anonymous"
 
     def _cleanup_old_keys(self, now: float) -> None:
         """Remove keys that haven't been accessed in the last 5 minutes."""
@@ -546,12 +569,10 @@ class RateLimitMiddleware:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
 
-        request = Request(scope, receive)
-
-        if request.url.path == "/health":
+        if scope["path"] == "/health":
             return await self.app(scope, receive, send)
 
-        key = self._get_rate_limit_key(request)
+        key = self._get_rate_limit_key(scope)
         now = time.time()
 
         # Periodic cleanup every 1000 requests
@@ -588,7 +609,8 @@ class AuthMiddleware:
     """Pure ASGI middleware for LLM client-key authentication.
 
     Resolves the Bearer token to an api_keys row (or legacy single key), stores
-    the id on request.state, and rejects invalid tokens with 401.
+    the id in the ASGI scope state (readable downstream as request.state.api_key_id),
+    and rejects invalid tokens with 401.
     """
 
     def __init__(self, app):
@@ -598,21 +620,21 @@ class AuthMiddleware:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
 
-        request = Request(scope, receive)
+        path = scope["path"]
 
         # Health check is public.
-        if request.url.path == "/health":
+        if path == "/health":
             return await self.app(scope, receive, send)
 
         # Admin REST API has its own dependency-based guard; skip middleware here
         # (admin_key is checked per-route).
-        if request.url.path.startswith("/admin/"):
+        if path.startswith("/admin/"):
             return await self.app(scope, receive, send)
 
         # Support both "Authorization: Bearer <key>" and "x-api-key: <key>" headers.
         # x-api-key takes precedence when present (Anthropic/Google native clients use it).
-        x_api_key = request.headers.get("x-api-key", "")
-        auth_header = request.headers.get("Authorization", "")
+        x_api_key = _asgi_header(scope, "x-api-key")
+        auth_header = _asgi_header(scope, "authorization")
         token = None
         if x_api_key:
             token = x_api_key.strip()
@@ -634,7 +656,10 @@ class AuthMiddleware:
             response = JSONResponse(status_code=401, content={"error": "Invalid or disabled API key."})
             return await response(scope, receive, send)
 
-        request.state.api_key_id = api_key.id
+        # request.state is backed by scope["state"]; writing here is visible to
+        # downstream handlers via request.state.api_key_id without building a
+        # Request object in this middleware.
+        scope.setdefault("state", {})["api_key_id"] = api_key.id
         return await self.app(scope, receive, send)
 
 

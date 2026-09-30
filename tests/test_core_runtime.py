@@ -102,9 +102,11 @@ class _RecordingApp:
 
     def __init__(self) -> None:
         self.calls = 0
+        self.last_scope: dict | None = None
 
     async def __call__(self, scope, receive, send):
         self.calls += 1
+        self.last_scope = scope
 
 
 # ===========================================================================
@@ -572,7 +574,7 @@ class TestAuthMiddleware:
     async def test_raw_authorization_header_without_bearer(self, tmp_path):
         db = await _new_db(tmp_path)
         try:
-            await db.create_api_key("raw-key", label="t")
+            key = await db.create_api_key("raw-key", label="t")
             saved, core._db = core._db, db
             try:
                 app = _RecordingApp()
@@ -581,6 +583,8 @@ class TestAuthMiddleware:
                 _, send = await _recording_send()
                 await mw(_http_scope(headers=headers), _empty_receive, send)
                 assert app.calls == 1
+                # api_key_id must land in scope state (request.state is backed by it)
+                assert app.last_scope["state"]["api_key_id"] == key.id
             finally:
                 core._db = saved
         finally:
